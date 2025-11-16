@@ -54,10 +54,6 @@
       "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
       "subdirs": ["."],
       "files_per_epoch": 4
-    },
-    "validation": {
-      "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
-      "subdirs": ["."]
     }
   },
   "checkpoint": {

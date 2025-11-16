@@ -149,7 +149,6 @@ def train_model_from_pod5(
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
-    val_ds: NanoporeSignalDataset | None = None,
     val_every: int = 2000,
     val_batches: int | None = 8,
     resume_from: str | None = None,
@@ -333,48 +332,94 @@ def train_model_from_pod5(
         )
         _log("[warmup] Compile finished; starting real data iterator.")
 
-    def _evaluate(gen_state, disc_state, val_ds, loss_w, B_eval: int = 1, val_limit: int | None = None):
-        if val_ds is None:
-            return {}
-        from ..data.prefetch import Prefetcher
+    # Optional compile warmup for eval/inference graphs to avoid first-validation stall.
+    if os.environ.get("VQGAN_WARMUP_EVAL", "1") != "0":
+        _log("[warmup] Compiling eval step on dummy batch; this may take a moment.")
+        warm_rng, step_rng = jax.random.split(step_rng)
+        dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
+        vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
+        outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, dummy_batch, train=False, offset=0, rng=warm_rng)
+        wave_hat = outs["wave_hat"]
+        fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, wave_hat, train=False, return_features=True)
+        real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, dummy_batch, train=False, return_features=True)
+        compute_generator_losses(
+            y=dummy_batch,
+            y_hat=wave_hat,
+            fake_map=fake_map,
+            real_feats=real_feats,
+            fake_feats=fake_feats,
+            commit_loss=outs["enc"]["commit_loss"],
+            weights=loss_weights,
+        )
+        hinge_d_loss(real_map, fake_map)
+        _log("[warmup] Eval compile finished.")
+
+    def _iter_random_eval_batches(source_ds: NanoporeSignalDataset, batch_size: int, max_batches: int, seed_offset: int):
+        rng_local = np.random.default_rng(seed ^ 0xEAD1 ^ int(seed_offset))
+        files = list(source_ds.pod5_files)
+        if not files:
+            return
+        max_skips = 8
+        for _ in range(max_batches):
+            windows: list[np.ndarray] = []
+            attempts = 0
+            while len(windows) < batch_size and attempts < batch_size * 8:
+                file_path = files[int(rng_local.integers(0, len(files)))]
+                skip = int(rng_local.integers(0, max_skips + 1))
+                chunk = None
+                try:
+                    chunk_iter = source_ds._iter_chunks_from_file(file_path)
+                    for _ in range(skip + 1):
+                        chunk = next(chunk_iter)
+                except StopIteration:
+                    chunk = None
+                except Exception:
+                    chunk = None
+                finally:
+                    attempts += 1
+                if chunk is None:
+                    continue
+                arr = np.asarray(chunk, dtype=np.float32)
+                windows.append(arr)
+            if len(windows) < batch_size:
+                break
+            batch = np.stack(windows, axis=0)
+            yield batch
+
+    def _evaluate(gen_state, disc_state, loss_w, B_eval: int = 1, val_limit: int | None = None, seed_offset: int = 0):
         Bv = max(1, min(B_eval, 16))
-        with Prefetcher(val_ds.batches(batch_size=Bv, drop_last=True, files_cycle=False), prefetch_size=1) as it:
-            agg: Dict[str, float] = {}
-            seen = 0
-            limit = val_limit if val_limit is not None and val_limit > 0 else None
-            for i, b in enumerate(it):
-                if limit is not None and i >= limit:
-                    break
-                y = jnp.asarray(b)
-                rng_eval = jax.random.PRNGKey(seed ^ 0x5EED ^ i)
-                vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
-                outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, y, train=False, offset=0, rng=rng_eval)
-                y_hat = outs["wave_hat"]
-                fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, y_hat, train=False, return_features=True)
-                real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, y, train=False, return_features=True)
-                total_loss, gen_logs = compute_generator_losses(
-                    y=y,
-                    y_hat=y_hat,
-                    fake_map=fake_map,
-                    real_feats=real_feats,
-                    fake_feats=fake_feats,
-                    commit_loss=outs["enc"]["commit_loss"],
-                    weights=loss_w,
-                )
-                gen_logs = dict(gen_logs)
-                gen_logs["total_loss"] = total_loss
-                gen_logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
-                usage_ratio = outs["enc"].get("usage_ratio")
-                if usage_ratio is not None:
-                    gen_logs["code_usage"] = usage_ratio
-                gen_logs["disc_loss"] = hinge_d_loss(real_map, fake_map)
-                formatted = _simvq_style_logs(gen_logs, "val", 1.0)
-                float_logs = _logs_to_float_dict(formatted)
-                for k, v in float_logs.items():
-                    agg[k] = agg.get(k, 0.0) + v
-                seen += 1
-                if limit is not None and seen >= limit:
-                    break
+        limit = val_limit if val_limit is not None and val_limit > 0 else 8
+        agg: Dict[str, float] = {}
+        seen = 0
+        for i, host_batch in enumerate(_iter_random_eval_batches(ds, Bv, limit, seed_offset)):
+            y = jnp.asarray(host_batch)
+            rng_eval = jax.random.PRNGKey(seed ^ 0x5EED ^ i ^ int(seed_offset))
+            vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
+            outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, y, train=False, offset=0, rng=rng_eval)
+            y_hat = outs["wave_hat"]
+            fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, y_hat, train=False, return_features=True)
+            real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, y, train=False, return_features=True)
+            total_loss, gen_logs = compute_generator_losses(
+                y=y,
+                y_hat=y_hat,
+                fake_map=fake_map,
+                real_feats=real_feats,
+                fake_feats=fake_feats,
+                commit_loss=outs["enc"]["commit_loss"],
+                weights=loss_w,
+            )
+            gen_logs = dict(gen_logs)
+            gen_logs["total_loss"] = total_loss
+            gen_logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
+            usage_ratio = outs["enc"].get("usage_ratio")
+            if usage_ratio is not None:
+                gen_logs["code_usage"] = usage_ratio
+            gen_logs["disc_loss"] = hinge_d_loss(real_map, fake_map)
+            formatted = _simvq_style_logs(gen_logs, "val", 1.0)
+            float_logs = _logs_to_float_dict(formatted)
+            for k, v in float_logs.items():
+                agg[k] = agg.get(k, 0.0) + v
+            seen += 1
         if seen == 0:
             return {}
         return {k: v / seen for k, v in agg.items()}
@@ -437,10 +482,10 @@ def train_model_from_pod5(
             if should_log:
                 _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
                 _log_wandb(float_logs, step)
-            need_val = val_ds is not None and val_every > 0 and step % val_every == 0
+            need_val = val_every > 0 and step % val_every == 0
             val_metrics = None
             if need_val:
-                val_metrics = _evaluate(gen_state, disc_state, val_ds, loss_weights, B_eval=B, val_limit=val_batches)
+                val_metrics = _evaluate(gen_state, disc_state, loss_weights, B_eval=B, val_limit=val_batches, seed_offset=step)
                 if val_metrics:
                     _log("[val] step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items()))
                     _log_wandb(val_metrics, step)
