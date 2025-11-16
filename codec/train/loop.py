@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Tuple
 
+from collections import deque
+
 import os
 
 import jax
@@ -53,16 +55,51 @@ def _make_lr_schedule(base_lr: float, warmup_steps: int, total_steps: int):
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
     "reconstruct_loss": "reconstruct_loss",
-    "perceptual_loss": "perceptual_loss",
     "commit_loss": "commit_loss",
-    "reconstruct_scaled": "nll_loss",
-    "gan_scaled_loss": "g_loss",
-    "feature_scaled_loss": "feature_loss",
+    "weighted_reconstruct_loss": "weighted_reconstruct_loss",
+    "weighted_commit_loss": "weighted_commit_loss",
+    "gan_raw_loss": "gan_loss",
+    "weighted_gan_loss": "weighted_gan_loss",
+    "feature_loss": "feature_loss",
+    "weighted_feature_loss": "weighted_feature_loss",
     "perplexity": "codebook_perplexity",
     "code_usage": "codebook_util",
     "disc_loss": "disc_loss",
-    "commit_scaled": "commit_term",
 }
+
+_CODEBOOK_STATS_WINDOW = 100
+
+
+class _CodebookStatsWindow:
+    def __init__(self, window_size: int = _CODEBOOK_STATS_WINDOW):
+        self.window_size = max(1, int(window_size))
+        self.buffer: deque[tuple[np.ndarray, float]] = deque()
+        self.accum: np.ndarray | None = None
+        self.total: float = 0.0
+
+    def add(self, counts: np.ndarray, total: float) -> None:
+        counts = np.asarray(counts, dtype=np.float64)
+        total = float(total)
+        if self.accum is None or self.accum.shape != counts.shape:
+            self.buffer.clear()
+            self.total = 0.0
+            self.accum = np.zeros_like(counts, dtype=np.float64)
+        self.accum += counts
+        self.total += total
+        self.buffer.append((counts, total))
+        if len(self.buffer) > self.window_size:
+            old_counts, old_total = self.buffer.popleft()
+            self.accum -= old_counts
+            self.total -= old_total
+
+    def metrics(self) -> tuple[float, float] | None:
+        if self.accum is None or self.total <= 0.0:
+            return None
+        probs = self.accum / max(self.total, 1.0)
+        safe_probs = np.where(probs > 0.0, probs, 1.0)
+        usage = float(np.mean(self.accum > 0.0))
+        perplexity = float(np.exp(-np.sum(probs * np.log(safe_probs + 1e-10))))
+        return usage, perplexity
 
 
 def _value_to_float(val):
@@ -77,14 +114,12 @@ def _value_to_float(val):
 
 
 def _simvq_style_logs(raw_logs: Dict[str, Any], split: str, disc_factor: float) -> Dict[str, Any]:
-    pref = f"{split}/"
+    del disc_factor
+    pref = "" if split == "train" else f"{split}/"
     out: Dict[str, Any] = {}
     for src, dst in _SIMVQ_KEY_MAPPING.items():
         if src in raw_logs:
             out[f"{pref}{dst}"] = raw_logs[src]
-    if "gan_coeff" in raw_logs:
-        out[f"{pref}d_weight"] = raw_logs["gan_coeff"]
-    out[f"{pref}disc_factor"] = jnp.asarray(disc_factor, dtype=jnp.float32)
     return out
 
 
@@ -154,13 +189,6 @@ def train_model_from_pod5(
             wandb_logger.log(metrics, step=step)
         except Exception as exc:
             _log(f"[warn] wandb log failed: {exc}")
-
-    def _with_vq_default(state: GeneratorTrainState) -> GeneratorTrainState:
-        if not hasattr(state, "vq_vars"):
-            return state.replace(vq_vars=freeze({}))
-        if state.vq_vars is None:
-            return state.replace(vq_vars=freeze({}))
-        return state
 
     rng = jax.random.PRNGKey(seed)
     rng, gen_init_rng, disc_init_rng, _ = jax.random.split(rng, 4)
@@ -244,6 +272,20 @@ def train_model_from_pod5(
         },
     )
     disc_state, _ = create_discriminator_state(disc_init_rng, discriminator, (B, L), lr_schedule_fn)
+
+    base_vq_vars = gen_state.vq_vars
+
+    def _with_vq_default(state: GeneratorTrainState) -> GeneratorTrainState:
+        vq_existing = getattr(state, "vq_vars", None)
+        try:
+            has_vq = vq_existing is not None and len(vq_existing) > 0
+        except TypeError:
+            has_vq = vq_existing is not None
+        if has_vq:
+            return state
+        if base_vq_vars is not None:
+            return state.replace(vq_vars=base_vq_vars)
+        return state
 
     if not isinstance(gen_state.params, FrozenDict):
         gen_state = gen_state.replace(params=freeze(gen_state.params))
@@ -350,8 +392,7 @@ def train_model_from_pod5(
         except Exception as _:
             pass
 
-    code_hist_accum = None
-    code_hist_total = 0.0
+    code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
 
     try:
         for step in range(1, num_steps + 1):
@@ -377,22 +418,20 @@ def train_model_from_pod5(
             if hist_counts is not None and hist_total is not None:
                 hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
                 total_np = float(jax.device_get(hist_total))
-                if code_hist_accum is None or code_hist_accum.shape != hist_np.shape:
-                    code_hist_accum = np.zeros_like(hist_np, dtype=np.float64)
-                code_hist_accum += hist_np
-                code_hist_total += total_np
-            usage_ratio = float(jax.device_get(jnp.asarray(logs.get("code_usage", 0.0)))) if "code_usage" in logs else 0.0
+                code_hist_window.add(hist_np, total_np)
+            usage_ratio = (
+                float(jax.device_get(jnp.asarray(logs["code_usage"])))
+                if "code_usage" in logs
+                else 0.0
+            )
             logs["code_usage"] = usage_ratio
             should_log = log_every > 0 and step % int(log_every) == 0
-            if should_log and code_hist_accum is not None and code_hist_total > 0.0:
-                probs = code_hist_accum / max(code_hist_total, 1.0)
-                safe_probs = np.where(probs > 0.0, probs, 1.0)
-                agg_usage = float(np.mean(code_hist_accum > 0.0))
-                agg_perplexity = float(np.exp(-np.sum(probs * np.log(safe_probs + 1e-10))))
-                logs["code_usage"] = agg_usage
-                logs["perplexity"] = agg_perplexity
-                code_hist_accum = None
-                code_hist_total = 0.0
+            if should_log:
+                agg = code_hist_window.metrics()
+                if agg is not None:
+                    usage, perplexity = agg
+                    logs["code_usage"] = usage
+                    logs["perplexity"] = perplexity
             formatted_logs = _simvq_style_logs(logs, "train", df)
             float_logs = _logs_to_float_dict(formatted_logs)
             if should_log:
@@ -488,6 +527,8 @@ def train_more(
             except Exception:
                 pass
 
+    code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
+
     for i in range(1, num_steps + 1):
         step_rng, apply_rng = jax.random.split(step_rng)
         batch = next(data_iter)
@@ -506,6 +547,23 @@ def train_more(
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
         disc_state = disc_state.apply_gradients(grads=d_grads)
         logs = dict(logs)
+        hist_counts = logs.pop("_code_hist_counts", None)
+        hist_total = logs.pop("_code_hist_total", None)
+        if hist_counts is not None and hist_total is not None:
+            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
+            total_np = float(jax.device_get(hist_total))
+            code_hist_window.add(hist_np, total_np)
+        usage_ratio = (
+            float(jax.device_get(jnp.asarray(logs["code_usage"])))
+            if "code_usage" in logs
+            else 0.0
+        )
+        logs["code_usage"] = usage_ratio
+        agg = code_hist_window.metrics()
+        if agg is not None:
+            usage, perplexity = agg
+            logs["code_usage"] = usage
+            logs["perplexity"] = perplexity
         formatted = _simvq_style_logs(logs, "train", df)
         float_logs = _logs_to_float_dict(formatted)
         if i % 200 == 0 or i == 1:

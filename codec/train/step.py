@@ -17,15 +17,14 @@ def compute_grads(
 ):
     def gen_loss_fn(params):
         vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
-        outs, mutable = gen_state.apply_fn(
+        outs = gen_state.apply_fn(
             {"params": params, "vq": vq_in},
             batch,
             train=True,
             offset=0,
             rng=rng,
-            mutable=["vq"],
         )
-        vq_vars = mutable.get("vq", None)
+        vq_vars = gen_state.vq_vars
         wave_hat = outs["wave_hat"]
         fake_map, fake_feats = disc_state.apply_fn(
             {"params": disc_state.params},

@@ -60,14 +60,12 @@ def compute_generator_losses(
     logs = {
         "total_loss": total,
         "reconstruct_loss": l_time,
-        "perceptual_loss": jnp.asarray(0.0, dtype=l_time.dtype),
         "commit_loss": commit_loss,
-        "reconstruct_scaled": recon_term,
-        "commit_scaled": commit_term,
+        "weighted_reconstruct_loss": recon_term,
+        "weighted_commit_loss": commit_term,
         "gan_raw_loss": l_g,
-        "gan_scaled_loss": gan_term,
-        "gan_coeff": w_gan,
+        "weighted_gan_loss": gan_term,
         "feature_loss": l_fm,
-        "feature_scaled_loss": feature_term,
+        "weighted_feature_loss": feature_term,
     }
     return total, logs
