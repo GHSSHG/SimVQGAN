@@ -2,7 +2,7 @@
   "seed": 0,
   "train": {
     "steps": 50000,
-    "batch_size": 64,
+    "batch_size": 256,
     "learning_rate": 0.0001,
     "lr_scheduler": {
       "warmup_steps": 0,
@@ -13,7 +13,7 @@
     "save_every": 1000,
     "keep_last": 5,
     "val_every": 1000,
-    "val_batches": 8,
+    "val_batches": 16,
     "log_every": 100,
     "loss_weights": {
       "time_l1": 1.0,
