@@ -274,6 +274,23 @@ def train_model_from_pod5(
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
+    # Optional compile warmup on dummy batch to avoid long stalls on first real step (e.g., Colab).
+    if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
+        _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
+        warm_rng, step_rng = jax.random.split(step_rng)
+        dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
+        df_warm = float(disc_factor if int(disc_start) <= 0 else 0.0)
+        # Trigger JIT compile; ignore outputs.
+        compute_grads(
+            gen_state,
+            disc_state,
+            dummy_batch,
+            warm_rng,
+            loss_weights,
+            df_warm,
+        )
+        _log("[warmup] Compile finished; starting real data iterator.")
+
     def _evaluate(gen_state, disc_state, val_ds, loss_w, B_eval: int = 1, val_limit: int | None = None):
         if val_ds is None:
             return {}

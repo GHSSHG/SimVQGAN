@@ -2,7 +2,7 @@
 numpy>=1.26
 
 # JAX/Flax ecosystem (install plain jax for CPU devs; switch to jax[cuda12_pip] on GPUs)
-jax[cuda12_pip]==0.4.33
+jax[cuda12_pip]==0.7.2
 flax>=0.8.3
 optax>=0.2.1
 

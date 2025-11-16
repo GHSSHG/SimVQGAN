@@ -2,7 +2,7 @@
   "seed": 0,
   "train": {
     "steps": 50000,
-    "batch_size": 256,
+    "batch_size": 64,
     "learning_rate": 0.0001,
     "lr_scheduler": {
       "warmup_steps": 0,
@@ -53,7 +53,7 @@
     "train": {
       "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
       "subdirs": ["."],
-      "files_per_epoch": 16
+      "files_per_epoch": 4
     },
     "validation": {
       "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
