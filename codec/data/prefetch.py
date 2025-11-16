@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import queue
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, Optional
 
 import numpy as np
 import jax
@@ -28,6 +28,7 @@ class Prefetcher:
         self._q: "queue.Queue[object]" = queue.Queue(maxsize=prefetch_size)
         self._SENTINEL = object()
         self._dtype = dtype
+        self._stop = threading.Event()
         self._t = threading.Thread(
             target=self._worker, args=(source_iter, squeeze_channel_dim), daemon=True
         )
@@ -36,6 +37,8 @@ class Prefetcher:
     def _worker(self, source_iter: Iterable[np.ndarray], squeeze_channel_dim: bool) -> None:
         try:
             for batch in source_iter:
+                if self._stop.is_set():
+                    break
                 arr = np.asarray(batch)
                 if squeeze_channel_dim and arr.ndim == 3 and arr.shape[1] == 1:
                     arr = arr.squeeze(1)
@@ -60,10 +63,25 @@ class Prefetcher:
         if self._t.is_alive():
             self._t.join()
 
+    def close(self) -> None:
+        """Signal the worker to stop and drain the queue."""
+        self._stop.set()
+        self._q.put(self._SENTINEL)
+        self.join()
 
-def make_device_prefetcher(host_iter, device_prefetch_size=2, shard_for_multigpu=True):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+
+
+def make_device_prefetcher(host_iter, device_prefetch_size=2, shard_for_multigpu=True, global_batch_size: Optional[int] = None):
     """Put batches onto device asynchronously; optionally shard across local devices."""
     ndev = jax.local_device_count()
+    if shard_for_multigpu and ndev > 1 and global_batch_size is not None:
+        if global_batch_size % ndev != 0:
+            raise ValueError(f"Global batch size {global_batch_size} not divisible by number of devices {ndev}.")
     if shard_for_multigpu and ndev > 1:
         def _shard(batch):
             def _reshape(x):

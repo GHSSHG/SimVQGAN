@@ -250,8 +250,18 @@ def train_model_from_pod5(
     if not isinstance(disc_state.params, FrozenDict):
         disc_state = disc_state.replace(params=freeze(disc_state.params))
 
-    host_iter = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=True), prefetch_size=8)
-    data_iter = iter(make_device_prefetcher(host_iter, device_prefetch_size=2, shard_for_multigpu=False))
+    host_iter = Prefetcher(
+        ds.batches(batch_size=B, drop_last=True, files_cycle=True),
+        prefetch_size=8,
+    )
+    data_iter = iter(
+        make_device_prefetcher(
+            host_iter,
+            device_prefetch_size=2,
+            shard_for_multigpu=False,
+            global_batch_size=B,
+        )
+    )
     if loss_weights is None:
         loss_weights = {
             "time_l1": 1.0,
@@ -269,43 +279,43 @@ def train_model_from_pod5(
             return {}
         from ..data.prefetch import Prefetcher
         Bv = max(1, min(B_eval, 16))
-        it = Prefetcher(val_ds.batches(batch_size=Bv, drop_last=True, files_cycle=False), prefetch_size=1)
-        agg: Dict[str, float] = {}
-        seen = 0
-        limit = val_limit if val_limit is not None and val_limit > 0 else None
-        for i, b in enumerate(it):
-            if limit is not None and i >= limit:
-                break
-            y = jnp.asarray(b)
-            rng_eval = jax.random.PRNGKey(seed ^ 0x5EED ^ i)
-            vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
-            outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, y, train=False, offset=0, rng=rng_eval)
-            y_hat = outs["wave_hat"]
-            fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, y_hat, train=False, return_features=True)
-            real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, y, train=False, return_features=True)
-            total_loss, gen_logs = compute_generator_losses(
-                y=y,
-                y_hat=y_hat,
-                fake_map=fake_map,
-                real_feats=real_feats,
-                fake_feats=fake_feats,
-                commit_loss=outs["enc"]["commit_loss"],
-                weights=loss_w,
-            )
-            gen_logs = dict(gen_logs)
-            gen_logs["total_loss"] = total_loss
-            gen_logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
-            usage_ratio = outs["enc"].get("usage_ratio")
-            if usage_ratio is not None:
-                gen_logs["code_usage"] = usage_ratio
-            gen_logs["disc_loss"] = hinge_d_loss(real_map, fake_map)
-            formatted = _simvq_style_logs(gen_logs, "val", 1.0)
-            float_logs = _logs_to_float_dict(formatted)
-            for k, v in float_logs.items():
-                agg[k] = agg.get(k, 0.0) + v
-            seen += 1
-            if limit is not None and seen >= limit:
-                break
+        with Prefetcher(val_ds.batches(batch_size=Bv, drop_last=True, files_cycle=False), prefetch_size=1) as it:
+            agg: Dict[str, float] = {}
+            seen = 0
+            limit = val_limit if val_limit is not None and val_limit > 0 else None
+            for i, b in enumerate(it):
+                if limit is not None and i >= limit:
+                    break
+                y = jnp.asarray(b)
+                rng_eval = jax.random.PRNGKey(seed ^ 0x5EED ^ i)
+                vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
+                outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, y, train=False, offset=0, rng=rng_eval)
+                y_hat = outs["wave_hat"]
+                fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, y_hat, train=False, return_features=True)
+                real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, y, train=False, return_features=True)
+                total_loss, gen_logs = compute_generator_losses(
+                    y=y,
+                    y_hat=y_hat,
+                    fake_map=fake_map,
+                    real_feats=real_feats,
+                    fake_feats=fake_feats,
+                    commit_loss=outs["enc"]["commit_loss"],
+                    weights=loss_w,
+                )
+                gen_logs = dict(gen_logs)
+                gen_logs["total_loss"] = total_loss
+                gen_logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
+                usage_ratio = outs["enc"].get("usage_ratio")
+                if usage_ratio is not None:
+                    gen_logs["code_usage"] = usage_ratio
+                gen_logs["disc_loss"] = hinge_d_loss(real_map, fake_map)
+                formatted = _simvq_style_logs(gen_logs, "val", 1.0)
+                float_logs = _logs_to_float_dict(formatted)
+                for k, v in float_logs.items():
+                    agg[k] = agg.get(k, 0.0) + v
+                seen += 1
+                if limit is not None and seen >= limit:
+                    break
         if seen == 0:
             return {}
         return {k: v / seen for k, v in agg.items()}
@@ -326,81 +336,84 @@ def train_model_from_pod5(
     code_hist_accum = None
     code_hist_total = 0.0
 
-    for step in range(1, num_steps + 1):
-        step_rng, apply_rng = jax.random.split(step_rng)
-        batch = next(data_iter)
-        # gate adversarial factor by disc_start
-        df = float(disc_factor if step >= int(disc_start) else 0.0)
-        g_grads, d_grads, logs, new_vq = compute_grads(
-            gen_state,
-            disc_state,
-            batch,
-            apply_rng,
-            loss_weights,
-            df,
-        )
-        g_grads = _force_frozen(g_grads)
-        d_grads = _force_frozen(d_grads)
-        gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-        disc_state = disc_state.apply_gradients(grads=d_grads)
-        logs = dict(logs)
-        hist_counts = logs.pop("_code_hist_counts", None)
-        hist_total = logs.pop("_code_hist_total", None)
-        if hist_counts is not None and hist_total is not None:
-            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
-            total_np = float(jax.device_get(hist_total))
-            if code_hist_accum is None or code_hist_accum.shape != hist_np.shape:
-                code_hist_accum = np.zeros_like(hist_np, dtype=np.float64)
-            code_hist_accum += hist_np
-            code_hist_total += total_np
-        usage_ratio = float(jax.device_get(jnp.asarray(logs.get("code_usage", 0.0)))) if "code_usage" in logs else 0.0
-        logs["code_usage"] = usage_ratio
-        should_log = log_every > 0 and step % int(log_every) == 0
-        if should_log and code_hist_accum is not None and code_hist_total > 0.0:
-            probs = code_hist_accum / max(code_hist_total, 1.0)
-            safe_probs = np.where(probs > 0.0, probs, 1.0)
-            agg_usage = float(np.mean(code_hist_accum > 0.0))
-            agg_perplexity = float(np.exp(-np.sum(probs * np.log(safe_probs + 1e-10))))
-            logs["code_usage"] = agg_usage
-            logs["perplexity"] = agg_perplexity
-            code_hist_accum = None
-            code_hist_total = 0.0
-        formatted_logs = _simvq_style_logs(logs, "train", df)
-        float_logs = _logs_to_float_dict(formatted_logs)
-        if should_log:
-            _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
-            _log_wandb(float_logs, step)
-        need_val = val_ds is not None and val_every > 0 and step % val_every == 0
-        val_metrics = None
-        if need_val:
-            val_metrics = _evaluate(gen_state, disc_state, val_ds, loss_weights, B_eval=B, val_limit=val_batches)
-            if val_metrics:
-                _log("[val] step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items()))
-                _log_wandb(val_metrics, step)
-        if ckpt_dir and (step % save_every == 0):
-            flax_ckpt.save_checkpoint(
-                ckpt_dir,
-                target={"gen": gen_state, "disc": disc_state},
-                step=step,
-                overwrite=True,
-                keep=keep_last,
+    try:
+        for step in range(1, num_steps + 1):
+            step_rng, apply_rng = jax.random.split(step_rng)
+            batch = next(data_iter)
+            # gate adversarial factor by disc_start
+            df = float(disc_factor if step >= int(disc_start) else 0.0)
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rng,
+                loss_weights,
+                df,
             )
-            _log(f"[ckpt] saved step={step} to {ckpt_dir}")
-        # optional best-ckpt on validation
-        if need_val and best_dir is not None and val_metrics:
-            metric_name = "val/total_loss"
-            score = val_metrics.get(metric_name)
-            if score is not None and (best_score is None or score < best_score):
-                os.makedirs(best_dir, exist_ok=True)
+            g_grads = _force_frozen(g_grads)
+            d_grads = _force_frozen(d_grads)
+            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+            logs = dict(logs)
+            hist_counts = logs.pop("_code_hist_counts", None)
+            hist_total = logs.pop("_code_hist_total", None)
+            if hist_counts is not None and hist_total is not None:
+                hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
+                total_np = float(jax.device_get(hist_total))
+                if code_hist_accum is None or code_hist_accum.shape != hist_np.shape:
+                    code_hist_accum = np.zeros_like(hist_np, dtype=np.float64)
+                code_hist_accum += hist_np
+                code_hist_total += total_np
+            usage_ratio = float(jax.device_get(jnp.asarray(logs.get("code_usage", 0.0)))) if "code_usage" in logs else 0.0
+            logs["code_usage"] = usage_ratio
+            should_log = log_every > 0 and step % int(log_every) == 0
+            if should_log and code_hist_accum is not None and code_hist_total > 0.0:
+                probs = code_hist_accum / max(code_hist_total, 1.0)
+                safe_probs = np.where(probs > 0.0, probs, 1.0)
+                agg_usage = float(np.mean(code_hist_accum > 0.0))
+                agg_perplexity = float(np.exp(-np.sum(probs * np.log(safe_probs + 1e-10))))
+                logs["code_usage"] = agg_usage
+                logs["perplexity"] = agg_perplexity
+                code_hist_accum = None
+                code_hist_total = 0.0
+            formatted_logs = _simvq_style_logs(logs, "train", df)
+            float_logs = _logs_to_float_dict(formatted_logs)
+            if should_log:
+                _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
+                _log_wandb(float_logs, step)
+            need_val = val_ds is not None and val_every > 0 and step % val_every == 0
+            val_metrics = None
+            if need_val:
+                val_metrics = _evaluate(gen_state, disc_state, val_ds, loss_weights, B_eval=B, val_limit=val_batches)
+                if val_metrics:
+                    _log("[val] step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items()))
+                    _log_wandb(val_metrics, step)
+            if ckpt_dir and (step % save_every == 0):
                 flax_ckpt.save_checkpoint(
-                    best_dir,
+                    ckpt_dir,
                     target={"gen": gen_state, "disc": disc_state},
                     step=step,
                     overwrite=True,
-                    keep=1,
+                    keep=keep_last,
                 )
-                best_score = score
-                _log(f"[best] step {step}: {metric_name}={score:.4f} (saved)")
+                _log(f"[ckpt] saved step={step} to {ckpt_dir}")
+            # optional best-ckpt on validation
+            if need_val and best_dir is not None and val_metrics:
+                metric_name = "val/total_loss"
+                score = val_metrics.get(metric_name)
+                if score is not None and (best_score is None or score < best_score):
+                    os.makedirs(best_dir, exist_ok=True)
+                    flax_ckpt.save_checkpoint(
+                        best_dir,
+                        target={"gen": gen_state, "disc": disc_state},
+                        step=step,
+                        overwrite=True,
+                        keep=1,
+                    )
+                    best_score = score
+                    _log(f"[best] step {step}: {metric_name}={score:.4f} (saved)")
+    finally:
+        host_iter.close()
     if log_fp is not None:
         try:
             log_fp.close()
