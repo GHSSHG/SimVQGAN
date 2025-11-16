@@ -1,0 +1,80 @@
+{
+  "seed": 0,
+  "train": {
+    "steps": 50000,
+    "batch_size": 256,
+    "learning_rate": 0.0001,
+    "lr_scheduler": {
+      "warmup_steps": 0,
+      "total_steps": 50000
+    },
+    "disc_start": 0,
+    "disc_factor": 1.0,
+    "save_every": 1000,
+    "keep_last": 5,
+    "val_every": 1000,
+    "val_batches": 8,
+    "log_every": 100,
+    "loss_weights": {
+      "time_l1": 1.0,
+      "commit": 1.0,
+      "gan": 0.1,
+      "feature": 0.2
+    }
+  },
+  "model": {
+    "base_channels": 128,
+    "enc_channels": [128, 128, 256, 256, 512],
+    "enc_down_strides": [4, 4, 4, 3],
+    "enc_num_res_blocks": 2,
+    "latent_dim": 128,
+    "codebook_size": 4096,
+    "beta": 0.25,
+    "legacy_beta": false,
+    "dec_channels": [512, 256, 256, 128, 128],
+    "dec_up_strides": [3, 4, 4, 4],
+    "dec_num_res_blocks": 2,
+    "discriminator": {
+      "channels": [64, 128, 256, 512],
+      "strides": [2, 2, 2, 2],
+      "kernel_size": 15,
+      "resblock_layers": 2
+    }
+  },
+  "data": {
+    "type": "pod5",
+    "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
+    "segment_sec": 4.8,
+    "sample_rate": 5000,
+    "files_per_epoch": 16,
+    "subdirs": ["."],
+    "loader_workers": 4,
+    "loader_prefetch_chunks": 256,
+    "train": {
+      "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
+      "subdirs": ["."],
+      "files_per_epoch": 16
+    },
+    "validation": {
+      "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
+      "subdirs": ["."]
+    }
+  },
+  "checkpoint": {
+    "dir": "/content/VQGAN/checkpoints/nanopore",
+    "resume_from": null,
+    "drive_backup_dir": "/content/drive/MyDrive/VQGAN/checkpoints/nanopore"
+  },
+  "logging": {
+    "wandb": {
+      "enabled": true,
+      "project": "simvq-nanopore",
+      "run_name": null,
+      "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
+    }
+  },
+  "optim": {
+    "codebook_lr_mult": 0.0,
+    "freeze_W": false
+  }
+}
