@@ -23,6 +23,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -31,11 +32,22 @@ import jax.numpy as jnp
 import numpy as np
 from flax.training import checkpoints as flax_ckpt
 
-import sys
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+DEFAULT_VAL_CONFIG = REPO_ROOT / "configs/validate_dorado.colab.json"
+DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs/train_config.colab.json"
+
+
+def _repo_path(path: Optional[Path]) -> Optional[Path]:
+    if path is None:
+        return None
+    path = Path(path)
+    if path.is_absolute():
+        return path
+    return REPO_ROOT / path
+
 
 from codec.models.model import SimVQAudioModel  # noqa: E402
 from codec.data.normalization import robust_scale_with_stats  # noqa: E402
@@ -186,8 +198,18 @@ def _compute_identity(real_fastq: Path, gen_fastq: Path) -> Dict[str, float]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Validate SimVQGAN reconstructions via Dorado basecalling.")
-    p.add_argument("--config", type=Path, default=Path("configs/validate_dorado.colab.json"), help="Path to validation config JSON.")
-    p.add_argument("--train-config", type=Path, default=None, help="Training config JSON used to derive model hyperparameters.")
+    p.add_argument(
+        "--config",
+        type=Path,
+        default=DEFAULT_VAL_CONFIG,
+        help=f"Path to validation config JSON (default: {DEFAULT_VAL_CONFIG}).",
+    )
+    p.add_argument(
+        "--train-config",
+        type=Path,
+        default=None,
+        help="Training config JSON used to derive model hyperparameters.",
+    )
     p.add_argument("--pod5", type=Path, required=False, help="Reference POD5 file for validation.")
     p.add_argument("--ckpt-final", type=Path, required=False, help="Checkpoint dir for final model.")
     p.add_argument("--ckpt-best", type=Path, required=False, help="Checkpoint dir for best model.")
@@ -197,9 +219,10 @@ def main() -> None:
     p.add_argument("--device", type=str, default=None, help="Dorado device, e.g., cuda:0 or cpu")
     args = p.parse_args()
 
-    cfg_data: Dict = {}
-    if args.config and args.config.exists():
-        cfg_data = json.loads(args.config.read_text())
+    cfg_path = _repo_path(args.config)
+    if cfg_path is None or not cfg_path.exists():
+        raise FileNotFoundError(f"Validation config not found at {cfg_path}")
+    cfg_data: Dict = json.loads(cfg_path.read_text())
 
     def _cfg_value(path: str, default=None):
         node = cfg_data
@@ -215,27 +238,30 @@ def main() -> None:
         val = _cfg_value(path, default)
         if val is None:
             return None
-        return Path(val)
+        return _repo_path(Path(val))
 
-    train_cfg_path = args.train_config if args.train_config else _cfg_path("train_config", Path("configs/train_config.colab.json"))
+    train_cfg_path = (
+        _repo_path(args.train_config)
+        if args.train_config
+        else _cfg_path("train_config", DEFAULT_TRAIN_CONFIG)
+    )
     if train_cfg_path is None:
-        raise FileNotFoundError("Training config path missing; provide --train-config or set train_config in validation config.")
+        raise FileNotFoundError(
+            "Training config path missing; provide --train-config or set train_config in validation config."
+        )
     train_cfg = json.loads(train_cfg_path.read_text())
     data_cfg = train_cfg.get("data", {})
-    pod5_path = args.pod5 if args.pod5 else _cfg_path("pod5")
+    pod5_path = _repo_path(args.pod5) if args.pod5 else _cfg_path("pod5")
     if pod5_path is None:
         raise FileNotFoundError("Validation POD5 path missing; set --pod5 or 'pod5' in validation config.")
-    pod5_path = Path(pod5_path)
-    ckpt_final = args.ckpt_final if args.ckpt_final else _cfg_path("ckpt_final")
+    ckpt_final = _repo_path(args.ckpt_final) if args.ckpt_final else _cfg_path("ckpt_final")
     if ckpt_final is None:
         raise FileNotFoundError("Final checkpoint path missing; set --ckpt-final or 'ckpt_final' in validation config.")
-    ckpt_final = Path(ckpt_final)
-    ckpt_best = args.ckpt_best if args.ckpt_best else _cfg_path("ckpt_best")
-    ckpt_best = Path(ckpt_best) if ckpt_best is not None else None
-    out_dir = args.out_dir if args.out_dir is not None else _cfg_path("out_dir")
+    ckpt_best = _repo_path(args.ckpt_best) if args.ckpt_best else _cfg_path("ckpt_best")
+    out_dir = _repo_path(args.out_dir) if args.out_dir is not None else _cfg_path("out_dir")
     if out_dir is None:
         out_dir = Path("dorado_eval")
-    out_dir = Path(out_dir)
+    out_dir = _repo_path(out_dir)
     dorado_bin = args.dorado_bin or _cfg_value("dorado.bin", "dorado")
     dorado_model = args.dorado_model or _cfg_value("dorado.model")
     device = args.device or _cfg_value("dorado.device", "cuda:0")
