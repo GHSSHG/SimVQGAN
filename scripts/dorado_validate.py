@@ -40,6 +40,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_VAL_CONFIG = REPO_ROOT / "configs/validate_dorado.colab.json"
+OUTPUT_FILES = [
+    "real_trimmed.pod5",
+    "real.fastq",
+    "final_generated.pod5",
+    "final_generated.fastq",
+    "best_generated.pod5",
+    "best_generated.fastq",
+    "dorado_report.json",
+]
 
 
 def _pick_local_root() -> Path:
@@ -418,6 +427,11 @@ def main() -> None:
     p.add_argument("--dorado-bin", type=str, default=None, help="Path to Dorado binary.")
     p.add_argument("--dorado-model", type=str, required=False, help="Dorado model identifier or path (e.g., dna_r10.4.1_e8.2_260bps_sup@v4.3.0).")
     p.add_argument("--device", type=str, default=None, help="Dorado device, e.g., cuda:0 or cpu")
+    p.add_argument(
+        "--reuse-out-dir",
+        action="store_true",
+        help="If set, reuse existing artifacts from out_dir (Drive) to local staging instead of recomputing when possible.",
+    )
     args = p.parse_args()
 
     cfg_path = _repo_path(args.config)
@@ -481,6 +495,25 @@ def main() -> None:
     if dorado_model and not dorado_bin:
         dorado_bin = "dorado"
 
+    # Optional reuse: copy existing out_dir artifacts back to local to skip recompute
+    reuse = bool(args.reuse_out_dir)
+    reuse_map = {}
+    if reuse and out_dir.exists():
+        print(f"[reuse] attempting to reuse artifacts from {out_dir}", flush=True)
+        for fname in OUTPUT_FILES:
+            src = out_dir / fname
+            if src.exists():
+                dst = LOCAL_ROOT / fname
+                try:
+                    shutil.copy2(src, dst)
+                    reuse_map[fname] = dst
+                    print(f"[reuse] copied {src} -> {dst}", flush=True)
+                except Exception as exc:
+                    print(f"[reuse] failed to copy {src}: {exc}", flush=True)
+
+    def _should_skip(name: str) -> bool:
+        return reuse and (name in reuse_map)
+
     print(f"[stage] Copying POD5/checkpoints/dorado assets to {LOCAL_ROOT} ...", flush=True)
     pod5_local = _localize_file(pod5_path, LOCAL_POD5_DIR)
     ckpt_final_local = _localize_tree(ckpt_final, LOCAL_CKPT_DIR)
@@ -497,7 +530,11 @@ def main() -> None:
     total_reads = _count_reads(pod5_local)
     L = int(round(segment_sec * sample_rate))
     trimmed_local_pod5 = LOCAL_ROOT / "real_trimmed.pod5"
-    trimmed_used = _write_truncated_pod5(pod5_local, trimmed_local_pod5, L, total_reads, "real")
+    if not _should_skip("real_trimmed.pod5"):
+        trimmed_used = _write_truncated_pod5(pod5_local, trimmed_local_pod5, L, total_reads, "real")
+    else:
+        print("[reuse] Using cached real_trimmed.pod5", flush=True)
+        trimmed_used = _count_reads(trimmed_local_pod5)
     trimmed_real_pod5 = out_dir / "real_trimmed.pod5"
     if trimmed_local_pod5 != trimmed_real_pod5:
         print(f"[real] Copying trimmed POD5 to {trimmed_real_pod5}", flush=True)
@@ -508,9 +545,12 @@ def main() -> None:
     if dorado_model_local:
         print("[stage] Basecalling real (trimmed) POD5 with Dorado ...", flush=True)
         real_fastq = LOCAL_ROOT / "real.fastq"
-        if real_fastq.exists():
-            real_fastq.unlink()
-        _run_dorado(dorado_bin_local, dorado_model_local, trimmed_local_pod5, real_fastq, device)
+        if not _should_skip("real.fastq"):
+            if real_fastq.exists():
+                real_fastq.unlink()
+            _run_dorado(dorado_bin_local, dorado_model_local, trimmed_local_pod5, real_fastq, device)
+        else:
+            print("[reuse] Using cached real.fastq", flush=True)
         real_fastq_persist = out_dir / "real.fastq"
         if real_fastq_persist != real_fastq:
             shutil.copy2(real_fastq, real_fastq_persist)
@@ -523,11 +563,14 @@ def main() -> None:
         report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
         if dorado_model_local:
             gen_fastq_local = LOCAL_ROOT / f"{tag}_generated.fastq"
-            if gen_fastq_local.exists():
-                gen_fastq_local.unlink()
             gen_fastq_persist = out_dir / f"{tag}_generated.fastq"
-            print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
-            _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq_local, device)
+            if not _should_skip(f"{tag}_generated.fastq"):
+                if gen_fastq_local.exists():
+                    gen_fastq_local.unlink()
+                print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
+                _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq_local, device)
+            else:
+                print(f"[reuse] Using cached {tag}_generated.fastq", flush=True)
             if gen_fastq_persist != gen_fastq_local:
                 shutil.copy2(gen_fastq_local, gen_fastq_persist)
             ident = _compute_identity(real_fastq, gen_fastq_local) if real_fastq else {}
