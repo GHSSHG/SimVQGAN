@@ -1,5 +1,5 @@
 {
-  "pod5": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5/PBC83240_b2b54521_13d14a35_116.pod5",
+  "pod5": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC02/pod5/PBC83240_b2b54521_13d14a35_116.pod5",
   "ckpt_final": "/content/drive/MyDrive/VQGAN/checkpoints/final",
   "ckpt_best": "/content/drive/MyDrive/VQGAN/checkpoints/best",
   "out_dir": "/content/drive/MyDrive/VQGAN/dorado_eval",
