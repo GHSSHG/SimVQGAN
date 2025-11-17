@@ -31,8 +31,14 @@ import jax.numpy as jnp
 import numpy as np
 from flax.training import checkpoints as flax_ckpt
 
-from codec.models.model import SimVQAudioModel
-from codec.data.normalization import robust_scale_with_stats
+import sys
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from codec.models.model import SimVQAudioModel  # noqa: E402
+from codec.data.normalization import robust_scale_with_stats  # noqa: E402
 
 try:
     import pod5
