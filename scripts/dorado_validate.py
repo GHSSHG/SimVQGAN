@@ -85,6 +85,31 @@ def _is_in_local_cache(path: Path) -> bool:
     return False
 
 
+def _localize_dorado_bin(bin_path: Optional[str]) -> Optional[str]:
+    if not bin_path:
+        return bin_path
+    path = Path(bin_path)
+    if not path.exists():
+        return bin_path
+    if _is_in_local_cache(path):
+        return str(path)
+    if path.is_dir():
+        localized_dir = _localize_tree(path, LOCAL_DORADO_DIR)
+        return str(localized_dir)
+    bundle_root = path.parent
+    if bundle_root.name == "bin" and (bundle_root.parent / "lib").exists():
+        bundle_root = bundle_root.parent
+    local_bundle = _localize_tree(bundle_root, LOCAL_DORADO_DIR)
+    if local_bundle is None:
+        return str(path)
+    try:
+        rel = path.relative_to(bundle_root)
+        return str(local_bundle / rel)
+    except ValueError:
+        localized_file = _localize_file(path, LOCAL_DORADO_DIR)
+        return str(localized_file) if localized_file else str(path)
+
+
 def _repo_path(path: Optional[Path]) -> Optional[Path]:
     if path is None:
         return None
@@ -348,6 +373,12 @@ def main() -> None:
         default=None,
         help="Model config JSON to recreate generator (default: use embedded settings from validation config).",
     )
+    p.add_argument(
+        "--train-config",
+        type=Path,
+        default=None,
+        help="Legacy training config JSON to fall back on for model/window settings.",
+    )
     p.add_argument("--pod5", type=Path, required=False, help="Reference POD5 file for validation.")
     p.add_argument("--ckpt-final", type=Path, required=False, help="Checkpoint dir for final model.")
     p.add_argument("--ckpt-best", type=Path, required=False, help="Checkpoint dir for best model.")
@@ -368,13 +399,28 @@ def main() -> None:
             return None
         return _repo_path(Path(value))
 
-    model_cfg = cfg_data.get("model", {})
+    train_cfg = None
+    train_cfg_path = args.train_config or cfg_data.get("train_config")
+    if train_cfg_path:
+        train_cfg_path = _repo_path(Path(train_cfg_path))
+        if train_cfg_path is None or not train_cfg_path.exists():
+            raise FileNotFoundError(f"Training config path missing: {train_cfg_path}")
+        train_cfg = json.loads(train_cfg_path.read_text())
+
+    model_cfg = {}
     if args.model_config:
         model_cfg = json.loads(_repo_path(args.model_config).read_text())
+    elif "model" in cfg_data:
+        model_cfg = cfg_data["model"]
+    elif train_cfg:
+        model_cfg = train_cfg.get("model", {})
     if not model_cfg:
-        raise ValueError("Model config missing; define 'model' in validation config or provide --model-config.")
+        raise ValueError("Model config missing; define 'model' in validation config, provide --model-config, or include train_config.")
 
-    window_cfg = cfg_data.get("window") or cfg_data.get("data") or {}
+    window_cfg = cfg_data.get("window") or cfg_data.get("data")
+    if not window_cfg and train_cfg:
+        window_cfg = train_cfg.get("data")
+    window_cfg = window_cfg or {}
     segment_sec = float(window_cfg.get("segment_sec", 4.8))
     sample_rate = float(window_cfg.get("sample_rate", 5000.0))
     L = int(round(segment_sec * sample_rate))
@@ -408,9 +454,7 @@ def main() -> None:
     ckpt_final_local = _localize_tree(ckpt_final, LOCAL_CKPT_DIR)
     ckpt_best_local = _localize_tree(ckpt_best, LOCAL_CKPT_DIR) if ckpt_best is not None else None
 
-    dorado_bin_local = dorado_bin
-    if dorado_bin and Path(dorado_bin).exists():
-        dorado_bin_local = str(_localize_file(Path(dorado_bin), LOCAL_DORADO_DIR, keep_name="dorado"))
+    dorado_bin_local = _localize_dorado_bin(dorado_bin)
 
     dorado_model_local = dorado_model
     if dorado_model and Path(dorado_model).exists():
