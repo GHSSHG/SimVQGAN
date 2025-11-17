@@ -215,8 +215,18 @@ def _load_generator(ckpt_dir: Path, model_cfg: Dict, L: int):
     if not isinstance(restored, dict) or "gen" not in restored:
         raise ValueError(f"Checkpoint at {ckpt_dir} missing generator state")
     gen_state = restored["gen"]
-    params = gen_state.params
-    vq_vars = gen_state.vq_vars if getattr(gen_state, "vq_vars", None) is not None else variables.get("vq", {})
+    params = None
+    vq_vars = None
+    if hasattr(gen_state, "params"):
+        params = gen_state.params
+        vq_vars = getattr(gen_state, "vq_vars", None)
+    elif isinstance(gen_state, dict):
+        params = gen_state.get("params")
+        vq_vars = gen_state.get("vq_vars") or gen_state.get("vq")
+    if params is None:
+        raise ValueError(f"Generator checkpoint at {ckpt_dir} missing params field (type={type(gen_state)})")
+    if vq_vars is None:
+        vq_vars = variables.get("vq", {})
     return model, params, vq_vars
 
 
