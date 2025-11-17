@@ -66,7 +66,9 @@ def parse_args() -> argparse.Namespace:
     )
     # validation options
     p.add_argument("--val-every", type=int, default=2000, help="Run lightweight validation every N steps")
-    p.add_argument("--val-batches", type=int, default=2, help="Number of training-derived batches per validation run")
+    p.add_argument("--val-batches", type=int, default=2, help="Number of validation batches per run (<=0 means no cap)")
+    p.add_argument("--val-root", type=Path, default=None, help="Optional separate root for validation POD5")
+    p.add_argument("--val-subdirs", nargs="*", default=None, help="Optional subdirectories for validation")
     p.add_argument("--seed", type=int, default=None, help="Optional seed; if omitted, derive a new epoch seed")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
@@ -237,11 +239,23 @@ def main() -> None:
             base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
         train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
+        val_spec = None
+        if data_cfg.get("validation"):
+            val_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("validation"))
+            val_spec["root"] = _resolve_data_path(val_spec.get("root"), cfg_dir)
+            val_spec.pop("files_per_epoch", None)
         ds, _ = _prepare_split_dataset(
             split_cfg=train_spec,
             seed=seed,
             allow_pick=True,
         )
+        val_ds = None
+        if val_spec is not None:
+            val_ds, _ = _prepare_split_dataset(
+                split_cfg=val_spec,
+                seed=seed,
+                allow_pick=False,
+            )
 
         ckpt_dir = str(Path(ckpt_cfg.get("dir", "./checkpoints/vqgan")).resolve())
         resume_from = ckpt_cfg.get("resume_from", None)
@@ -274,6 +288,7 @@ def main() -> None:
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
+                val_ds=val_ds,
                 val_every=val_every,
                 val_batches=val_batches,
                 resume_from=str(resume_from) if resume_from is not None else None,
@@ -320,6 +335,23 @@ def main() -> None:
         seed=int(seed),
         allow_pick=True,
     )
+    val_ds = None
+    if args.val_root is not None:
+        val_spec = {
+            "type": "pod5",
+            "root": str(args.val_root),
+            "subdirs": args.val_subdirs or ["."],
+            "segment_sec": float(args.segment_sec),
+            "sample_rate": float(args.sample_rate),
+            "loader_workers": legacy_loader_workers,
+            "loader_prefetch_chunks": legacy_loader_prefetch,
+        }
+        val_spec.pop("files_per_epoch", None)
+        val_ds, _ = _prepare_split_dataset(
+            split_cfg=val_spec,
+            seed=int(seed),
+            allow_pick=False,
+        )
 
     ckpt_dir = str(args.ckpt_dir)
     val_batches_arg = None if args.val_batches <= 0 else int(args.val_batches)
@@ -350,6 +382,7 @@ def main() -> None:
             lr_warmup_steps=1000,
             lr_total_steps=int(args.steps),
             batch_size=int(args.batch_size),
+            val_ds=val_ds,
             val_every=int(args.val_every),
             val_batches=val_batches_arg,
             wandb_logger=wandb_logger,

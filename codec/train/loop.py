@@ -149,6 +149,7 @@ def train_model_from_pod5(
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
+    val_ds: NanoporeSignalDataset | None = None,
     val_every: int = 2000,
     val_batches: int | None = 8,
     resume_from: str | None = None,
