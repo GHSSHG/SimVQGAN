@@ -1,9 +1,25 @@
 {
-  "train_config": "configs/train_config.colab.json",
   "pod5": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5/PBC83240_b2b54521_13d14a35_116.pod5",
   "ckpt_final": "/content/drive/MyDrive/VQGAN/checkpoints/final",
   "ckpt_best": "/content/drive/MyDrive/VQGAN/checkpoints/best",
   "out_dir": "/content/drive/MyDrive/VQGAN/dorado_eval",
+  "window": {
+    "segment_sec": 4.8,
+    "sample_rate": 5000.0
+  },
+  "model": {
+    "base_channels": 128,
+    "enc_channels": [128, 128, 256, 256, 512],
+    "enc_down_strides": [4, 4, 4, 3],
+    "enc_num_res_blocks": 2,
+    "latent_dim": 128,
+    "codebook_size": 4096,
+    "beta": 0.25,
+    "legacy_beta": false,
+    "dec_channels": [512, 256, 256, 128, 128],
+    "dec_up_strides": [3, 4, 4, 4],
+    "dec_num_res_blocks": 2
+  },
   "dorado": {
     "bin": "/content/drive/MyDrive/dorado/dorado-1.2.0-linux-x64/bin/dorado",
     "model": "/content/drive/MyDrive/dorado/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0",

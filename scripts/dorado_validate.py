@@ -9,11 +9,11 @@ Steps:
 
 Usage (Colab):
     python scripts/dorado_validate.py \\
-        --config configs/train_config.colab.json \\
+        --config configs/validate_dorado.colab.json \\
         --pod5 /content/drive/MyDrive/ont_open_data/.../PBC83240_b2b54521_13d14a35_116.pod5 \\
         --ckpt-final /content/drive/MyDrive/VQGAN/checkpoints/final \\
         --ckpt-best /content/drive/MyDrive/VQGAN/checkpoints/best \\
-        --out-dir /content/drive/MyDrive/VQGAN/dorado_eval \\
+        --out-dir /content/VQGAN/dorado_eval \\
         --dorado-model dna_r10.4.1_e8.2_260bps_sup@v4.3.0 \\
         --dorado-bin dorado
 """
@@ -21,7 +21,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -37,7 +39,50 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 DEFAULT_VAL_CONFIG = REPO_ROOT / "configs/validate_dorado.colab.json"
-DEFAULT_TRAIN_CONFIG = REPO_ROOT / "configs/train_config.colab.json"
+
+
+def _pick_local_root() -> Path:
+    """Choose a writable staging root: prefer /content in Colab, else repo-local."""
+    for cand in (Path("/content"), REPO_ROOT / ".local_cache"):
+        try:
+            cand.mkdir(parents=True, exist_ok=True)
+            probe = cand / ".probe"
+            probe.write_text("ok", encoding="utf-8")
+            probe.unlink()
+            return cand
+        except Exception:
+            continue
+    return REPO_ROOT
+
+
+LOCAL_ROOT = _pick_local_root()
+LOCAL_POD5_DIR = LOCAL_ROOT / "local_pod5"
+LOCAL_CKPT_DIR = LOCAL_ROOT / "local_ckpts"
+LOCAL_DORADO_DIR = LOCAL_ROOT / "local_dorado"
+_LOCAL_CACHE_DIRS = (
+    LOCAL_POD5_DIR,
+    LOCAL_CKPT_DIR,
+    LOCAL_DORADO_DIR,
+)
+
+
+def _resolve_safe(path: Path) -> Path:
+    try:
+        return path.resolve()
+    except FileNotFoundError:
+        return path.absolute()
+
+
+def _is_in_local_cache(path: Path) -> bool:
+    resolved = _resolve_safe(Path(path))
+    for base in _LOCAL_CACHE_DIRS:
+        base_resolved = _resolve_safe(base)
+        try:
+            if os.path.commonpath([str(resolved), str(base_resolved)]) == str(base_resolved):
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _repo_path(path: Optional[Path]) -> Optional[Path]:
@@ -47,6 +92,55 @@ def _repo_path(path: Optional[Path]) -> Optional[Path]:
     if path.is_absolute():
         return path
     return REPO_ROOT / path
+
+
+def _localize_file(src: Optional[Path], dst_dir: Path, keep_name: Optional[str] = None) -> Optional[Path]:
+    """Copy a file into dst_dir if it is not already under /content; return destination path."""
+    if src is None:
+        return None
+    src = Path(src)
+    if _is_in_local_cache(src):
+        return src
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / (keep_name if keep_name else src.name)
+    if dst.exists():
+        return dst
+    print(f"[copy] {src} -> {dst}", flush=True)
+    shutil.copy2(src, dst)
+    return dst
+
+
+def _localize_tree(src: Optional[Path], dst_dir: Path) -> Optional[Path]:
+    """Copy a directory (or file) into dst_dir; if src is under /content, return as-is."""
+    if src is None:
+        return None
+    src = Path(src)
+    if _is_in_local_cache(src):
+        return src
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    dst = dst_dir / src.name
+    if dst.exists():
+        return dst
+    print(f"[copy] {src} -> {dst}", flush=True)
+    if src.is_dir():
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dst)
+    return dst
+
+
+def _progress_markers(total: int) -> list[int]:
+    if total <= 0:
+        return []
+    marks: list[int] = []
+    for pct in range(1, 10):
+        mark = max(1, math.ceil(total * pct / 10))
+        if marks and mark == marks[-1]:
+            continue
+        marks.append(mark)
+    if not marks or marks[-1] != total:
+        marks.append(total)
+    return marks
 
 
 from codec.models.model import SimVQAudioModel  # noqa: E402
@@ -102,13 +196,12 @@ def _load_generator(ckpt_dir: Path, model_cfg: Dict, L: int):
 
 
 def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int) -> np.ndarray:
-    # robust normalize full read and keep stats for inversion
+    """Normalize, window, run generator, and invert scale. Tail shorter than L is dropped."""
     norm, median, scale = robust_scale_with_stats(signal, eps=1e-6)
-    # chop into windows
     n = norm.shape[0]
     windows = n // L
     if windows <= 0:
-        return signal  # too short; fallback to original
+        return np.asarray([], dtype=np.int16)
     norm = norm[: windows * L].reshape(windows, L)
     y = jnp.asarray(norm)
     rng = jax.random.PRNGKey(0)
@@ -120,25 +213,69 @@ def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int) -> np.
     return reconstructed
 
 
-def _write_generated_pod5(src_path: Path, dst_path: Path, model, params, vq_vars, L: int) -> Tuple[int, int]:
-    total_reads = 0
+def _count_reads(pod5_path: Path) -> int:
+    print(f"[count] Scanning {pod5_path} ...", flush=True)
+    with pod5.Reader(str(pod5_path)) as reader:
+        attr = getattr(reader, "num_reads", None)
+        if isinstance(attr, int):
+            total = attr
+        else:
+            total = 0
+            for _ in reader.reads():
+                total += 1
+    print(f"[count] Found {total} reads", flush=True)
+    return total
+
+
+def _write_truncated_pod5(src_path: Path, dst_path: Path, L: int, total_reads: int, label: str) -> int:
+    """Write a POD5 with signals truncated to multiples of L; drop reads shorter than L."""
+    print(f"[{label}] Writing truncated POD5 -> {dst_path}", flush=True)
     used_reads = 0
+    markers = _progress_markers(total_reads)
     with pod5.Reader(str(src_path)) as reader, Writer(str(dst_path)) as writer:
-        for record in reader.reads():
-            total_reads += 1
+        for idx, record in enumerate(reader.reads(), start=1):
+            while markers and idx >= markers[0]:
+                pct = (markers[0] / max(total_reads, 1)) * 100
+                print(f"[{label}] progress: {idx}/{total_reads} ({pct:.1f}%)", flush=True)
+                markers.pop(0)
             raw = record.signal
-            if raw.shape[0] < L:
-                writer.add_read(record.to_read())  # keep original if too short
-                continue
+            n = raw.shape[0]
+            windows = n // L
+            if windows <= 0:
+                continue  # drop short read
+            trimmed = raw[: windows * L]
+            read = record.to_read()
+            read.signal = trimmed.astype(np.int16, copy=False)
+            writer.add_read(read)
+            used_reads += 1
+    print(f"[{label}] done. kept {used_reads}/{total_reads} reads", flush=True)
+    return used_reads
+
+
+def _write_generated_pod5(src_path: Path, dst_path: Path, model, params, vq_vars, L: int, total_reads: int) -> Tuple[int, int]:
+    print(f"[gen] Generating POD5 -> {dst_path}", flush=True)
+    used_reads = 0
+    markers = _progress_markers(total_reads)
+    with pod5.Reader(str(src_path)) as reader, Writer(str(dst_path)) as writer:
+        for idx, record in enumerate(reader.reads(), start=1):
+            while markers and idx >= markers[0]:
+                pct = (markers[0] / max(total_reads, 1)) * 100
+                print(f"[gen] progress: {idx}/{total_reads} ({pct:.1f}%)", flush=True)
+                markers.pop(0)
+            raw = record.signal
             gen_signal = _reconstruct_read(model, params, vq_vars, raw, L)
+            if gen_signal.size == 0:
+                continue  # drop short
             read = record.to_read()
             read.signal = gen_signal
             writer.add_read(read)
             used_reads += 1
+    print(f"[gen] done. kept {used_reads}/{total_reads} reads", flush=True)
     return used_reads, total_reads
 
 
 def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: Path, device: str) -> None:
+    print(f"[dorado] {pod5_path.name} -> {out_fastq}", flush=True)
     cmd = [
         dorado_bin,
         "basecaller",
@@ -151,6 +288,7 @@ def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: 
         proc = subprocess.run(cmd, stdout=fp, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         raise RuntimeError(f"Dorado failed on {pod5_path}: {proc.stderr}")
+    print(f"[dorado] finished {pod5_path.name}", flush=True)
 
 
 def _read_fastq(path: Path) -> Dict[str, str]:
@@ -205,10 +343,10 @@ def main() -> None:
         help=f"Path to validation config JSON (default: {DEFAULT_VAL_CONFIG}).",
     )
     p.add_argument(
-        "--train-config",
+        "--model-config",
         type=Path,
         default=None,
-        help="Training config JSON used to derive model hyperparameters.",
+        help="Model config JSON to recreate generator (default: use embedded settings from validation config).",
     )
     p.add_argument("--pod5", type=Path, required=False, help="Reference POD5 file for validation.")
     p.add_argument("--ckpt-final", type=Path, required=False, help="Checkpoint dir for final model.")
@@ -222,79 +360,102 @@ def main() -> None:
     cfg_path = _repo_path(args.config)
     if cfg_path is None or not cfg_path.exists():
         raise FileNotFoundError(f"Validation config not found at {cfg_path}")
+    print(f"[setup] Using config {cfg_path}", flush=True)
     cfg_data: Dict = json.loads(cfg_path.read_text())
 
-    def _cfg_value(path: str, default=None):
-        node = cfg_data
-        for part in path.split("."):
-            if not isinstance(node, dict):
-                return default
-            node = node.get(part)
-            if node is None:
-                return default
-        return node
-
-    def _cfg_path(path: str, default=None):
-        val = _cfg_value(path, default)
-        if val is None:
+    def _resolve_path(value: Optional[str]) -> Optional[Path]:
+        if value is None:
             return None
-        return _repo_path(Path(val))
+        return _repo_path(Path(value))
 
-    train_cfg_path = (
-        _repo_path(args.train_config)
-        if args.train_config
-        else _cfg_path("train_config", DEFAULT_TRAIN_CONFIG)
-    )
-    if train_cfg_path is None:
-        raise FileNotFoundError(
-            "Training config path missing; provide --train-config or set train_config in validation config."
-        )
-    train_cfg = json.loads(train_cfg_path.read_text())
-    data_cfg = train_cfg.get("data", {})
-    pod5_path = _repo_path(args.pod5) if args.pod5 else _cfg_path("pod5")
-    if pod5_path is None:
-        raise FileNotFoundError("Validation POD5 path missing; set --pod5 or 'pod5' in validation config.")
-    ckpt_final = _repo_path(args.ckpt_final) if args.ckpt_final else _cfg_path("ckpt_final")
-    if ckpt_final is None:
-        raise FileNotFoundError("Final checkpoint path missing; set --ckpt-final or 'ckpt_final' in validation config.")
-    ckpt_best = _repo_path(args.ckpt_best) if args.ckpt_best else _cfg_path("ckpt_best")
-    out_dir = _repo_path(args.out_dir) if args.out_dir is not None else _cfg_path("out_dir")
-    if out_dir is None:
-        out_dir = Path("dorado_eval")
-    out_dir = _repo_path(out_dir)
-    dorado_bin = args.dorado_bin or _cfg_value("dorado.bin", "dorado")
-    dorado_model = args.dorado_model or _cfg_value("dorado.model")
-    device = args.device or _cfg_value("dorado.device", "cuda:0")
-    segment_sec = float(data_cfg.get("segment_sec", 4.8))
-    sample_rate = float(data_cfg.get("sample_rate", 5000.0))
+    model_cfg = cfg_data.get("model", {})
+    if args.model_config:
+        model_cfg = json.loads(_repo_path(args.model_config).read_text())
+    if not model_cfg:
+        raise ValueError("Model config missing; define 'model' in validation config or provide --model-config.")
+
+    window_cfg = cfg_data.get("window") or cfg_data.get("data") or {}
+    segment_sec = float(window_cfg.get("segment_sec", 4.8))
+    sample_rate = float(window_cfg.get("sample_rate", 5000.0))
     L = int(round(segment_sec * sample_rate))
-    model_cfg = train_cfg.get("model", {})
 
+    pod5_path = _repo_path(args.pod5) if args.pod5 else _resolve_path(cfg_data.get("pod5"))
+    if pod5_path is None or not pod5_path.exists():
+        raise FileNotFoundError(f"Validation POD5 path missing: {pod5_path}")
+
+    ckpt_final = _repo_path(args.ckpt_final) if args.ckpt_final else _resolve_path(cfg_data.get("ckpt_final"))
+    if ckpt_final is None or not ckpt_final.exists():
+        raise FileNotFoundError(f"Final checkpoint path missing: {ckpt_final}")
+
+    ckpt_best = _repo_path(args.ckpt_best) if args.ckpt_best else _resolve_path(cfg_data.get("ckpt_best"))
+    if ckpt_best is not None and not ckpt_best.exists():
+        raise FileNotFoundError(f"Best checkpoint path missing: {ckpt_best}")
+
+    out_dir = _repo_path(args.out_dir) if args.out_dir else _resolve_path(cfg_data.get("out_dir"))
+    if out_dir is None:
+        out_dir = REPO_ROOT / "dorado_eval"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Prepare real fastq if Dorado model provided
+    dorado_cfg = cfg_data.get("dorado", {})
+    dorado_bin = args.dorado_bin or dorado_cfg.get("bin")
+    dorado_model = args.dorado_model or dorado_cfg.get("model")
+    device = args.device or dorado_cfg.get("device", "cuda:0")
+    if dorado_model and not dorado_bin:
+        dorado_bin = "dorado"
+
+    print(f"[stage] Copying POD5/checkpoints/dorado assets to {LOCAL_ROOT} ...", flush=True)
+    pod5_local = _localize_file(pod5_path, LOCAL_POD5_DIR)
+    ckpt_final_local = _localize_tree(ckpt_final, LOCAL_CKPT_DIR)
+    ckpt_best_local = _localize_tree(ckpt_best, LOCAL_CKPT_DIR) if ckpt_best is not None else None
+
+    dorado_bin_local = dorado_bin
+    if dorado_bin and Path(dorado_bin).exists():
+        dorado_bin_local = str(_localize_file(Path(dorado_bin), LOCAL_DORADO_DIR, keep_name="dorado"))
+
+    dorado_model_local = dorado_model
+    if dorado_model and Path(dorado_model).exists():
+        dorado_model_local = str(_localize_tree(Path(dorado_model), LOCAL_DORADO_DIR))
+
+    print("[stage] Copying complete.", flush=True)
+
+    total_reads = _count_reads(pod5_local)
+    L = int(round(segment_sec * sample_rate))
+    trimmed_real_pod5 = out_dir / "real_trimmed.pod5"
+    trimmed_used = _write_truncated_pod5(pod5_local, trimmed_real_pod5, L, total_reads, "real")
+
     real_fastq = None
-    if dorado_model:
+    if dorado_model_local:
+        print("[stage] Basecalling real (trimmed) POD5 with Dorado ...", flush=True)
         real_fastq = out_dir / "real.fastq"
-        _run_dorado(dorado_bin, dorado_model, pod5_path, real_fastq, device)
+        _run_dorado(dorado_bin_local, dorado_model_local, trimmed_real_pod5, real_fastq, device)
 
     def _process_ckpt(tag: str, ckpt_path: Path) -> Optional[Dict[str, float]]:
+        print(f"[stage] Loading checkpoint '{tag}' from {ckpt_path}", flush=True)
         model, params, vq_vars = _load_generator(ckpt_path, model_cfg, L)
         gen_pod5 = out_dir / f"{tag}_generated.pod5"
-        used, total = _write_generated_pod5(pod5_path, gen_pod5, model, params, vq_vars, L)
+        used, total = _write_generated_pod5(pod5_local, gen_pod5, model, params, vq_vars, L, total_reads)
         report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
-        if dorado_model:
+        if dorado_model_local:
             gen_fastq = out_dir / f"{tag}_generated.fastq"
-            _run_dorado(dorado_bin, dorado_model, gen_pod5, gen_fastq, device)
+            print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
+            _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq, device)
             ident = _compute_identity(real_fastq, gen_fastq) if real_fastq else {}
             report.update(ident)
             report["generated_fastq"] = str(gen_fastq)
         return report
 
-    reports = {}
-    reports["final"] = _process_ckpt("final", ckpt_final)
-    if ckpt_best is not None:
-        reports["best"] = _process_ckpt("best", ckpt_best)
+    reports = {
+        "real": {
+            "trimmed_pod5": str(trimmed_real_pod5),
+            "reads_total": total_reads,
+            "reads_kept": trimmed_used,
+        }
+    }
+    if real_fastq:
+        reports["real"]["real_fastq"] = str(real_fastq)
+    reports["final"] = _process_ckpt("final", ckpt_final_local)
+    if ckpt_best_local is not None:
+        reports["best"] = _process_ckpt("best", ckpt_best_local)
 
     (out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
     print(json.dumps(reports, indent=2))
