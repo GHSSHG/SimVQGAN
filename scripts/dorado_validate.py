@@ -504,10 +504,16 @@ def main() -> None:
         shutil.copy2(trimmed_local_pod5, trimmed_real_pod5)
 
     real_fastq = None
+    real_fastq_persist = None
     if dorado_model_local:
         print("[stage] Basecalling real (trimmed) POD5 with Dorado ...", flush=True)
-        real_fastq = out_dir / "real.fastq"
+        real_fastq = LOCAL_ROOT / "real.fastq"
+        if real_fastq.exists():
+            real_fastq.unlink()
         _run_dorado(dorado_bin_local, dorado_model_local, trimmed_local_pod5, real_fastq, device)
+        real_fastq_persist = out_dir / "real.fastq"
+        if real_fastq_persist != real_fastq:
+            shutil.copy2(real_fastq, real_fastq_persist)
 
     def _process_ckpt(tag: str, ckpt_path: Path) -> Optional[Dict[str, float]]:
         print(f"[stage] Loading checkpoint '{tag}' from {ckpt_path}", flush=True)
@@ -516,12 +522,17 @@ def main() -> None:
         used, total = _write_generated_pod5(trimmed_local_pod5, gen_pod5, model, params, vq_vars, L, trimmed_used)
         report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
         if dorado_model_local:
-            gen_fastq = out_dir / f"{tag}_generated.fastq"
+            gen_fastq_local = LOCAL_ROOT / f"{tag}_generated.fastq"
+            if gen_fastq_local.exists():
+                gen_fastq_local.unlink()
+            gen_fastq_persist = out_dir / f"{tag}_generated.fastq"
             print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
-            _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq, device)
-            ident = _compute_identity(real_fastq, gen_fastq) if real_fastq else {}
+            _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq_local, device)
+            if gen_fastq_persist != gen_fastq_local:
+                shutil.copy2(gen_fastq_local, gen_fastq_persist)
+            ident = _compute_identity(real_fastq, gen_fastq_local) if real_fastq else {}
             report.update(ident)
-            report["generated_fastq"] = str(gen_fastq)
+            report["generated_fastq"] = str(gen_fastq_persist)
         return report
 
     reports = {
@@ -532,7 +543,7 @@ def main() -> None:
         }
     }
     if real_fastq:
-        reports["real"]["real_fastq"] = str(real_fastq)
+        reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
     reports["final"] = _process_ckpt("final", ckpt_final_local)
     if ckpt_best_local is not None:
         reports["best"] = _process_ckpt("best", ckpt_best_local)
