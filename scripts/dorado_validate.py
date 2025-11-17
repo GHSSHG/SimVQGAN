@@ -267,6 +267,10 @@ def _write_truncated_pod5(src_path: Path, dst_path: Path, L: int, total_reads: i
     print(f"[{label}] Writing truncated POD5 -> {dst_path}", flush=True)
     used_reads = 0
     markers = _progress_markers(total_reads)
+    dst_path = Path(dst_path)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if dst_path.exists():
+        dst_path.unlink()
     with pod5.Reader(str(src_path)) as reader, Writer(str(dst_path)) as writer:
         for idx, record in enumerate(reader.reads(), start=1):
             while markers and idx >= markers[0]:
@@ -291,6 +295,10 @@ def _write_generated_pod5(src_path: Path, dst_path: Path, model, params, vq_vars
     print(f"[gen] Generating POD5 -> {dst_path}", flush=True)
     used_reads = 0
     markers = _progress_markers(total_reads)
+    dst_path = Path(dst_path)
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    if dst_path.exists():
+        dst_path.unlink()
     with pod5.Reader(str(src_path)) as reader, Writer(str(dst_path)) as writer:
         for idx, record in enumerate(reader.reads(), start=1):
             while markers and idx >= markers[0]:
