@@ -59,7 +59,7 @@
   "checkpoint": {
     "dir": "/content/VQGAN/checkpoints/nanopore",
     "resume_from": null,
-    "drive_backup_dir": "/content/drive/MyDrive/VQGAN/checkpoints/nanopore"
+    "drive_backup_dir": "/content/drive/MyDrive/VQGAN/checkpoints"
   },
   "logging": {
     "wandb": {
