@@ -346,8 +346,7 @@ def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: 
 
 
 def _read_fastq(path: Path) -> Dict[str, str]:
-    seqs = {}
-    name = None
+    seqs: Dict[str, str] = {}
     path = Path(path)
 
     def _open():
@@ -364,14 +363,43 @@ def _read_fastq(path: Path) -> Dict[str, str]:
         return path.open("r", **text_kwargs)
 
     with _open() as fp:
-        for line in fp:
-            if line.startswith("@"):
-                name = line.strip()[1:].split()[0]
-                seqs[name] = ""
-            elif line.startswith("+"):
+        current_id = None
+        seq_chunks: list[str] = []
+        seq_len = 0
+        qual_remaining = 0
+        for raw_line in fp:
+            line = raw_line.strip()
+            if not line:
                 continue
-            elif name is not None:
-                seqs[name] += line.strip()
+            if qual_remaining > 0:
+                qual_remaining -= len(line)
+                if qual_remaining < 0:
+                    qual_remaining = 0
+                continue
+            if line.startswith("@") and current_id is None:
+                current_id = line[1:].split()[0]
+                seq_chunks = []
+                continue
+            if line.startswith("@") and qual_remaining == 0:
+                # new record starting after finishing previous
+                if current_id is not None and seq_chunks:
+                    seqs[current_id] = "".join(seq_chunks)
+                current_id = line[1:].split()[0]
+                seq_chunks = []
+                continue
+            if line.startswith("+") and current_id is not None:
+                seq = "".join(seq_chunks)
+                seqs[current_id] = seq
+                seq_len = len(seq)
+                qual_remaining = seq_len
+                current_id = None
+                seq_chunks = []
+                continue
+            if current_id is not None:
+                seq_chunks.append(line)
+        # Catch last record without trailing '+'
+        if current_id is not None and seq_chunks:
+            seqs[current_id] = "".join(seq_chunks)
     return seqs
 
 
@@ -562,17 +590,26 @@ def main() -> None:
     def _process_ckpt(tag: str, ckpt_path: Path) -> Optional[Dict[str, float]]:
         print(f"[stage] Loading checkpoint '{tag}' from {ckpt_path}", flush=True)
         model, params, vq_vars = _load_generator(ckpt_path, model_cfg, L)
-        gen_pod5 = out_dir / f"{tag}_generated.pod5"
-        used, total = _write_generated_pod5(trimmed_local_pod5, gen_pod5, model, params, vq_vars, L, trimmed_used)
-        report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
+        gen_name = f"{tag}_generated.pod5"
+        gen_pod5_local = LOCAL_ROOT / gen_name
+        gen_pod5_dest = out_dir / gen_name
+        if not _should_skip(gen_name):
+            used, total = _write_generated_pod5(trimmed_local_pod5, gen_pod5_local, model, params, vq_vars, L, trimmed_used)
+        else:
+            print(f"[reuse] Using cached {gen_name}", flush=True)
+            used = total = _count_reads(gen_pod5_local)
+        if gen_pod5_dest != gen_pod5_local:
+            shutil.copy2(gen_pod5_local, gen_pod5_dest)
+        report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5_dest)}
         if dorado_model_local:
-            gen_fastq_local = LOCAL_ROOT / f"{tag}_generated.fastq"
-            gen_fastq_persist = out_dir / f"{tag}_generated.fastq"
-            if not _should_skip(f"{tag}_generated.fastq"):
+            fastq_name = f"{tag}_generated.fastq"
+            gen_fastq_local = LOCAL_ROOT / fastq_name
+            gen_fastq_persist = out_dir / fastq_name
+            if not _should_skip(fastq_name):
                 if gen_fastq_local.exists():
                     gen_fastq_local.unlink()
                 print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
-                _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5, gen_fastq_local, device)
+                _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5_local, gen_fastq_local, device)
             else:
                 print(f"[reuse] Using cached {tag}_generated.fastq", flush=True)
             if gen_fastq_persist != gen_fastq_local:
