@@ -20,6 +20,7 @@ Usage (Colab):
 from __future__ import annotations
 
 import argparse
+import gzip
 import json
 import math
 import os
@@ -337,7 +338,20 @@ def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: 
 def _read_fastq(path: Path) -> Dict[str, str]:
     seqs = {}
     name = None
-    with path.open() as fp:
+    path = Path(path)
+    def _open():
+        if path.suffix == ".gz":
+            return gzip.open(path, "rt")
+        try:
+            with path.open("rb") as fb:
+                magic = fb.read(2)
+            if magic == b"\x1f\x8b":
+                return gzip.open(path, "rt")
+        except FileNotFoundError:
+            raise
+        return path.open("r")
+
+    with _open() as fp:
         for line in fp:
             if line.startswith("@"):
                 name = line.strip()[1:].split()[0]
