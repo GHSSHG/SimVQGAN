@@ -328,7 +328,14 @@ def _write_generated_pod5(src_path: Path, dst_path: Path, model, params, vq_vars
     return used_reads, total_reads
 
 
-def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: Path, device: str) -> None:
+def _run_dorado(
+    dorado_bin: str,
+    dorado_model: str,
+    pod5_path: Path,
+    out_fastq: Path,
+    device: str,
+    emit_fastq: bool = True,
+) -> None:
     print(f"[dorado] {pod5_path.name} -> {out_fastq}", flush=True)
     cmd = [
         dorado_bin,
@@ -338,6 +345,8 @@ def _run_dorado(dorado_bin: str, dorado_model: str, pod5_path: Path, out_fastq: 
         "--device",
         device,
     ]
+    if emit_fastq:
+        cmd.append("--emit-fastq")
     with out_fastq.open("w") as fp:
         proc = subprocess.run(cmd, stdout=fp, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
@@ -524,6 +533,7 @@ def main() -> None:
     dorado_bin = args.dorado_bin or dorado_cfg.get("bin")
     dorado_model = args.dorado_model or dorado_cfg.get("model")
     device = args.device or dorado_cfg.get("device", "cuda:0")
+    dorado_emit_fastq = bool(dorado_cfg.get("emit_fastq", True))
     if dorado_model and not dorado_bin:
         dorado_bin = "dorado"
 
@@ -580,7 +590,14 @@ def main() -> None:
         if not _should_skip("real.fastq"):
             if real_fastq.exists():
                 real_fastq.unlink()
-            _run_dorado(dorado_bin_local, dorado_model_local, trimmed_local_pod5, real_fastq, device)
+            _run_dorado(
+                dorado_bin_local,
+                dorado_model_local,
+                trimmed_local_pod5,
+                real_fastq,
+                device,
+                emit_fastq=dorado_emit_fastq,
+            )
         else:
             print("[reuse] Using cached real.fastq", flush=True)
         real_fastq_persist = out_dir / "real.fastq"
@@ -609,7 +626,14 @@ def main() -> None:
                 if gen_fastq_local.exists():
                     gen_fastq_local.unlink()
                 print(f"[stage] Dorado basecalling generated POD5 ({tag}) ...", flush=True)
-                _run_dorado(dorado_bin_local, dorado_model_local, gen_pod5_local, gen_fastq_local, device)
+                _run_dorado(
+                    dorado_bin_local,
+                    dorado_model_local,
+                    gen_pod5_local,
+                    gen_fastq_local,
+                    device,
+                    emit_fastq=dorado_emit_fastq,
+                )
             else:
                 print(f"[reuse] Using cached {tag}_generated.fastq", flush=True)
             if gen_fastq_persist != gen_fastq_local:

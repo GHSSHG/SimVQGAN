@@ -2,3 +2,4 @@ AGENTS.md
 __pycache__
 test/
 .venv
+*.fastq
