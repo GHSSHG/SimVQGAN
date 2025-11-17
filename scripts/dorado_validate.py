@@ -482,20 +482,24 @@ def main() -> None:
 
     total_reads = _count_reads(pod5_local)
     L = int(round(segment_sec * sample_rate))
+    trimmed_local_pod5 = LOCAL_ROOT / "real_trimmed.pod5"
+    trimmed_used = _write_truncated_pod5(pod5_local, trimmed_local_pod5, L, total_reads, "real")
     trimmed_real_pod5 = out_dir / "real_trimmed.pod5"
-    trimmed_used = _write_truncated_pod5(pod5_local, trimmed_real_pod5, L, total_reads, "real")
+    if trimmed_local_pod5 != trimmed_real_pod5:
+        print(f"[real] Copying trimmed POD5 to {trimmed_real_pod5}", flush=True)
+        shutil.copy2(trimmed_local_pod5, trimmed_real_pod5)
 
     real_fastq = None
     if dorado_model_local:
         print("[stage] Basecalling real (trimmed) POD5 with Dorado ...", flush=True)
         real_fastq = out_dir / "real.fastq"
-        _run_dorado(dorado_bin_local, dorado_model_local, trimmed_real_pod5, real_fastq, device)
+        _run_dorado(dorado_bin_local, dorado_model_local, trimmed_local_pod5, real_fastq, device)
 
     def _process_ckpt(tag: str, ckpt_path: Path) -> Optional[Dict[str, float]]:
         print(f"[stage] Loading checkpoint '{tag}' from {ckpt_path}", flush=True)
         model, params, vq_vars = _load_generator(ckpt_path, model_cfg, L)
         gen_pod5 = out_dir / f"{tag}_generated.pod5"
-        used, total = _write_generated_pod5(pod5_local, gen_pod5, model, params, vq_vars, L, total_reads)
+        used, total = _write_generated_pod5(trimmed_local_pod5, gen_pod5, model, params, vq_vars, L, trimmed_used)
         report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
         if dorado_model_local:
             gen_fastq = out_dir / f"{tag}_generated.fastq"
