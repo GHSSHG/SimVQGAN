@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+from argparse import BooleanOptionalAction
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
@@ -348,17 +349,19 @@ def _read_fastq(path: Path) -> Dict[str, str]:
     seqs = {}
     name = None
     path = Path(path)
+
     def _open():
+        text_kwargs = {"encoding": "utf-8", "errors": "ignore"}
         if path.suffix == ".gz":
-            return gzip.open(path, "rt")
+            return gzip.open(path, "rt", **text_kwargs)
         try:
             with path.open("rb") as fb:
                 magic = fb.read(2)
             if magic == b"\x1f\x8b":
-                return gzip.open(path, "rt")
+                return gzip.open(path, "rt", **text_kwargs)
         except FileNotFoundError:
             raise
-        return path.open("r")
+        return path.open("r", **text_kwargs)
 
     with _open() as fp:
         for line in fp:
@@ -429,8 +432,9 @@ def main() -> None:
     p.add_argument("--device", type=str, default=None, help="Dorado device, e.g., cuda:0 or cpu")
     p.add_argument(
         "--reuse-out-dir",
-        action="store_true",
-        help="If set, reuse existing artifacts from out_dir (Drive) to local staging instead of recomputing when possible.",
+        action=BooleanOptionalAction,
+        default=True,
+        help="Reuse existing artifacts from out_dir (Drive) to local staging when present. Use --no-reuse-out-dir to force recompute.",
     )
     args = p.parse_args()
 
