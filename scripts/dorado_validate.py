@@ -180,50 +180,91 @@ def _compute_identity(real_fastq: Path, gen_fastq: Path) -> Dict[str, float]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Validate SimVQGAN reconstructions via Dorado basecalling.")
-    p.add_argument("--config", type=Path, required=True, help="Path to training config JSON.")
-    p.add_argument("--pod5", type=Path, required=True, help="Reference POD5 file for validation.")
-    p.add_argument("--ckpt-final", type=Path, required=True, help="Checkpoint dir for final model.")
+    p.add_argument("--config", type=Path, default=Path("configs/validate_dorado.colab.json"), help="Path to validation config JSON.")
+    p.add_argument("--train-config", type=Path, default=None, help="Training config JSON used to derive model hyperparameters.")
+    p.add_argument("--pod5", type=Path, required=False, help="Reference POD5 file for validation.")
+    p.add_argument("--ckpt-final", type=Path, required=False, help="Checkpoint dir for final model.")
     p.add_argument("--ckpt-best", type=Path, required=False, help="Checkpoint dir for best model.")
-    p.add_argument("--out-dir", type=Path, default=Path("dorado_eval"), help="Output directory for generated POD5/FASTQ and report.")
-    p.add_argument("--dorado-bin", type=str, default="dorado", help="Path to Dorado binary.")
+    p.add_argument("--out-dir", type=Path, default=None, help="Output directory for generated POD5/FASTQ and report.")
+    p.add_argument("--dorado-bin", type=str, default=None, help="Path to Dorado binary.")
     p.add_argument("--dorado-model", type=str, required=False, help="Dorado model identifier or path (e.g., dna_r10.4.1_e8.2_260bps_sup@v4.3.0).")
-    p.add_argument("--device", type=str, default="cuda:0", help="Dorado device, e.g., cuda:0 or cpu")
+    p.add_argument("--device", type=str, default=None, help="Dorado device, e.g., cuda:0 or cpu")
     args = p.parse_args()
 
-    cfg = json.loads(args.config.read_text())
-    data_cfg = cfg.get("data", {})
+    cfg_data: Dict = {}
+    if args.config and args.config.exists():
+        cfg_data = json.loads(args.config.read_text())
+
+    def _cfg_value(path: str, default=None):
+        node = cfg_data
+        for part in path.split("."):
+            if not isinstance(node, dict):
+                return default
+            node = node.get(part)
+            if node is None:
+                return default
+        return node
+
+    def _cfg_path(path: str, default=None):
+        val = _cfg_value(path, default)
+        if val is None:
+            return None
+        return Path(val)
+
+    train_cfg_path = args.train_config if args.train_config else _cfg_path("train_config", Path("configs/train_config.colab.json"))
+    if train_cfg_path is None:
+        raise FileNotFoundError("Training config path missing; provide --train-config or set train_config in validation config.")
+    train_cfg = json.loads(train_cfg_path.read_text())
+    data_cfg = train_cfg.get("data", {})
+    pod5_path = args.pod5 if args.pod5 else _cfg_path("pod5")
+    if pod5_path is None:
+        raise FileNotFoundError("Validation POD5 path missing; set --pod5 or 'pod5' in validation config.")
+    pod5_path = Path(pod5_path)
+    ckpt_final = args.ckpt_final if args.ckpt_final else _cfg_path("ckpt_final")
+    if ckpt_final is None:
+        raise FileNotFoundError("Final checkpoint path missing; set --ckpt-final or 'ckpt_final' in validation config.")
+    ckpt_final = Path(ckpt_final)
+    ckpt_best = args.ckpt_best if args.ckpt_best else _cfg_path("ckpt_best")
+    ckpt_best = Path(ckpt_best) if ckpt_best is not None else None
+    out_dir = args.out_dir if args.out_dir is not None else _cfg_path("out_dir")
+    if out_dir is None:
+        out_dir = Path("dorado_eval")
+    out_dir = Path(out_dir)
+    dorado_bin = args.dorado_bin or _cfg_value("dorado.bin", "dorado")
+    dorado_model = args.dorado_model or _cfg_value("dorado.model")
+    device = args.device or _cfg_value("dorado.device", "cuda:0")
     segment_sec = float(data_cfg.get("segment_sec", 4.8))
     sample_rate = float(data_cfg.get("sample_rate", 5000.0))
     L = int(round(segment_sec * sample_rate))
-    model_cfg = cfg.get("model", {})
+    model_cfg = train_cfg.get("model", {})
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
     # Prepare real fastq if Dorado model provided
     real_fastq = None
-    if args.dorado_model:
-        real_fastq = args.out_dir / "real.fastq"
-        _run_dorado(args.dorado_bin, args.dorado_model, args.pod5, real_fastq, args.device)
+    if dorado_model:
+        real_fastq = out_dir / "real.fastq"
+        _run_dorado(dorado_bin, dorado_model, pod5_path, real_fastq, device)
 
     def _process_ckpt(tag: str, ckpt_path: Path) -> Optional[Dict[str, float]]:
         model, params, vq_vars = _load_generator(ckpt_path, model_cfg, L)
-        gen_pod5 = args.out_dir / f"{tag}_generated.pod5"
-        used, total = _write_generated_pod5(args.pod5, gen_pod5, model, params, vq_vars, L)
+        gen_pod5 = out_dir / f"{tag}_generated.pod5"
+        used, total = _write_generated_pod5(pod5_path, gen_pod5, model, params, vq_vars, L)
         report = {"reads_used": used, "reads_total": total, "generated_pod5": str(gen_pod5)}
-        if args.dorado_model:
-            gen_fastq = args.out_dir / f"{tag}_generated.fastq"
-            _run_dorado(args.dorado_bin, args.dorado_model, gen_pod5, gen_fastq, args.device)
+        if dorado_model:
+            gen_fastq = out_dir / f"{tag}_generated.fastq"
+            _run_dorado(dorado_bin, dorado_model, gen_pod5, gen_fastq, device)
             ident = _compute_identity(real_fastq, gen_fastq) if real_fastq else {}
             report.update(ident)
             report["generated_fastq"] = str(gen_fastq)
         return report
 
     reports = {}
-    reports["final"] = _process_ckpt("final", args.ckpt_final)
-    if args.ckpt_best:
-        reports["best"] = _process_ckpt("best", args.ckpt_best)
+    reports["final"] = _process_ckpt("final", ckpt_final)
+    if ckpt_best is not None:
+        reports["best"] = _process_ckpt("best", ckpt_best)
 
-    (args.out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
+    (out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
     print(json.dumps(reports, indent=2))
 
 
