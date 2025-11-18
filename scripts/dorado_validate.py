@@ -180,7 +180,10 @@ def _progress_markers(total: int) -> list[int]:
 
 
 from codec.models.model import SimVQAudioModel  # noqa: E402
-from codec.data.normalization import robust_scale_with_stats  # noqa: E402
+from codec.data.pod5_processing import (  # noqa: E402
+    normalize_adc_signal,
+    denormalize_to_adc,
+)
 
 try:
     import pod5
@@ -241,9 +244,9 @@ def _load_generator(ckpt_dir: Path, model_cfg: Dict, L: int):
     return model, params, vq_vars
 
 
-def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int) -> np.ndarray:
-    """Normalize, window, run generator, and invert scale. Tail shorter than L is dropped."""
-    norm, median, scale = robust_scale_with_stats(signal, eps=1e-6)
+def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int, calibration) -> np.ndarray:
+    """Normalize via calibration, window, run generator, and invert scale."""
+    norm, stats, cal = normalize_adc_signal(signal, calibration, eps=1e-6)
     n = norm.shape[0]
     windows = n // L
     if windows <= 0:
@@ -254,8 +257,8 @@ def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int) -> np.
     vq_in = vq_vars if vq_vars is not None else {}
     outs = model.apply({"params": params, "vq": vq_in}, y, train=False, offset=0, rng=rng)
     wave_hat = np.asarray(outs["wave_hat"], dtype=np.float32).reshape(-1)
-    reconstructed = wave_hat * scale + median
-    reconstructed = np.clip(np.rint(reconstructed), -32768, 32767).astype(np.int16, copy=False)
+    _, adc = denormalize_to_adc(wave_hat, stats, cal)
+    reconstructed = np.clip(np.rint(adc), -32768, 32767).astype(np.int16, copy=False)
     return reconstructed
 
 
@@ -317,7 +320,7 @@ def _write_generated_pod5(src_path: Path, dst_path: Path, model, params, vq_vars
                 print(f"[gen] progress: {idx}/{total_reads} ({pct:.1f}%)", flush=True)
                 markers.pop(0)
             raw = record.signal
-            gen_signal = _reconstruct_read(model, params, vq_vars, raw, L)
+            gen_signal = _reconstruct_read(model, params, vq_vars, raw, L, getattr(record, "calibration", None))
             if gen_signal.size == 0:
                 continue  # drop short
             read = record.to_read()

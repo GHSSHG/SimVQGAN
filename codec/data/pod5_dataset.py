@@ -9,15 +9,13 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import numpy as np
 import pod5 as p5
 
-from .normalization import robust_scale
+from .pod5_processing import normalize_adc_signal, resolve_sample_rate
 
 
-def _normalize_read_signal(signal: np.ndarray) -> np.ndarray:
-    """Convert raw int16 ADC samples to float32 and run per-read robust scaling."""
-    arr = np.asarray(signal)
-    if arr.dtype != np.float32:
-        arr = arr.astype(np.float32, copy=False)
-    return robust_scale(arr)
+def _normalize_read_signal(signal: np.ndarray, calibration: Any) -> np.ndarray:
+    """Convert int16 ADC to normalized float32 using POD5 calibration."""
+    normalized, _, _ = normalize_adc_signal(signal, calibration)
+    return normalized
 
 
 def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarray]:
@@ -45,10 +43,10 @@ def _should_skip_pod5(exc: Exception) -> bool:
 
 """POD5 dataset utilities.
 
-This build forces the sampling rate to a fixed value (default 5000 Hz) from
-configuration, rather than reading per-read metadata. Each read is first
-converted to float32, robust-normalized once, and then chunked so every window
-shares the same per-read statistics (median≈0, MAD≈1).
+Each read is streamed from POD5, converted to picoamps via calibration, robust
+normalized once, and then chunked so every window shares the same per-read
+statistics (median≈0, MAD≈1). Sample-rate hints stored in POD5 are preferred,
+falling back to configured defaults only when metadata is absent.
 """
 
 
@@ -98,44 +96,53 @@ class NanoporeSignalDataset:
         if self.read_ids_per_file and file_path in self.read_ids_per_file:
             selection = self.read_ids_per_file[file_path]
 
-        def _should_skip(exc: Exception) -> bool:
-            msg = str(exc)
-            keywords = (
-                "Invalid signature in file",
-                "Failed to open pod5 file",
-                "Pod5ApiException",
-            )
-            return any(k in msg for k in keywords)
-
         def _mark_bad_file(exc: Exception, context: str) -> None:
             if file_path in self._invalid_files:
                 return
             print(f"[warn] {context}，永久跳过 {file_path}: {exc}")
             self._invalid_files.add(file_path)
 
+        warned_sr_mismatch = False
         try:
             with p5.Reader(str(file_path)) as reader:
+                run_info = getattr(reader, "run_info", None)
                 gen = reader.reads(selection=selection) if selection else reader.reads()
                 for read in gen:
                     try:
-                        # Force sample rate to configured value (default 5000 Hz)
-                        sr_hz = float(self.sample_rate_hz_default) if self.sample_rate_hz_default is not None else 5000.0
-                        chunk_size = int(round(self.window_ms * float(sr_hz) / 1000.0))
+                        sr_measured = resolve_sample_rate(
+                            read_obj=read,
+                            run_info=run_info,
+                            configured_hz=None,
+                        )
+                        target_sr = float(self.sample_rate_hz_default) if self.sample_rate_hz_default else sr_measured
+                        if target_sr is None or target_sr <= 0.0:
+                            target_sr = sr_measured or 5000.0
+                        mismatch = abs(sr_measured - target_sr) if sr_measured is not None else 0.0
+                        tol = max(1.0, 0.001 * target_sr)
+                        if mismatch > tol:
+                            if not warned_sr_mismatch:
+                                print(
+                                    f"[warn] read sample_rate={sr_measured:.2f}Hz differs from configured {target_sr:.2f}Hz; skipping reads in {file_path}",
+                                    flush=True,
+                                )
+                                warned_sr_mismatch = True
+                            continue
+                        chunk_size = int(round(self.window_ms * float(target_sr) / 1000.0))
                         if chunk_size <= 0:
                             chunk_size = 1
                         raw_signal = read.signal
                         if raw_signal.shape[0] < chunk_size:
                             continue
-                        norm_signal = _normalize_read_signal(raw_signal)
+                        norm_signal = _normalize_read_signal(raw_signal, getattr(read, "calibration", None))
                         for chunk in _iter_full_chunks(norm_signal, chunk_size=chunk_size):
                             yield chunk.astype(np.float32, copy=False)
                     except Exception as read_exc:
-                        if _should_skip(read_exc):
+                        if _should_skip_pod5(read_exc):
                             _mark_bad_file(read_exc, "读取 read 失败")
                             return
                         raise
         except Exception as open_exc:
-            if _should_skip(open_exc):
+            if _should_skip_pod5(open_exc):
                 _mark_bad_file(open_exc, "POD5 文件损坏")
                 return
             raise
