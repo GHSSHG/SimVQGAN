@@ -9,13 +9,18 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 import numpy as np
 import pod5 as p5
 
-from .pod5_processing import normalize_adc_signal, resolve_sample_rate
+from .pod5_processing import (
+    normalize_adc_signal,
+    resolve_sample_rate,
+    NormalizationStats,
+    CalibrationParams,
+)
 
 
-def _normalize_read_signal(signal: np.ndarray, calibration: Any) -> np.ndarray:
+def _normalize_read_signal(signal: np.ndarray, calibration: Any) -> tuple[np.ndarray, NormalizationStats, CalibrationParams]:
     """Convert int16 ADC to normalized float32 using POD5 calibration."""
-    normalized, _, _ = normalize_adc_signal(signal, calibration)
-    return normalized
+    normalized, stats, cal = normalize_adc_signal(signal, calibration)
+    return normalized, stats, cal
 
 
 def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarray]:
@@ -55,6 +60,7 @@ class NanoporeSignalDataset:
     pod5_files: List[Path]
     window_ms: int = 4800
     sample_rate_hz_default: Optional[float] = None
+    return_metadata: bool = False
     read_ids_per_file: Optional[Dict[Path, Sequence[str]]] = None
     loader_workers: int = 1
     loader_prefetch_chunks: int = 128
@@ -67,6 +73,7 @@ class NanoporeSignalDataset:
         files: Iterable[Union[str, Path]],
         window_ms: int = 4800,
         sample_rate_hz_default: Optional[float] = None,
+        return_metadata: bool = False,
         read_ids_per_file: Optional[Dict[Union[str, Path], Sequence[str]]] = None,
         loader_workers: int = 1,
         loader_prefetch_chunks: int = 128,
@@ -84,6 +91,7 @@ class NanoporeSignalDataset:
             pod5_files=paths,
             window_ms=int(window_ms),
             sample_rate_hz_default=sample_rate_hz_default,
+            return_metadata=bool(return_metadata),
             read_ids_per_file=rid_map,
             loader_workers=workers,
             loader_prefetch_chunks=prefetch_chunks,
@@ -109,46 +117,66 @@ class NanoporeSignalDataset:
                 gen = reader.reads(selection=selection) if selection else reader.reads()
                 for read in gen:
                     try:
-                        sr_measured = resolve_sample_rate(
+                        read_sr = getattr(read, "sample_rate", None)
+                        run_sr = getattr(run_info, "sample_rate", None)
+                        measured_sr = None
+                        if read_sr is not None:
+                            try:
+                                measured_sr = float(read_sr)
+                            except Exception:
+                                measured_sr = None
+                        if measured_sr is None and run_sr is not None:
+                            try:
+                                measured_sr = float(run_sr)
+                            except Exception:
+                                measured_sr = None
+
+                        target_sr = resolve_sample_rate(
                             read_obj=read,
                             run_info=run_info,
-                            configured_hz=None,
+                            configured_hz=self.sample_rate_hz_default,
                         )
-                        target_sr = float(self.sample_rate_hz_default) if self.sample_rate_hz_default else sr_measured
-                        if target_sr is None or target_sr <= 0.0:
-                            target_sr = sr_measured or 5000.0
-                        mismatch = abs(sr_measured - target_sr) if sr_measured is not None else 0.0
-                        tol = max(1.0, 0.001 * target_sr)
-                        if mismatch > tol:
-                            if not warned_sr_mismatch:
-                                print(
-                                    f"[warn] read sample_rate={sr_measured:.2f}Hz differs from configured {target_sr:.2f}Hz; skipping reads in {file_path}",
-                                    flush=True,
-                                )
-                                warned_sr_mismatch = True
-                            continue
+                        # Only gate when we actually have a measured value from metadata.
+                        if measured_sr is not None and self.sample_rate_hz_default is not None:
+                            mismatch = abs(measured_sr - float(self.sample_rate_hz_default))
+                            tol = max(1.0, 0.001 * float(self.sample_rate_hz_default))
+                            if mismatch > tol:
+                                if not warned_sr_mismatch:
+                                    print(
+                                        f"[warn] read sample_rate={measured_sr:.2f}Hz differs from configured {float(self.sample_rate_hz_default):.2f}Hz; skipping reads in {file_path}",
+                                        flush=True,
+                                    )
+                                    warned_sr_mismatch = True
+                                continue
                         chunk_size = int(round(self.window_ms * float(target_sr) / 1000.0))
                         if chunk_size <= 0:
                             chunk_size = 1
                         raw_signal = read.signal
                         if raw_signal.shape[0] < chunk_size:
                             continue
-                        norm_signal = _normalize_read_signal(raw_signal, getattr(read, "calibration", None))
+                        norm_signal, stats, cal = _normalize_read_signal(raw_signal, getattr(read, "calibration", None))
                         for chunk in _iter_full_chunks(norm_signal, chunk_size=chunk_size):
-                            yield chunk.astype(np.float32, copy=False)
+                            arr = chunk.astype(np.float32, copy=False)
+                            if not self.return_metadata:
+                                yield arr
+                            else:
+                                yield (arr, stats, cal)
                     except Exception as read_exc:
                         if _should_skip_pod5(read_exc):
                             _mark_bad_file(read_exc, "读取 read 失败")
                             return
-                        raise
+                        read_id = getattr(read, "read_id", "unknown")
+                        raise RuntimeError(f"读取 {file_path} 中 read {read_id} 失败: {read_exc}") from read_exc
         except Exception as open_exc:
             if _should_skip_pod5(open_exc):
                 _mark_bad_file(open_exc, "POD5 文件损坏")
                 return
-            raise
+            raise RuntimeError(f"打开 POD5 {file_path} 失败: {open_exc}") from open_exc
 
     @staticmethod
     def _flush_batch(buf: List[np.ndarray]) -> np.ndarray:
+        if buf and isinstance(buf[0], tuple):
+            raise ValueError("return_metadata=True 数据集不支持批量堆叠；请迭代 chunk 自行处理元数据")
         batch = np.stack(buf, axis=0).astype(np.float32, copy=False)
         return batch[:, np.newaxis, :]
 
@@ -171,6 +199,8 @@ class NanoporeSignalDataset:
     ) -> Iterator[np.ndarray]:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if self.return_metadata:
+            raise ValueError("return_metadata=True 时请使用 iter_chunks 手动消费数据")
         worker_count = int(num_workers if num_workers is not None else self.loader_workers)
         queue_cap = int(max_chunk_queue if max_chunk_queue is not None else self.loader_prefetch_chunks)
         # Threaded path only makes sense when we need endless streaming (files_cycle=True) and >1 worker

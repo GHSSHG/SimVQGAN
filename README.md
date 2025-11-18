@@ -20,7 +20,7 @@
 
 1.  **scripts/train.py** 解析配置 -\> 解析数据根目录、子目录与采样率。
 2.  **codec/utils/pod5\_files.py** 查找 POD5 文件；`NanoporeSignalDataset.from_paths` 校验存在性。
-3.  每个 read：读取 POD5 校准 (offset/scale) 将 int16 ADC 转为 pA，再执行鲁棒归一化 (median/MAD) 并按窗口长度分段 (window\_ms 推导 chunk\_size)。
+3.  每个 read：读取 POD5 校准 (offset/scale) 将 int16 ADC 转为 pA，再执行鲁棒归一化 (median/MAD) 并按窗口长度分段 (window\_ms 推导 chunk\_size)。训练仅消费归一化后的窗口；验证/生成路径会保存 median/MAD 与校准参数，以便对模型输出做逆归一化并写回 POD5。
 4.  通过 `Prefetcher` 线程预取到主机队列，可选 `make_device_prefetcher` 将 batch 放入设备并按多 GPU 分片。
 
 ## 模型与训练主线

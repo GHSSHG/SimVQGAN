@@ -4,8 +4,11 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
 import numpy as np
+import warnings
 
 from .normalization import robust_scale_with_stats
+
+_CAL_WARNING_KEYS: set[str] = set()
 
 
 @dataclass(frozen=True)
@@ -40,9 +43,11 @@ def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
         return calibration_obj
     offset = 0.0
     scale = 1.0
+    source = "unknown"
     for attr in ("offset", "calibration_offset"):
         if hasattr(calibration_obj, attr):
             offset = getattr(calibration_obj, attr)
+            source = attr
             break
     for attr in ("scale", "calibration_scale"):
         if hasattr(calibration_obj, attr):
@@ -56,7 +61,16 @@ def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
         scale = float(scale)
     except Exception:
         scale = 1.0
-    if not np.isfinite(scale) or scale == 0.0:
+    if calibration_obj is None and "missing_calibration" not in _CAL_WARNING_KEYS:
+        warnings.warn("[pod5] Missing calibration metadata; assuming offset=0, scale=1", RuntimeWarning)
+        _CAL_WARNING_KEYS.add("missing_calibration")
+    if not np.isfinite(scale) or np.isclose(scale, 0.0):
+        if "invalid_scale" not in _CAL_WARNING_KEYS:
+            warnings.warn(
+                f"[pod5] Invalid calibration scale '{scale}' from {source}; falling back to 1.0",
+                RuntimeWarning,
+            )
+            _CAL_WARNING_KEYS.add("invalid_scale")
         scale = 1.0
     return CalibrationParams(offset=offset, scale=scale)
 

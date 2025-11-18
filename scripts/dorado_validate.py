@@ -276,8 +276,15 @@ def _count_reads(pod5_path: Path) -> int:
     return total
 
 
-def _write_truncated_pod5(src_path: Path, dst_path: Path, L: int, total_reads: int, label: str) -> int:
-    """Write a POD5 with signals truncated to multiples of L; drop reads shorter than L."""
+def _write_truncated_pod5(
+    src_path: Path,
+    dst_path: Path,
+    L: int,
+    total_reads: int,
+    label: str,
+    trim_mode: str = "drop",
+) -> int:
+    """Write a POD5 with signals adjusted to multiples of L using drop/pad."""
     print(f"[{label}] Writing truncated POD5 -> {dst_path}", flush=True)
     used_reads = 0
     markers = _progress_markers(total_reads)
@@ -293,10 +300,32 @@ def _write_truncated_pod5(src_path: Path, dst_path: Path, L: int, total_reads: i
                 markers.pop(0)
             raw = record.signal
             n = raw.shape[0]
-            windows = n // L
-            if windows <= 0:
-                continue  # drop short read
-            trimmed = raw[: windows * L]
+            trimmed = None
+            if n < L:
+                if trim_mode == "pad" and n > 0:
+                    pad_val = raw[-1]
+                    pad = np.full((L - n,), pad_val, dtype=raw.dtype)
+                    trimmed = np.concatenate([raw, pad])
+                else:
+                    continue  # drop short read entirely
+            else:
+                if trim_mode == "drop":
+                    windows = n // L
+                    if windows <= 0:
+                        continue
+                    trimmed = raw[: windows * L]
+                elif trim_mode == "pad":
+                    remainder = n % L
+                    if remainder == 0:
+                        trimmed = raw
+                    else:
+                        pad_val = raw[-1]
+                        pad = np.full((L - remainder,), pad_val, dtype=raw.dtype)
+                        trimmed = np.concatenate([raw, pad])
+                else:
+                    raise ValueError(f"Unsupported trim_mode={trim_mode}")
+            if trimmed is None or trimmed.shape[0] < L:
+                continue
             read = record.to_read()
             read.signal = trimmed.astype(np.int16, copy=False)
             writer.add_read(read)
@@ -471,6 +500,12 @@ def main() -> None:
     p.add_argument("--dorado-model", type=str, required=False, help="Dorado model identifier or path (e.g., dna_r10.4.1_e8.2_260bps_sup@v4.3.0).")
     p.add_argument("--device", type=str, default=None, help="Dorado device, e.g., cuda:0 or cpu")
     p.add_argument(
+        "--trim-mode",
+        choices=("drop", "pad"),
+        default="drop",
+        help="How to handle leftover samples when windowing reads (drop tail or pad using last sample).",
+    )
+    p.add_argument(
         "--reuse-out-dir",
         action=BooleanOptionalAction,
         default=True,
@@ -574,9 +609,10 @@ def main() -> None:
 
     total_reads = _count_reads(pod5_local)
     L = int(round(segment_sec * sample_rate))
+    trim_mode = args.trim_mode
     trimmed_local_pod5 = LOCAL_ROOT / "real_trimmed.pod5"
     if not _should_skip("real_trimmed.pod5"):
-        trimmed_used = _write_truncated_pod5(pod5_local, trimmed_local_pod5, L, total_reads, "real")
+        trimmed_used = _write_truncated_pod5(pod5_local, trimmed_local_pod5, L, total_reads, "real", trim_mode=trim_mode)
     else:
         print("[reuse] Using cached real_trimmed.pod5", flush=True)
         trimmed_used = _count_reads(trimmed_local_pod5)
@@ -651,6 +687,7 @@ def main() -> None:
             "trimmed_pod5": str(trimmed_real_pod5),
             "reads_total": total_reads,
             "reads_kept": trimmed_used,
+            "trim_mode": trim_mode,
         }
     }
     if real_fastq:
