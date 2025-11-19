@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Iterator, Tuple
 
 from collections import deque
 
@@ -135,7 +135,8 @@ def _logs_to_float_dict(logs: Dict[str, Any]) -> Dict[str, float]:
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
-    num_steps: int = 200,
+    num_steps: int | None = 200,
+    num_epochs: int | None = None,
     learning_rate: float = 5e-4,
     seed: int = 0,
     ckpt_dir: str | None = None,
@@ -252,10 +253,39 @@ def train_model_from_pod5(
     _, L = init_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
 
+    def _positive_int(value: int | None) -> int | None:
+        if value is None:
+            return None
+        try:
+            intval = int(value)
+        except (TypeError, ValueError):
+            return None
+        return intval if intval > 0 else None
+
+    steps_limit = _positive_int(num_steps)
+    epochs_limit = _positive_int(num_epochs)
+    epoch_mode = epochs_limit is not None
+    if not epoch_mode and steps_limit is None:
+        raise ValueError("Must provide a positive num_steps or num_epochs for training")
+
     warmup = int(lr_warmup_steps) if lr_warmup_steps is not None else 0
-    total_sched = lr_total_steps if lr_total_steps is not None else num_steps
+    warmup = max(0, warmup)
+    total_sched = None
+    if lr_total_steps is not None:
+        total_sched = max(1, int(lr_total_steps))
+    elif steps_limit is not None:
+        total_sched = steps_limit
     lr_value = float(learning_rate)
-    lr_schedule_fn = _make_lr_schedule(lr_value, warmup, total_sched) if warmup and warmup > 0 else lr_value
+    if warmup > 0:
+        if total_sched is None:
+            raise ValueError(
+                "Warmup/cosine LR schedule requires lr_scheduler.total_steps or an explicit num_steps; "
+                "provide lr_scheduler.total_steps when training by epochs."
+            )
+        total_sched = max(total_sched, warmup + 1)
+        lr_schedule_fn = _make_lr_schedule(lr_value, warmup, total_sched)
+    else:
+        lr_schedule_fn = lr_value
 
     gen_state, _ = create_generator_state(
         gen_init_rng,
@@ -289,18 +319,20 @@ def train_model_from_pod5(
     if not isinstance(disc_state.params, FrozenDict):
         disc_state = disc_state.replace(params=freeze(disc_state.params))
 
-    host_iter = Prefetcher(
-        ds.batches(batch_size=B, drop_last=True, files_cycle=True),
-        prefetch_size=8,
-    )
-    data_iter = iter(
-        make_device_prefetcher(
-            host_iter,
-            device_prefetch_size=2,
-            shard_for_multigpu=False,
-            global_batch_size=B,
+    def _make_data_iterator(files_cycle: bool) -> tuple[Prefetcher, Iterator[np.ndarray]]:
+        host_iter = Prefetcher(
+            ds.batches(batch_size=B, drop_last=True, files_cycle=files_cycle),
+            prefetch_size=8,
         )
-    )
+        data_iter = iter(
+            make_device_prefetcher(
+                host_iter,
+                device_prefetch_size=2,
+                shard_for_multigpu=False,
+                global_batch_size=B,
+            )
+        )
+        return host_iter, data_iter
     if loss_weights is None:
         loss_weights = {
             "time_l1": 1.0,
@@ -342,61 +374,97 @@ def train_model_from_pod5(
             pass
 
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
+    global_step = 0
 
-    try:
-        for step in range(1, num_steps + 1):
-            step_rng, apply_rng = jax.random.split(step_rng)
-            batch = next(data_iter)
-            # gate adversarial factor by disc_start
-            df = float(disc_factor if step >= int(disc_start) else 0.0)
-            g_grads, d_grads, logs, new_vq = compute_grads(
-                gen_state,
-                disc_state,
-                batch,
-                apply_rng,
-                loss_weights,
-                df,
+    def _consume_batch(batch, step: int) -> None:
+        nonlocal step_rng, gen_state, disc_state
+        step_rng, apply_rng = jax.random.split(step_rng)
+        df = float(disc_factor if step >= int(disc_start) else 0.0)
+        g_grads, d_grads, logs, new_vq = compute_grads(
+            gen_state,
+            disc_state,
+            batch,
+            apply_rng,
+            loss_weights,
+            df,
+        )
+        g_grads = _force_frozen(g_grads)
+        d_grads = _force_frozen(d_grads)
+        gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
+        disc_state = disc_state.apply_gradients(grads=d_grads)
+        logs = dict(logs)
+        hist_counts = logs.pop("_code_hist_counts", None)
+        hist_total = logs.pop("_code_hist_total", None)
+        if hist_counts is not None and hist_total is not None:
+            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
+            total_np = float(jax.device_get(hist_total))
+            code_hist_window.add(hist_np, total_np)
+        usage_ratio = (
+            float(jax.device_get(jnp.asarray(logs["code_usage"])))
+            if "code_usage" in logs
+            else 0.0
+        )
+        logs["code_usage"] = usage_ratio
+        should_log = log_every > 0 and step % int(log_every) == 0
+        if should_log:
+            agg = code_hist_window.metrics()
+            if agg is not None:
+                usage, perplexity = agg
+                logs["code_usage"] = usage
+                logs["perplexity"] = perplexity
+        formatted_logs = _simvq_style_logs(logs, "train", df)
+        float_logs = _logs_to_float_dict(formatted_logs)
+        if should_log:
+            _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
+            _log_wandb(float_logs, step)
+        if ckpt_dir and save_every > 0 and (step % save_every == 0):
+            flax_ckpt.save_checkpoint(
+                ckpt_dir,
+                target={"gen": gen_state, "disc": disc_state},
+                step=step,
+                overwrite=True,
+                keep=keep_last,
             )
-            g_grads = _force_frozen(g_grads)
-            d_grads = _force_frozen(d_grads)
-            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-            disc_state = disc_state.apply_gradients(grads=d_grads)
-            logs = dict(logs)
-            hist_counts = logs.pop("_code_hist_counts", None)
-            hist_total = logs.pop("_code_hist_total", None)
-            if hist_counts is not None and hist_total is not None:
-                hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
-                total_np = float(jax.device_get(hist_total))
-                code_hist_window.add(hist_np, total_np)
-            usage_ratio = (
-                float(jax.device_get(jnp.asarray(logs["code_usage"])))
-                if "code_usage" in logs
-                else 0.0
-            )
-            logs["code_usage"] = usage_ratio
-            should_log = log_every > 0 and step % int(log_every) == 0
-            if should_log:
-                agg = code_hist_window.metrics()
-                if agg is not None:
-                    usage, perplexity = agg
-                    logs["code_usage"] = usage
-                    logs["perplexity"] = perplexity
-            formatted_logs = _simvq_style_logs(logs, "train", df)
-            float_logs = _logs_to_float_dict(formatted_logs)
-            if should_log:
-                _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
-                _log_wandb(float_logs, step)
-            if ckpt_dir and (step % save_every == 0):
-                flax_ckpt.save_checkpoint(
-                    ckpt_dir,
-                    target={"gen": gen_state, "disc": disc_state},
-                    step=step,
-                    overwrite=True,
-                    keep=keep_last,
+            _log(f"[ckpt] saved step={step} to {ckpt_dir}")
+
+    if epoch_mode:
+        assert epochs_limit is not None
+        for epoch_idx in range(1, epochs_limit + 1):
+            host_iter, data_iter = _make_data_iterator(files_cycle=False)
+            steps_this_epoch = 0
+            try:
+                while True:
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
+                        break
+                    global_step += 1
+                    steps_this_epoch += 1
+                    _consume_batch(batch, global_step)
+            finally:
+                host_iter.close()
+            if steps_this_epoch == 0:
+                raise ValueError(
+                    f"Epoch {epoch_idx} yielded no training batches; check segment/window settings."
                 )
-                _log(f"[ckpt] saved step={step} to {ckpt_dir}")
-    finally:
-        host_iter.close()
+            _log(
+                f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global step={global_step})."
+            )
+    else:
+        assert steps_limit is not None
+        host_iter, data_iter = _make_data_iterator(files_cycle=True)
+        try:
+            for _ in range(steps_limit):
+                try:
+                    batch = next(data_iter)
+                except StopIteration as exc:
+                    raise RuntimeError(
+                        "Data iterator stopped unexpectedly with files_cycle=True; provide num_epochs for finite runs."
+                    ) from exc
+                global_step += 1
+                _consume_batch(batch, global_step)
+        finally:
+            host_iter.close()
     if log_fp is not None:
         try:
             log_fp.close()

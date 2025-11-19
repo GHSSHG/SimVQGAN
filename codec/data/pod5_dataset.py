@@ -42,6 +42,8 @@ def _should_skip_pod5(exc: Exception) -> bool:
         "Invalid signature in file",
         "Failed to open pod5 file",
         "Pod5ApiException",
+        "Bad address",
+        "Error writing bytes to file",
     )
     return any(k in msg for k in keywords)
 
@@ -59,6 +61,7 @@ falling back to configured defaults only when metadata is absent.
 class NanoporeSignalDataset:
     pod5_files: List[Path]
     window_ms: int = 2000
+    window_samples: Optional[int] = None
     sample_rate_hz_default: Optional[float] = None
     return_metadata: bool = False
     read_ids_per_file: Optional[Dict[Path, Sequence[str]]] = None
@@ -72,6 +75,7 @@ class NanoporeSignalDataset:
         cls,
         files: Iterable[Union[str, Path]],
         window_ms: int = 2000,
+        window_samples: Optional[int] = None,
         sample_rate_hz_default: Optional[float] = None,
         return_metadata: bool = False,
         read_ids_per_file: Optional[Dict[Union[str, Path], Sequence[str]]] = None,
@@ -87,9 +91,15 @@ class NanoporeSignalDataset:
             rid_map = {Path(k).expanduser().resolve(): v for k, v in read_ids_per_file.items()}
         workers = max(1, int(loader_workers))
         prefetch_chunks = max(1, int(loader_prefetch_chunks))
+        window_samples_int: Optional[int] = None
+        if window_samples is not None:
+            ws = int(window_samples)
+            if ws > 0:
+                window_samples_int = ws
         return cls(
             pod5_files=paths,
             window_ms=int(window_ms),
+            window_samples=window_samples_int,
             sample_rate_hz_default=sample_rate_hz_default,
             return_metadata=bool(return_metadata),
             read_ids_per_file=rid_map,
@@ -148,7 +158,10 @@ class NanoporeSignalDataset:
                                     )
                                     warned_sr_mismatch = True
                                 continue
-                        chunk_size = int(round(self.window_ms * float(target_sr) / 1000.0))
+                        if self.window_samples is not None and self.window_samples > 0:
+                            chunk_size = int(self.window_samples)
+                        else:
+                            chunk_size = int(round(self.window_ms * float(target_sr) / 1000.0))
                         if chunk_size <= 0:
                             chunk_size = 1
                         raw_signal = read.signal
@@ -203,8 +216,8 @@ class NanoporeSignalDataset:
             raise ValueError("return_metadata=True 时请使用 iter_chunks 手动消费数据")
         worker_count = int(num_workers if num_workers is not None else self.loader_workers)
         queue_cap = int(max_chunk_queue if max_chunk_queue is not None else self.loader_prefetch_chunks)
-        # Threaded path only makes sense when we need endless streaming (files_cycle=True) and >1 worker
-        if worker_count <= 1 or not files_cycle:
+        # Threaded path engages whenever >1 worker is requested; finite epochs still benefit
+        if worker_count <= 1:
             while True:
                 buf: List[np.ndarray] = []
                 for fp in self.pod5_files:

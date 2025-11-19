@@ -47,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--segment-sec", type=float, default=2.0, help="Segment length in seconds for each training window (default 2.0 → L=10000 for sr=5000)")
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
     p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--steps", type=int, default=50000)
+    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
     p.add_argument("--save-every", type=int, default=1000)
@@ -128,6 +129,7 @@ def _build_dataset(
     files: list[Path],
     window_ms: int,
     sample_rate: float,
+    window_samples: int | None,
     split_cfg: Dict[str, Any] | None = None,
 ) -> NanoporeSignalDataset:
     cfg = split_cfg or {}
@@ -138,6 +140,7 @@ def _build_dataset(
     return NanoporeSignalDataset.from_paths(
         files,
         window_ms=window_ms,
+        window_samples=window_samples,
         sample_rate_hz_default=sample_rate,
         loader_workers=loader_workers,
         loader_prefetch_chunks=loader_prefetch,
@@ -153,6 +156,15 @@ def _prepare_split_dataset(
     segment_sec = float(split_cfg.get("segment_sec", 2.0))
     sample_rate = float(split_cfg.get("sample_rate", 5000.0))
     window_ms = int(round(segment_sec * 1000))
+    segment_samples_raw = split_cfg.get("segment_samples")
+    window_samples = None
+    if segment_samples_raw not in (None, ""):
+        try:
+            window_samples = int(segment_samples_raw)
+        except (TypeError, ValueError):
+            window_samples = None
+    if window_samples is not None and window_samples <= 0:
+        window_samples = None
     data_type = split_cfg.get("type", "pod5")
     if data_type != "pod5":
         raise ValueError(f"Unsupported data type {data_type}")
@@ -161,6 +173,7 @@ def _prepare_split_dataset(
         files=files,
         window_ms=window_ms,
         sample_rate=sample_rate,
+        window_samples=window_samples,
         split_cfg=split_cfg,
     )
     return dataset, files
@@ -181,7 +194,27 @@ def main() -> None:
         model_cfg = cfg.get("model", {})
         data_cfg = cfg.get("data", {})
         ckpt_cfg = cfg.get("checkpoint", {})
-        steps = int(train_cfg.get("steps", 50000))
+        def _positive_int(value: Any) -> int | None:
+            if value in (None, "", False):
+                return None
+            try:
+                intval = int(value)
+            except (TypeError, ValueError):
+                return None
+            return intval if intval > 0 else None
+
+        steps = _positive_int(train_cfg.get("steps"))
+        epochs = _positive_int(train_cfg.get("epochs"))
+        cli_epochs = _positive_int(args.epochs)
+        cli_steps = _positive_int(args.steps)
+        if cli_epochs is not None:
+            epochs = cli_epochs
+            steps = None
+        elif cli_steps is not None:
+            steps = cli_steps
+            epochs = None
+        if steps is None and epochs is None:
+            steps = 50000
         batch_size = int(train_cfg.get("batch_size", 512))
         lr = float(train_cfg.get("learning_rate", 5e-4))
         save_every = int(train_cfg.get("save_every", 1000))
@@ -218,6 +251,7 @@ def main() -> None:
             "root": base_root,
             "subdirs": data_cfg.get("subdirs", ["."]),
             "segment_sec": float(data_cfg.get("segment_sec", 2.0)),
+            "segment_samples": data_cfg.get("segment_samples"),
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "files_per_epoch": data_cfg.get("files_per_epoch"),
             "loader_workers": max(1, default_loader_workers),
@@ -253,6 +287,7 @@ def main() -> None:
             train_model_from_pod5(
                 ds,
                 num_steps=steps,
+                num_epochs=epochs,
                 learning_rate=lr,
                 seed=int(seed),
                 ckpt_dir=ckpt_dir,
@@ -295,6 +330,20 @@ def main() -> None:
     legacy_loader_prefetch = (
         max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
     )
+    def _legacy_positive(value: Any) -> int | None:
+        if value in (None, "", False):
+            return None
+        try:
+            intval = int(value)
+        except (TypeError, ValueError):
+            return None
+        return intval if intval > 0 else None
+
+    legacy_steps = _legacy_positive(args.steps)
+    legacy_epochs = _legacy_positive(args.epochs)
+    if legacy_epochs is None and legacy_steps is None:
+        legacy_steps = 50000
+
     train_spec = {
         "type": "pod5",
         "root": str(root),
@@ -315,11 +364,15 @@ def main() -> None:
     wandb_logger = None
     if args.wandb:
         run_name = args.wandb_run or f"vq-gan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        wandb_logger = init_wandb(args.wandb_project or "vq-gan", run_name, {
+        wandb_payload: Dict[str, Any] = {
             "mode": "cli",
             "batch_size": int(args.batch_size),
-            "steps": int(args.steps),
-        }, api_key=None)
+        }
+        if legacy_steps is not None:
+            wandb_payload["steps"] = int(legacy_steps)
+        if legacy_epochs is not None:
+            wandb_payload["epochs"] = int(legacy_epochs)
+        wandb_logger = init_wandb(args.wandb_project or "vq-gan", run_name, wandb_payload, api_key=None)
     default_loss_weights = {
         "time_l1": 1.0,
         "commit": 1.0,
@@ -329,15 +382,16 @@ def main() -> None:
     try:
         train_model_from_pod5(
             ds,
-            num_steps=int(args.steps),
+            num_steps=legacy_steps,
+            num_epochs=legacy_epochs,
             learning_rate=float(args.lr),
             seed=int(seed),
             ckpt_dir=ckpt_dir,
             save_every=int(args.save_every),
             keep_last=int(args.keep_last),
             loss_weights=default_loss_weights,
-            lr_warmup_steps=1000,
-            lr_total_steps=int(args.steps),
+            lr_warmup_steps=0,
+            lr_total_steps=int(legacy_steps) if legacy_steps is not None else None,
             batch_size=int(args.batch_size),
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
