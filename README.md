@@ -1,73 +1,167 @@
-## 项目概览
+## SimVQGAN for Nanopore Current Reconstruction
 
-  - 本仓库实现基于 JAX/Flax 的 1D SimVQGAN（向量量化自动编码器 + PatchGAN 判别器），目标是对 Nanopore POD5 原始电流信号进行时域重建与对抗式训练。
+SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于对 Nanopore POD5 原始电流信号进行时域重建。项目聚焦于：
 
-## 核心目录与职责
+- **自监督压缩与重建**：SimVQ 编码器/解码器 + PatchGAN 判别器，共 80× 下采样、约 2 s（10000 sample @ 5 kHz）窗口。
+- **面向 Colab/A100 的流水线**：线程化 POD5 流式读取、设备预取、XLA cache、TF32。
+- **训练后验证**：借助 `scripts/dorado_validate.py` 将真实/生成信号交给 ONT Dorado basecaller，得到简单 identity 指标。
 
-  - **train.py**：入口脚本，设置 JAX 运行环境（TF32 / CUDA 选择）后转调 `scripts/train.py`。路径：`train.py`.
-  - **scripts/train.py**：解析配置、加载 POD5 数据、构建模型与判别器、训练与日志/断点记录（验证流程已移至训练结束后的独立脚本）。路径：`scripts/train.py`.
-  - **configs/**：训练配置 JSON（默认 `train_config.colab.json`），包含数据路径、模型与优化超参。路径：`configs/train_config.colab.json`.
-  - **codec/ 包**：
-      - **data/**：POD5 读取、鲁棒归一化、分块与线程/设备预取。路径示例：`codec/data/pod5_dataset.py`.
-      - **models/**：编码器/解码器、SimVQ 量化器、PatchGAN 判别器。主模型：`codec/models/model.py`.
-      - **train/**：训练状态、损失、单步梯度计算、主训练循环。路径：`codec/train/loop.py`, `codec/train/step.py`, `codec/train/losses.py`.
-      - **jaxlayers/**：卷积等 JAX/Flax 层封装。路径：`codec/jaxlayers/layers.py`.
-      - **utils/**：POD5 文件发现、随机种子、WandB 包装、断点同步。路径：`codec/utils/*.py`.
-      - **runtime.py**：JAX/XLA 环境配置与编译缓存。路径：`codec/runtime.py`.
-  - **scripts/setup\_local\_repo.py**：在 Colab SSD 镜像仓库以加速 I/O。
+---
 
-## 数据与预处理流程
+### 目录速览
 
-1.  **scripts/train.py** 解析配置 -\> 解析数据根目录、子目录与采样率。
-2.  **codec/utils/pod5\_files.py** 查找 POD5 文件；`NanoporeSignalDataset.from_paths` 校验存在性。
-3.  每个 read：读取 POD5 校准 (offset/scale) 将 int16 ADC 转为 pA，再执行鲁棒归一化 (median/MAD) 并按窗口长度分段 (window\_ms 推导 chunk\_size)。训练仅消费归一化后的窗口；验证/生成路径会保存 median/MAD 与校准参数，以便对模型输出做逆归一化并写回 POD5。
-4.  通过 `Prefetcher` 线程预取到主机队列，可选 `make_device_prefetcher` 将 batch 放入设备并按多 GPU 分片。
+| 路径 | 说明 |
+| --- | --- |
+| `train.py` | 入口脚本：配置 runtime 后转调 `scripts/train.py`。 |
+| `scripts/train.py` | CLI 训练管线（配置解析、数据集构建、模型组装、日志/断点）。 |
+| `scripts/dorado_validate.py` | 训练后验证（重建 POD5 + Dorado basecalling + identity 报告）。 |
+| `scripts/setup_local_repo.py` | Colab 上将仓库镜像到 `/content` SSD 以提升 I/O。 |
+| `configs/` | JSON 配置（训练、验证）。默认：`train_config.colab.json`、`validate_dorado.colab.json`。 |
+| `codec/data/` | POD5 正规化、窗口切分、线程/设备预取；核心类 `NanoporeSignalDataset`。 |
+| `codec/models/` | 编码器、解码器、量化器、PatchGAN 判别器、整合模型。 |
+| `codec/train/` | 损失、TrainState、梯度计算、完整训练循环。 |
+| `codec/utils/` | POD5 文件发现、随机数、WandB、checkpoint 同步等工具。 |
+| `codec/runtime.py` | 设置 JAX/XLA 环境（TF32、CUDA、编译缓存等）。 |
 
-## 模型与训练主线
+---
 
-  - 编码器 (`SimVQEncoder1D`) 级联残差块+降采样；量化前 1×1 卷积；`SimVQ1D` 量化输出代码索引与承诺损失；解码器上采样重建波形 (`SimVQDecoder1D` + `PatchGAN` 判别器)。
-  - 损失 (`compute_generator_losses`)：L1 重建 + 承诺 + GAN + feature matching，权重来自配置。
-  - 训练步 (`compute_grads`)：生成器前向→判别器真/假→生成器和判别器各自梯度；记录 perplexity、code usage 等统计。
-  - 学习率：余弦 + warmup（`_make_lr_schedule`，位于 `codec/train/loop.py`）。
-  - 断点：`flax.training.checkpoints` 保存；可镜像到 Google Drive (`drive_backup_dir`)。
+### 数据流与预处理
 
-## 运行与命令示例
+1. **文件发现**：`scripts/train.py` 读取配置 → `codec/utils/pod5_files.py` 枚举 POD5 → 可按 `files_per_epoch` 采样子集。
+2. **流式读取**：`NanoporeSignalDataset` 在独立线程中顺序读取 POD5，每个 read 通过 `codec/data/pod5_processing.py` 将 int16 ADC → pA，并执行鲁棒 median/MAD 归一化。
+3. **窗口化**：`segment_sec=2.0` 与采样率（默认为 5000 Hz）决定 `window_ms=2000`，将每个 read 切成完整 chunk。训练阶段仅消费归一化波形；验证/生成阶段额外保留 normalization stats 用于还原。
+4. **预取**：`Prefetcher` 将 CPU 线程产出的 batch 推送到主进程，`make_device_prefetcher`（可选）再搬运到 GPU，以减少输入瓶颈。
 
-  - **默认训练**（自动选用 `configs/train_config.colab.json` 或候选路径）：
-    ```bash
-    python train.py --config configs/train_config.colab.json
-    ```
-  - **指定输出目录与保存频率**：
-    ```bash
-    python scripts/train.py --config configs/train_config.colab.json --ckpt-dir checkpoints/run1 --save-every 2000
-    ```
-  - **快速冒烟测试**（少步数）：
-    ```bash
-    python scripts/train.py --config configs/train_config.colab.json --steps 10
-    ```
-  - **Colab 镜像以提速 I/O**：
-    ```bash
-    python scripts/setup_local_repo.py --target /content/VQGAN
-    ```
+---
 
-## 配置要点（configs/train\_config.colab.json）
+### 模型结构（默认）
 
-  - **数据**：`data.root` 指向 POD5 目录，`segment_sec=2.0s`（10000 sample @ 5 kHz），`sample_rate=5000Hz`，`files_per_epoch` 控制采样子集。
-  - **模型**：`base_channels=32`，`enc_channels=[32,32,64,64,128]`，`dec_channels=[128,64,64,32,32]`，`enc_down_strides=[4,4,5,1]`，`dec_up_strides=[1,5,4,4]`，`codebook_size=4096`，`beta=0.25`。
-  - **训练**：`steps`、`batch_size`（默认 512）、`learning_rate`（默认 5e-4）、判别器权重 `disc_factor`、保存频率；周期性验证已移除，若需验证请运行 `scripts/dorado_validate.py`。
-  - **日志**：WandB 开关与项目名。请通过环境变量设置 `WANDB_API_KEY`，不要写入源码。
+- **编码器 `SimVQEncoder1D`**：`base_channels=32`、channel multipliers `(1,1,2,2,4)`，down-strides `(4,4,5,1)`（总 80×），残差块每级 2 个。
+- **量化器 `SimVQ1D`**：`codebook_size=4096`、`latent_dim=128`，无 EMA，支持 perplexity/usage 统计。
+- **解码器 `SimVQDecoder1D`**：镜像上采样 schedule `(128,64,64,32,32)`、up-strides `(1,5,4,4)`，PixelShuffle 风格。
+- **判别器 `PatchDiscriminator1D`**：通道 `(32,64,128,256)`，每层卷积+残差，hinge GAN 损失。
+- **Loss 组合**：时间域 L1（`time_l1`）、commitment（`beta`）、GAN（`gan`）、feature matching（`feature`），权重可在配置中调整。
 
-## 开发与扩展步骤（建议顺序）
+---
 
-1.  **新数据路径**：修改/复制 `configs/*.json`，调整 `data.root`、`files_per_epoch` 以适配磁盘/显存。
-2.  **模型试验**：在配置中调 `codebook_size`、`latent_dim`、enc/dec 通道表；保持下采样与上采样对齐。
-3.  **增加指标**：在 `codec/train/step.py` 中扩展日志键，或在 `codec/train/loop.py` 的 `_simvq_style_logs` 映射输出。
-4.  **性能调优**：开启 `XLA_CACHE_DIR`（已在 `runtime.enable_jax_compilation_cache` 支持），合理设置 `loader_workers`、`loader_prefetch_chunks`。
-5.  **云端运行**：先执行 `scripts/setup_local_repo.py` 镜像到本地 SSD，再运行训练以减少 I/O 瓶颈。
-6.  **测试与调试**：无现成单测；可在 `test/`（已忽略）下用 pytest 针对 `NanoporeSignalDataset` 和损失函数写小样本测试；训练冒烟用极小 `steps` 验证流程不崩。
-7.  **提交规范**：短祈使句提交，例如“add pod5 cache guard”；PR 说明需包含改动摘要、运行过的命令/日志、配置差异和是否影响 checkpoints 或路径。
+### 快速上手
 
-## 注意事项
+> 以下命令均在仓库根目录执行；默认配置位于 `configs/train_config.colab.json`。
 
-  - **GPU 环境自动探测**：若不想用 GPU，导出 `CUDA_VISIBLE_DEVICES=""` 再运行。
-  - **不要提交大型 POD5 或密钥**；配置中的 API key 字段仅作占位，应依赖环境变量。
+1. **安装依赖**（示例）
+   ```bash
+   pip install -r requirements.txt  # 若无 requirements，请根据 JAX/Flax 版本手动安装
+   ```
+
+2. **启动训练**
+   ```bash
+   python train.py --config configs/train_config.colab.json
+   ```
+   - 默认 batch size=512、base LR=5e-4、steps=50k、单 GPU。
+   - 日志写入 `<ckpt_dir>/train.log`，WandB 可通过配置中的 `logging.wandb.enabled` 或 `--wandb` 开启。
+
+3. **自定义输出 & 保存频率**
+   ```bash
+   python scripts/train.py \
+     --config configs/train_config.colab.json \
+     --ckpt-dir checkpoints/run1 \
+     --save-every 2000
+   ```
+
+4. **冒烟测试**
+   ```bash
+   python scripts/train.py --config configs/train_config.colab.json --steps 10 --log-every 1
+   ```
+
+5. **在 Colab 镜像仓库**
+   ```bash
+   python scripts/setup_local_repo.py --target /content/SimVQGAN
+   ```
+
+---
+
+### 配置说明
+
+#### `configs/train_config.colab.json`
+
+| 键 | 作用 | 备注 |
+| --- | --- | --- |
+| `train.batch_size` | 每步样本数（默认 512） | 根据显存调整，可结合 `files_per_epoch` 控制数据混洗。 |
+| `train.learning_rate` | AdamW LR 基准（默认 5e-4） | 结合 warmup/cosine (`lr_scheduler`) 使用。 |
+| `train.loss_weights` | L1 / commit / GAN / feature 权重 | 对应 `codec/train/losses.py`。 |
+| `model.*` | 编解码通道/步幅、`latent_dim`、`codebook_size` | 需保持 enc/dec schedule 对齐。 |
+| `data.segment_sec` | 窗口长度（秒） | 2.0 → 10000 sample @ 5 kHz。 |
+| `data.files_per_epoch` | 每 epoch 采样的 POD5 文件数 | 0/null 表示全部。 |
+| `checkpoint.dir` | 断点输出目录 | 可配合 `drive_backup_dir` 做镜像。 |
+| `logging.wandb.*` | WandB 开关、项目/Run 名 | `api_key` 建议改用环境变量 `WANDB_API_KEY`。 |
+
+#### `configs/validate_dorado.colab.json`
+
+| 键 | 作用 |
+| --- | --- |
+| `pod5` | 需要验证的真实 POD5 文件。 |
+| `ckpt_final` | 训练完的 checkpoint 目录（`ckpt_final/checkpoint_*`）。 |
+| `window` & `model` | 复制训练时的 segment / 结构配置，确保验证模型一致。 |
+| `dorado` | Dorado 可执行、模型、设备等信息。 |
+
+使用示例：
+```bash
+python scripts/dorado_validate.py \
+  --config configs/validate_dorado.colab.json \
+  --pod5 /path/to/sample.pod5 \
+  --ckpt-final /path/to/checkpoints/checkpoint_50000 \
+  --out-dir /path/to/dorado_eval \
+  --dorado-bin /path/to/dorado \
+  --dorado-model dna_r10.4.1_e8.2_400bps_sup@v5.2.0
+```
+输出：裁剪后的真实 POD5、生成 POD5、可选 FASTQ、`dorado_report.json`（包含 mean/median identity）。
+
+---
+
+### 常见工作流
+
+1. **替换数据集**：
+   - 复制训练配置，修改 `data.root`、`subdirs`、`files_per_epoch`。
+   - 若采样率不同，更新 `data.sample_rate` 并确保 POD5 元数据一致。
+
+2. **尝试新模型**：
+   - 在配置中调整 `model.enc_channels` / `dec_channels` 等；保持下采样/上采样匹配。
+   - 同步修改 `scripts/dorado_validate.py` 使用的验证配置。
+
+3. **调高吞吐**：
+   - 增加 `data.loader_workers`、`loader_prefetch_chunks`。
+   - 设置 `XLA_CACHE_DIR` 环境变量（`codec/runtime.enable_jax_compilation_cache` 会使用）。
+
+4. **仅继续训练**：
+   - 指定 `checkpoint.resume_from` 或在 CLI 中 `--ckpt-dir` 指向已有目录。
+   - 使用 `codec/train/train_more` 时可手动加载存档后继续。
+
+5. **验证/发布**：
+   - 训练结束后运行 `scripts/dorado_validate.py`，无需依赖在线验证；可在报告中附上 Dorado identity。
+
+---
+
+### 开发建议
+
+1. **编码风格**：Python 3.11+，PEP8/Black 风格，4 空格缩进，模块/函数/变量使用 snake_case。
+2. **调试**：`test/` 目录被 gitignore，可自由写 pytest；冒烟测试建议 `--steps 10 --log-every 1`。
+3. **提交信息**：使用简短祈使句（如 “add pod5 cache guard”），一次提交涵盖相关修改。
+4. **安全**：不要提交 POD5、大型 checkpoint 或密钥；通过环境变量提供 `WANDB_API_KEY`、`CUDA_VISIBLE_DEVICES` 等。
+5. **资源**：若只想 CPU 运行，设置 `CUDA_VISIBLE_DEVICES=""`；如需自定义 JAX cache 路径，设置 `XLA_CACHE_DIR`。
+
+---
+
+### 故障排查与提示
+
+| 问题 | 可能原因 | 对策 |
+| --- | --- | --- |
+| 数据集迭代阻塞 | POD5 损坏 / 样本率不匹配 | 控制台会打印 `[warn]` 并跳过；检查 `data.sample_rate`、移除损坏文件。 |
+| OOM | batch size 过大或 `files_per_epoch` 太高导致预取占用显存 | 减小 `train.batch_size`、调整 `loader_prefetch_chunks`，或禁用设备预取。 |
+| Dorado 验证报错 | `dorado` 不在 PATH、模型路径错误 | 显示的命令会包含复制路径，确认配置中的 `dorado.bin`、`dorado.model`。 |
+| WandB 无法初始化 | API Key 缺失 / 网络限制 | 关闭 `logging.wandb.enabled` 或设置 `WANDB_MODE=offline`。 |
+
+---
+
+如需进一步说明（如定制量化器、扩展损失、接入多 GPU），欢迎在对应模块 (`codec/models/quantize.py`, `codec/train/losses.py` 等) 上继续扩展。
+
+Happy hacking!
