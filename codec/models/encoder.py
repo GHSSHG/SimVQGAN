@@ -160,10 +160,10 @@ class EncoderStage1D(nn.Module):
 
 class SimVQEncoder1D(nn.Module):
     in_channels: int = 1
-    base_channels: int = 128
+    base_channels: int = 32
     channel_multipliers: Sequence[int] = (1, 1, 2, 2, 4)
     num_res_blocks: int = 2
-    down_strides: Sequence[int] = (4, 4, 4, 3)
+    down_strides: Sequence[int] = (4, 4, 5, 1)
     latent_dim: int = 128
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32

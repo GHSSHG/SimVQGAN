@@ -81,9 +81,9 @@ class DecoderStage1D(nn.Module):
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channel_schedule: Sequence[int] = (512, 256, 256, 128, 128)
+    channel_schedule: Sequence[int] = (128, 64, 64, 32, 32)
     num_res_blocks: int = 2
-    up_strides: Sequence[int] = (3, 4, 4, 4)
+    up_strides: Sequence[int] = (1, 5, 4, 4)
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 

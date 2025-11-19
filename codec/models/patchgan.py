@@ -11,7 +11,7 @@ from .encoder import SimVQResBlock1D
 class PatchDiscriminator1D(nn.Module):
     """SimVQ-inspired PatchGAN discriminator with residual refinement."""
 
-    channels: Tuple[int, ...] = (64, 128, 256, 512)
+    channels: Tuple[int, ...] = (32, 64, 128, 256)
     strides: Tuple[int, ...] = (2, 2, 2, 2)
     kernel_size: int = 15
     resblock_layers: int = 2

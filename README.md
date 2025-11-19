@@ -5,7 +5,7 @@
 ## 核心目录与职责
 
   - **train.py**：入口脚本，设置 JAX 运行环境（TF32 / CUDA 选择）后转调 `scripts/train.py`。路径：`train.py`.
-  - **scripts/train.py**：解析配置、加载 POD5 数据、构建模型与判别器、训练/验证、记录日志与断点。路径：`scripts/train.py`.
+  - **scripts/train.py**：解析配置、加载 POD5 数据、构建模型与判别器、训练与日志/断点记录（验证流程已移至训练结束后的独立脚本）。路径：`scripts/train.py`.
   - **configs/**：训练配置 JSON（默认 `train_config.colab.json`），包含数据路径、模型与优化超参。路径：`configs/train_config.colab.json`.
   - **codec/ 包**：
       - **data/**：POD5 读取、鲁棒归一化、分块与线程/设备预取。路径示例：`codec/data/pod5_dataset.py`.
@@ -37,13 +37,13 @@
     ```bash
     python train.py --config configs/train_config.colab.json
     ```
-  - **指定输出与验证间隔**：
+  - **指定输出目录与保存频率**：
     ```bash
-    python scripts/train.py --config configs/train_config.colab.json --ckpt-dir checkpoints/run1 --val-every 2000
+    python scripts/train.py --config configs/train_config.colab.json --ckpt-dir checkpoints/run1 --save-every 2000
     ```
   - **快速冒烟测试**（少步数）：
     ```bash
-    python scripts/train.py --config configs/train_config.colab.json --steps 10 --val-every 10
+    python scripts/train.py --config configs/train_config.colab.json --steps 10
     ```
   - **Colab 镜像以提速 I/O**：
     ```bash
@@ -52,9 +52,9 @@
 
 ## 配置要点（configs/train\_config.colab.json）
 
-  - **数据**：`data.root` 指向 POD5 目录，`segment_sec=4.8s`，`sample_rate=5000Hz`，`files_per_epoch` 控制采样子集。
-  - **模型**：`base_channels=128`，`codebook_size=4096`，`beta=0.25`，编码/解码通道与步幅在 `enc_down_strides` / `dec_up_strides`。
-  - **训练**：`steps`、`batch_size`、`learning_rate`、判别器权重 `disc_factor`、保存/验证频率。
+  - **数据**：`data.root` 指向 POD5 目录，`segment_sec=2.0s`（10000 sample @ 5 kHz），`sample_rate=5000Hz`，`files_per_epoch` 控制采样子集。
+  - **模型**：`base_channels=32`，`enc_channels=[32,32,64,64,128]`，`dec_channels=[128,64,64,32,32]`，`enc_down_strides=[4,4,5,1]`，`dec_up_strides=[1,5,4,4]`，`codebook_size=4096`，`beta=0.25`。
+  - **训练**：`steps`、`batch_size`（默认 512）、`learning_rate`（默认 5e-4）、判别器权重 `disc_factor`、保存频率；周期性验证已移除，若需验证请运行 `scripts/dorado_validate.py`。
   - **日志**：WandB 开关与项目名。请通过环境变量设置 `WANDB_API_KEY`，不要写入源码。
 
 ## 开发与扩展步骤（建议顺序）

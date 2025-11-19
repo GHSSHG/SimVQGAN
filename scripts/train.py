@@ -44,11 +44,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("root", type=Path, nargs="?", help="Root directory containing POD5 files or subfolders")
     p.add_argument("--subdirs", nargs="*", default=None, help="Optional subdirectories under root to search")
     p.add_argument("--files-per-epoch", type=int, default=32, help="How many files to cycle per epoch selection")
-    p.add_argument("--segment-sec", type=float, default=4.8, help="Segment length in seconds for each training window (default 4.8 → L=24000 for sr=5000)")
+    p.add_argument("--segment-sec", type=float, default=2.0, help="Segment length in seconds for each training window (default 2.0 → L=10000 for sr=5000)")
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=512)
     p.add_argument("--steps", type=int, default=50000)
-    p.add_argument("--lr", type=float, default=2e-4)
+    p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--keep-last", type=int, default=10)
@@ -64,11 +64,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override data.loader_prefetch_chunks for threaded POD5 loader",
     )
-    # validation options
-    p.add_argument("--val-every", type=int, default=2000, help="Run lightweight validation every N steps")
-    p.add_argument("--val-batches", type=int, default=2, help="Number of validation batches per run (<=0 means no cap)")
-    p.add_argument("--val-root", type=Path, default=None, help="Optional separate root for validation POD5")
-    p.add_argument("--val-subdirs", nargs="*", default=None, help="Optional subdirectories for validation")
     p.add_argument("--seed", type=int, default=None, help="Optional seed; if omitted, derive a new epoch seed")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
@@ -155,7 +150,7 @@ def _prepare_split_dataset(
     seed: int,
     allow_pick: bool,
 ) -> tuple[NanoporeSignalDataset, list[Path]]:
-    segment_sec = float(split_cfg.get("segment_sec", 4.8))
+    segment_sec = float(split_cfg.get("segment_sec", 2.0))
     sample_rate = float(split_cfg.get("sample_rate", 5000.0))
     window_ms = int(round(segment_sec * 1000))
     data_type = split_cfg.get("type", "pod5")
@@ -187,15 +182,10 @@ def main() -> None:
         data_cfg = cfg.get("data", {})
         ckpt_cfg = cfg.get("checkpoint", {})
         steps = int(train_cfg.get("steps", 50000))
-        batch_size = int(train_cfg.get("batch_size", 128))
-        lr = float(train_cfg.get("learning_rate", 2e-4))
+        batch_size = int(train_cfg.get("batch_size", 512))
+        lr = float(train_cfg.get("learning_rate", 5e-4))
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
-        val_every = int(train_cfg.get("val_every", 2000))
-        val_batches_cfg = train_cfg.get("val_batches", 8)
-        val_batches = None if (isinstance(val_batches_cfg, str) and val_batches_cfg.lower() == "all") else (
-            None if val_batches_cfg is None else int(val_batches_cfg)
-        )
         log_every = int(train_cfg.get("log_every", 50))
         # weights aligned with SimVQ losses
         lw = train_cfg.get("loss_weights", {})
@@ -227,7 +217,7 @@ def main() -> None:
             "type": data_cfg.get("type", "pod5"),
             "root": base_root,
             "subdirs": data_cfg.get("subdirs", ["."]),
-            "segment_sec": float(data_cfg.get("segment_sec", 4.8)),
+            "segment_sec": float(data_cfg.get("segment_sec", 2.0)),
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "files_per_epoch": data_cfg.get("files_per_epoch"),
             "loader_workers": max(1, default_loader_workers),
@@ -239,23 +229,11 @@ def main() -> None:
             base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
         train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
-        val_spec = None
-        if data_cfg.get("validation"):
-            val_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("validation"))
-            val_spec["root"] = _resolve_data_path(val_spec.get("root"), cfg_dir)
-            val_spec.pop("files_per_epoch", None)
         ds, _ = _prepare_split_dataset(
             split_cfg=train_spec,
             seed=seed,
             allow_pick=True,
         )
-        val_ds = None
-        if val_spec is not None:
-            val_ds, _ = _prepare_split_dataset(
-                split_cfg=val_spec,
-                seed=seed,
-                allow_pick=False,
-            )
 
         ckpt_dir = str(Path(ckpt_cfg.get("dir", "./checkpoints/vqgan")).resolve())
         resume_from = ckpt_cfg.get("resume_from", None)
@@ -288,9 +266,6 @@ def main() -> None:
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
-                val_ds=val_ds,
-                val_every=val_every,
-                val_batches=val_batches,
                 resume_from=str(resume_from) if resume_from is not None else None,
                 log_every=log_every,
                 wandb_logger=wandb_logger,
@@ -335,26 +310,8 @@ def main() -> None:
         seed=int(seed),
         allow_pick=True,
     )
-    val_ds = None
-    if args.val_root is not None:
-        val_spec = {
-            "type": "pod5",
-            "root": str(args.val_root),
-            "subdirs": args.val_subdirs or ["."],
-            "segment_sec": float(args.segment_sec),
-            "sample_rate": float(args.sample_rate),
-            "loader_workers": legacy_loader_workers,
-            "loader_prefetch_chunks": legacy_loader_prefetch,
-        }
-        val_spec.pop("files_per_epoch", None)
-        val_ds, _ = _prepare_split_dataset(
-            split_cfg=val_spec,
-            seed=int(seed),
-            allow_pick=False,
-        )
 
     ckpt_dir = str(args.ckpt_dir)
-    val_batches_arg = None if args.val_batches <= 0 else int(args.val_batches)
     wandb_logger = None
     if args.wandb:
         run_name = args.wandb_run or f"vq-gan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -382,9 +339,6 @@ def main() -> None:
             lr_warmup_steps=1000,
             lr_total_steps=int(args.steps),
             batch_size=int(args.batch_size),
-            val_ds=val_ds,
-            val_every=int(args.val_every),
-            val_batches=val_batches_arg,
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
         )

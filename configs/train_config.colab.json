@@ -2,8 +2,8 @@
   "seed": 0,
   "train": {
     "steps": 50000,
-    "batch_size": 64,
-    "learning_rate": 0.0001,
+    "batch_size": 512,
+    "learning_rate": 0.0005,
     "lr_scheduler": {
       "warmup_steps": 0,
       "total_steps": 50000
@@ -12,8 +12,6 @@
     "disc_factor": 1.0,
     "save_every": 1000,
     "keep_last": 5,
-    "val_every": 1000,
-    "val_batches": 16,
     "log_every": 100,
     "loss_weights": {
       "time_l1": 1.0,
@@ -23,19 +21,19 @@
     }
   },
   "model": {
-    "base_channels": 128,
-    "enc_channels": [128, 128, 256, 256, 512],
-    "enc_down_strides": [4, 4, 4, 3],
+    "base_channels": 32,
+    "enc_channels": [32, 32, 64, 64, 128],
+    "enc_down_strides": [4, 4, 5, 1],
     "enc_num_res_blocks": 2,
     "latent_dim": 128,
     "codebook_size": 4096,
     "beta": 0.25,
     "legacy_beta": false,
-    "dec_channels": [512, 256, 256, 128, 128],
-    "dec_up_strides": [3, 4, 4, 4],
+    "dec_channels": [128, 64, 64, 32, 32],
+    "dec_up_strides": [1, 5, 4, 4],
     "dec_num_res_blocks": 2,
     "discriminator": {
-      "channels": [64, 128, 256, 512],
+      "channels": [32, 64, 128, 256],
       "strides": [2, 2, 2, 2],
       "kernel_size": 15,
       "resblock_layers": 2
@@ -44,7 +42,7 @@
   "data": {
     "type": "pod5",
     "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5/FC01/pod5",
-    "segment_sec": 4.8,
+    "segment_sec": 2.0,
     "sample_rate": 5000,
     "files_per_epoch": 16,
     "subdirs": ["."],
@@ -57,7 +55,7 @@
     }
   },
   "checkpoint": {
-    "dir": "/content/VQGAN/checkpoints/nanopore",
+    "dir": "/content/VQGAN/checkpoints",
     "resume_from": null,
     "drive_backup_dir": "/content/drive/MyDrive/VQGAN/checkpoints"
   },

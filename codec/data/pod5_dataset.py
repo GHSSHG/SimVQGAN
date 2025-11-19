@@ -58,7 +58,7 @@ falling back to configured defaults only when metadata is absent.
 @dataclass
 class NanoporeSignalDataset:
     pod5_files: List[Path]
-    window_ms: int = 4800
+    window_ms: int = 2000
     sample_rate_hz_default: Optional[float] = None
     return_metadata: bool = False
     read_ids_per_file: Optional[Dict[Path, Sequence[str]]] = None
@@ -71,7 +71,7 @@ class NanoporeSignalDataset:
     def from_paths(
         cls,
         files: Iterable[Union[str, Path]],
-        window_ms: int = 4800,
+        window_ms: int = 2000,
         sample_rate_hz_default: Optional[float] = None,
         return_metadata: bool = False,
         read_ids_per_file: Optional[Dict[Union[str, Path], Sequence[str]]] = None,

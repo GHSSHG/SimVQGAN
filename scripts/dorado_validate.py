@@ -3,7 +3,7 @@
 Run post-training validation by basecalling real vs. model-generated signals with Dorado.
 
 Steps:
-1) Load generator weights from a checkpoint (final or best).
+1) Load generator weights from a checkpoint (final).
 2) Read a POD5 file, normalize each read, reconstruct with the model, and write a new POD5 containing generated signals (metadata preserved).
 3) Optionally call Dorado on both real and generated POD5 files and compute simple per-read identity.
 
@@ -12,7 +12,6 @@ Usage (Colab):
         --config configs/validate_dorado.colab.json \\
         --pod5 /content/drive/MyDrive/ont_open_data/.../PBC83240_b2b54521_13d14a35_116.pod5 \\
         --ckpt-final /content/drive/MyDrive/VQGAN/checkpoints/final \\
-        --ckpt-best /content/drive/MyDrive/VQGAN/checkpoints/best \\
         --out-dir /content/VQGAN/dorado_eval \\
         --dorado-model dna_r10.4.1_e8.2_260bps_sup@v4.3.0 \\
         --dorado-bin dorado
@@ -46,8 +45,6 @@ OUTPUT_FILES = [
     "real.fastq",
     "final_generated.pod5",
     "final_generated.fastq",
-    "best_generated.pod5",
-    "best_generated.fastq",
     "dorado_report.json",
 ]
 
@@ -197,12 +194,12 @@ def _build_model(model_cfg: Dict, L: int):
         val = model_cfg.get(name, default)
         return tuple(int(v) for v in val)
 
-    base_channels = int(model_cfg.get("base_channels", 128))
-    enc_channels = _tuple("enc_channels", (128, 128, 256, 256, 512))
+    base_channels = int(model_cfg.get("base_channels", 32))
+    enc_channels = _tuple("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple("enc_down_strides", (4, 4, 4, 3))
-    dec_channels = _tuple("dec_channels", (512, 256, 256, 128, 128))
-    dec_up_strides = _tuple("dec_up_strides", (3, 4, 4, 4))
+    enc_down_strides = _tuple("enc_down_strides", (4, 4, 5, 1))
+    dec_channels = _tuple("dec_channels", (128, 64, 64, 32, 32))
+    dec_up_strides = _tuple("dec_up_strides", (1, 5, 4, 4))
     model = SimVQAudioModel(
         in_channels=1,
         base_channels=base_channels,
@@ -494,7 +491,6 @@ def main() -> None:
     )
     p.add_argument("--pod5", type=Path, required=False, help="Reference POD5 file for validation.")
     p.add_argument("--ckpt-final", type=Path, required=False, help="Checkpoint dir for final model.")
-    p.add_argument("--ckpt-best", type=Path, required=False, help="Checkpoint dir for best model.")
     p.add_argument("--out-dir", type=Path, default=None, help="Output directory for generated POD5/FASTQ and report.")
     p.add_argument("--dorado-bin", type=str, default=None, help="Path to Dorado binary.")
     p.add_argument("--dorado-model", type=str, required=False, help="Dorado model identifier or path (e.g., dna_r10.4.1_e8.2_260bps_sup@v4.3.0).")
@@ -546,7 +542,7 @@ def main() -> None:
     if not window_cfg and train_cfg:
         window_cfg = train_cfg.get("data")
     window_cfg = window_cfg or {}
-    segment_sec = float(window_cfg.get("segment_sec", 4.8))
+    segment_sec = float(window_cfg.get("segment_sec", 2.0))
     sample_rate = float(window_cfg.get("sample_rate", 5000.0))
     L = int(round(segment_sec * sample_rate))
 
@@ -557,10 +553,6 @@ def main() -> None:
     ckpt_final = _repo_path(args.ckpt_final) if args.ckpt_final else _resolve_path(cfg_data.get("ckpt_final"))
     if ckpt_final is None or not ckpt_final.exists():
         raise FileNotFoundError(f"Final checkpoint path missing: {ckpt_final}")
-
-    ckpt_best = _repo_path(args.ckpt_best) if args.ckpt_best else _resolve_path(cfg_data.get("ckpt_best"))
-    if ckpt_best is not None and not ckpt_best.exists():
-        raise FileNotFoundError(f"Best checkpoint path missing: {ckpt_best}")
 
     out_dir = _repo_path(args.out_dir) if args.out_dir else _resolve_path(cfg_data.get("out_dir"))
     if out_dir is None:
@@ -597,7 +589,6 @@ def main() -> None:
     print(f"[stage] Copying POD5/checkpoints/dorado assets to {LOCAL_ROOT} ...", flush=True)
     pod5_local = _localize_file(pod5_path, LOCAL_POD5_DIR)
     ckpt_final_local = _localize_tree(ckpt_final, LOCAL_CKPT_DIR)
-    ckpt_best_local = _localize_tree(ckpt_best, LOCAL_CKPT_DIR) if ckpt_best is not None else None
 
     dorado_bin_local = _localize_dorado_bin(dorado_bin)
 
@@ -693,8 +684,6 @@ def main() -> None:
     if real_fastq:
         reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
     reports["final"] = _process_ckpt("final", ckpt_final_local)
-    if ckpt_best_local is not None:
-        reports["best"] = _process_ckpt("best", ckpt_best_local)
 
     (out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
     print(json.dumps(reports, indent=2))

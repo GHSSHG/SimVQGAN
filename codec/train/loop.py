@@ -136,7 +136,7 @@ def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
     num_steps: int = 200,
-    learning_rate: float = 3e-4,
+    learning_rate: float = 5e-4,
     seed: int = 0,
     ckpt_dir: str | None = None,
     save_every: int = 1000,
@@ -149,9 +149,6 @@ def train_model_from_pod5(
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
-    val_ds: NanoporeSignalDataset | None = None,
-    val_every: int = 2000,
-    val_batches: int | None = 8,
     resume_from: str | None = None,
     log_every: int = 50,
     wandb_logger: Any | None = None,
@@ -199,13 +196,13 @@ def train_model_from_pod5(
         return tuple(int(v) for v in val)
 
     latent_dim = int(mcfg.get("latent_dim", 128))
-    base_channels = int(mcfg.get("base_channels", 128))
-    enc_channels = _tuple_cfg("enc_channels", (128, 128, 256, 256, 512))
+    base_channels = int(mcfg.get("base_channels", 32))
+    enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple_cfg("enc_down_strides", (4, 4, 4, 3))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (4, 4, 5, 1))
     enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
-    dec_channels = _tuple_cfg("dec_channels", (512, 256, 256, 128, 128))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (3, 4, 4, 4))
+    dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 5, 4, 4))
     dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     generator = SimVQAudioModel(
         in_channels=1,
@@ -222,7 +219,7 @@ def train_model_from_pod5(
         dec_up_strides=dec_up_strides,
     )
     disc_cfg = dict(mcfg.get("discriminator", {}))
-    disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (64, 128, 256, 512)))
+    disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
     disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
     discriminator = PatchDiscriminator1D(
         channels=disc_channels,
@@ -333,73 +330,6 @@ def train_model_from_pod5(
         )
         _log("[warmup] Compile finished; starting real data iterator.")
 
-    # Optional compile warmup for eval/inference graphs to avoid first-validation stall.
-    if os.environ.get("VQGAN_WARMUP_EVAL", "1") != "0":
-        _log("[warmup] Compiling eval step on dummy batch; this may take a moment.")
-        warm_rng, step_rng = jax.random.split(step_rng)
-        dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
-        outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, dummy_batch, train=False, offset=0, rng=warm_rng)
-        wave_hat = outs["wave_hat"]
-        fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, wave_hat, train=False, return_features=True)
-        real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, dummy_batch, train=False, return_features=True)
-        compute_generator_losses(
-            y=dummy_batch,
-            y_hat=wave_hat,
-            fake_map=fake_map,
-            real_feats=real_feats,
-            fake_feats=fake_feats,
-            commit_loss=outs["enc"]["commit_loss"],
-            weights=loss_weights,
-        )
-        hinge_d_loss(real_map, fake_map)
-        _log("[warmup] Eval compile finished.")
-
-    def _evaluate(gen_state, disc_state, eval_ds: NanoporeSignalDataset, loss_w, B_eval: int = 1, val_limit: int | None = None, seed_offset: int = 0):
-        if eval_ds is None:
-            return {}
-        Bv = max(1, min(B_eval, 16))
-        limit = val_limit if val_limit is not None and val_limit > 0 else None
-        agg: Dict[str, float] = {}
-        seen = 0
-        with Prefetcher(eval_ds.batches(batch_size=Bv, drop_last=True, files_cycle=False), prefetch_size=2) as it:
-            for i, host_batch in enumerate(it):
-                if limit is not None and i >= limit:
-                    break
-                y = jnp.asarray(host_batch)
-                rng_eval = jax.random.PRNGKey(seed ^ 0x5EED ^ i ^ int(seed_offset))
-                vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
-                outs = gen_state.apply_fn({"params": gen_state.params, "vq": vq_in}, y, train=False, offset=0, rng=rng_eval)
-                y_hat = outs["wave_hat"]
-                fake_map, fake_feats = disc_state.apply_fn({"params": disc_state.params}, y_hat, train=False, return_features=True)
-                real_map, real_feats = disc_state.apply_fn({"params": disc_state.params}, y, train=False, return_features=True)
-                total_loss, gen_logs = compute_generator_losses(
-                    y=y,
-                    y_hat=y_hat,
-                    fake_map=fake_map,
-                    real_feats=real_feats,
-                    fake_feats=fake_feats,
-                    commit_loss=outs["enc"]["commit_loss"],
-                    weights=loss_w,
-                )
-                gen_logs = dict(gen_logs)
-                gen_logs["total_loss"] = total_loss
-                gen_logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
-                usage_ratio = outs["enc"].get("usage_ratio")
-                if usage_ratio is not None:
-                    gen_logs["code_usage"] = usage_ratio
-                gen_logs["disc_loss"] = hinge_d_loss(real_map, fake_map)
-                formatted = _simvq_style_logs(gen_logs, "val", 1.0)
-                float_logs = _logs_to_float_dict(formatted)
-                for k, v in float_logs.items():
-                    agg[k] = agg.get(k, 0.0) + v
-                seen += 1
-        if seen == 0:
-            return {}
-        return {k: v / seen for k, v in agg.items()}
-
-    best_dir = os.path.join(ckpt_dir, "best") if ckpt_dir else None
-    best_score = None
     # Optional resume
     if resume_from is not None and os.path.exists(resume_from):
         try:
@@ -456,13 +386,6 @@ def train_model_from_pod5(
             if should_log:
                 _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
                 _log_wandb(float_logs, step)
-            need_val = val_ds is not None and val_every > 0 and step % val_every == 0
-            val_metrics = None
-            if need_val:
-                val_metrics = _evaluate(gen_state, disc_state, val_ds, loss_weights, B_eval=B, val_limit=val_batches, seed_offset=step)
-                if val_metrics:
-                    _log("[val] step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in val_metrics.items()))
-                    _log_wandb(val_metrics, step)
             if ckpt_dir and (step % save_every == 0):
                 flax_ckpt.save_checkpoint(
                     ckpt_dir,
@@ -472,21 +395,6 @@ def train_model_from_pod5(
                     keep=keep_last,
                 )
                 _log(f"[ckpt] saved step={step} to {ckpt_dir}")
-            # optional best-ckpt on validation
-            if need_val and best_dir is not None and val_metrics:
-                metric_name = "val/total_loss"
-                score = val_metrics.get(metric_name)
-                if score is not None and (best_score is None or score < best_score):
-                    os.makedirs(best_dir, exist_ok=True)
-                    flax_ckpt.save_checkpoint(
-                        best_dir,
-                        target={"gen": gen_state, "disc": disc_state},
-                        step=step,
-                        overwrite=True,
-                        keep=1,
-                    )
-                    best_score = score
-                    _log(f"[best] step {step}: {metric_name}={score:.4f} (saved)")
     finally:
         host_iter.close()
     if log_fp is not None:
