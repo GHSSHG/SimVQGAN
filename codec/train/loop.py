@@ -35,23 +35,6 @@ def _force_frozen(tree):
     return tree
 
 
-def _make_lr_schedule(base_lr: float, warmup_steps: int, total_steps: int):
-    warmup_steps = max(0, int(warmup_steps))
-    total_steps = max(total_steps, warmup_steps + 1)
-
-    if warmup_steps == 0:
-        return float(base_lr)
-
-    def schedule(step: int | jnp.ndarray):
-        step_f = jnp.asarray(step, dtype=jnp.float32)
-        warm = jnp.clip(step_f / jnp.maximum(1.0, float(warmup_steps)), 0.0, 1.0)
-        progress = jnp.clip((step_f - warmup_steps) / jnp.maximum(1.0, float(total_steps - warmup_steps)), 0.0, 1.0)
-        cosine = 0.5 * (1.0 + jnp.cos(jnp.pi * progress))
-        return base_lr * jnp.where(step_f < warmup_steps, warm, cosine)
-
-    return schedule
-
-
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
     "reconstruct_loss": "reconstruct_loss",
@@ -135,7 +118,6 @@ def _logs_to_float_dict(logs: Dict[str, Any]) -> Dict[str, float]:
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
-    num_steps: int | None = 200,
     num_epochs: int | None = None,
     learning_rate: float = 5e-4,
     seed: int = 0,
@@ -143,8 +125,6 @@ def train_model_from_pod5(
     save_every: int = 1000,
     keep_last: int = 3,
     loss_weights: Dict[str, float] | None = None,
-    lr_warmup_steps: int | None = None,
-    lr_total_steps: int | None = None,
     disc_start: int = 0,
     disc_factor: float = 1.0,
     model_cfg: dict | None = None,
@@ -253,52 +233,29 @@ def train_model_from_pod5(
     _, L = init_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
 
-    def _positive_int(value: int | None) -> int | None:
-        if value is None:
-            return None
-        try:
-            intval = int(value)
-        except (TypeError, ValueError):
-            return None
-        return intval if intval > 0 else None
+    if num_epochs is None:
+        raise ValueError("Epoch-based training requires num_epochs > 0.")
+    try:
+        epochs_limit = int(num_epochs)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("num_epochs must be convertible to int") from exc
+    if epochs_limit <= 0:
+        raise ValueError("num_epochs must be a positive integer.")
 
-    steps_limit = _positive_int(num_steps)
-    epochs_limit = _positive_int(num_epochs)
-    epoch_mode = epochs_limit is not None
-    if not epoch_mode and steps_limit is None:
-        raise ValueError("Must provide a positive num_steps or num_epochs for training")
-
-    warmup = int(lr_warmup_steps) if lr_warmup_steps is not None else 0
-    warmup = max(0, warmup)
-    total_sched = None
-    if lr_total_steps is not None:
-        total_sched = max(1, int(lr_total_steps))
-    elif steps_limit is not None:
-        total_sched = steps_limit
     lr_value = float(learning_rate)
-    if warmup > 0:
-        if total_sched is None:
-            raise ValueError(
-                "Warmup/cosine LR schedule requires lr_scheduler.total_steps or an explicit num_steps; "
-                "provide lr_scheduler.total_steps when training by epochs."
-            )
-        total_sched = max(total_sched, warmup + 1)
-        lr_schedule_fn = _make_lr_schedule(lr_value, warmup, total_sched)
-    else:
-        lr_schedule_fn = lr_value
 
     gen_state, _ = create_generator_state(
         gen_init_rng,
         generator,
         (B, L),
-        lr_schedule_fn,
+        lr_value,
         group_lrs={
             "default": 1.0,
             "codebook": float(codebook_lr_mult),
             "W": 0.0 if bool(freeze_W) else 1.0,
         },
     )
-    disc_state, _ = create_discriminator_state(disc_init_rng, discriminator, (B, L), lr_schedule_fn)
+    disc_state, _ = create_discriminator_state(disc_init_rng, discriminator, (B, L), lr_value)
 
     base_vq_vars = gen_state.vq_vars
 
@@ -319,9 +276,9 @@ def train_model_from_pod5(
     if not isinstance(disc_state.params, FrozenDict):
         disc_state = disc_state.replace(params=freeze(disc_state.params))
 
-    def _make_data_iterator(files_cycle: bool) -> tuple[Prefetcher, Iterator[np.ndarray]]:
+    def _make_data_iterator() -> tuple[Prefetcher, Iterator[np.ndarray]]:
         host_iter = Prefetcher(
-            ds.batches(batch_size=B, drop_last=True, files_cycle=files_cycle),
+            ds.batches(batch_size=B, drop_last=True, files_cycle=False),
             prefetch_size=8,
         )
         data_iter = iter(
@@ -427,44 +384,27 @@ def train_model_from_pod5(
             )
             _log(f"[ckpt] saved step={step} to {ckpt_dir}")
 
-    if epoch_mode:
-        assert epochs_limit is not None
-        for epoch_idx in range(1, epochs_limit + 1):
-            host_iter, data_iter = _make_data_iterator(files_cycle=False)
-            steps_this_epoch = 0
-            try:
-                while True:
-                    try:
-                        batch = next(data_iter)
-                    except StopIteration:
-                        break
-                    global_step += 1
-                    steps_this_epoch += 1
-                    _consume_batch(batch, global_step)
-            finally:
-                host_iter.close()
-            if steps_this_epoch == 0:
-                raise ValueError(
-                    f"Epoch {epoch_idx} yielded no training batches; check segment/window settings."
-                )
-            _log(
-                f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global step={global_step})."
-            )
-    else:
-        assert steps_limit is not None
-        host_iter, data_iter = _make_data_iterator(files_cycle=True)
+    for epoch_idx in range(1, epochs_limit + 1):
+        host_iter, data_iter = _make_data_iterator()
+        steps_this_epoch = 0
         try:
-            for _ in range(steps_limit):
+            while True:
                 try:
                     batch = next(data_iter)
-                except StopIteration as exc:
-                    raise RuntimeError(
-                        "Data iterator stopped unexpectedly with files_cycle=True; provide num_epochs for finite runs."
-                    ) from exc
+                except StopIteration:
+                    break
                 global_step += 1
+                steps_this_epoch += 1
                 _consume_batch(batch, global_step)
         finally:
             host_iter.close()
+        if steps_this_epoch == 0:
+            raise ValueError(
+                f"Epoch {epoch_idx} yielded no training batches; check segment/window settings."
+            )
+        _log(
+            f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global step={global_step})."
+        )
     if log_fp is not None:
         try:
             log_fp.close()
@@ -485,7 +425,7 @@ def train_more(
     generator,
     *,
     ds: NanoporeSignalDataset,
-    num_steps: int,
+    num_epochs: int,
     loss_weights: Dict[str, float],
     ckpt_dir: str | None,
     save_every: int,
@@ -494,7 +434,9 @@ def train_more(
     disc_factor: float = 1.0,
     disc_start: int = 0,
 ):
-    probe_iter = ds.batches(batch_size=1, drop_last=True, files_cycle=True)
+    if num_epochs <= 0:
+        raise ValueError("num_epochs must be positive when continuing training.")
+    probe_iter = ds.batches(batch_size=1, drop_last=True, files_cycle=False)
     probe = np.asarray(next(probe_iter))
     if probe.ndim == 3 and probe.shape[1] == 1:
         probe = probe[:, 0, :]
@@ -502,8 +444,12 @@ def train_more(
         probe = probe[..., 0]
     B = probe.shape[0]
     L = probe.shape[-1]
-    host_iter = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=True), prefetch_size=8)
-    data_iter = iter(make_device_prefetcher(host_iter, device_prefetch_size=2, shard_for_multigpu=False))
+
+    def _make_iter():
+        host = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=False), prefetch_size=8)
+        dev_iter = iter(make_device_prefetcher(host, device_prefetch_size=2, shard_for_multigpu=False))
+        return host, dev_iter
+
     step_rng = jax.random.PRNGKey(int(getattr(gen_state, "step", 0)))
 
     # prepare log file
@@ -524,11 +470,11 @@ def train_more(
 
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
 
-    for i in range(1, num_steps + 1):
-        step_rng, apply_rng = jax.random.split(step_rng)
-        batch = next(data_iter)
-        current_step = int(getattr(gen_state, "step", 0))
-        df = float(disc_factor if current_step >= int(disc_start) else 0.0)
+    current_global = int(getattr(gen_state, "step", 0))
+
+    def _train_step(batch, apply_rng):
+        nonlocal gen_state, disc_state
+        df = float(disc_factor if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0)
         g_grads, d_grads, logs, new_vq = compute_grads(
             gen_state,
             disc_state,
@@ -560,19 +506,43 @@ def train_more(
             logs["code_usage"] = usage
             logs["perplexity"] = perplexity
         formatted = _simvq_style_logs(logs, "train", df)
-        float_logs = _logs_to_float_dict(formatted)
-        if i % 200 == 0 or i == 1:
-            step_now = int(getattr(gen_state, "step", 0))
-            _log("step " + str(step_now) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
-        if ckpt_dir and (i % save_every == 0):
-            flax_ckpt.save_checkpoint(
-                ckpt_dir,
-                target={"gen": gen_state, "disc": disc_state},
-                step=int(getattr(gen_state, "step", 0)),
-                overwrite=True,
-                keep=keep_last,
-            )
-            _log(f"[ckpt] saved step={int(getattr(gen_state, 'step', 0))} to {ckpt_dir}")
+        return _logs_to_float_dict(formatted)
+
+    for epoch_idx in range(1, num_epochs + 1):
+        host_iter, data_iter = _make_iter()
+        steps_this_epoch = 0
+        try:
+            while True:
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    break
+                step_rng, apply_rng = jax.random.split(step_rng)
+                float_logs = _train_step(batch, apply_rng)
+                steps_this_epoch += 1
+                current_global = int(getattr(gen_state, "step", 0))
+                if steps_this_epoch == 1 or (current_global % 200 == 0):
+                    _log(
+                        "step "
+                        + str(current_global)
+                        + ", "
+                        + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items())
+                    )
+                if ckpt_dir and save_every > 0 and (current_global % save_every == 0):
+                    flax_ckpt.save_checkpoint(
+                        ckpt_dir,
+                        target={"gen": gen_state, "disc": disc_state},
+                        step=current_global,
+                        overwrite=True,
+                        keep=keep_last,
+                    )
+                    _log(f"[ckpt] saved step={current_global} to {ckpt_dir}")
+        finally:
+            host_iter.close()
+        if steps_this_epoch == 0:
+            raise ValueError(f"Epoch {epoch_idx} yielded no batches; check dataset configuration.")
+        _log(f"[train_more epoch {epoch_idx}/{num_epochs}] completed {steps_this_epoch} steps (global step={current_global}).")
+
     if log_fp is not None:
         try:
             log_fp.close()

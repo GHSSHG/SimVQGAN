@@ -4,9 +4,6 @@
     "epochs": 2,
     "batch_size": 512,
     "learning_rate": 0.0005,
-    "lr_scheduler": {
-      "warmup_steps": 0
-    },
     "disc_start": 0,
     "disc_factor": 1.0,
     "save_every": 1000,
@@ -44,7 +41,6 @@
     "segment_sec": 2.0,
     "segment_samples": 10000,
     "sample_rate": 5000,
-    "files_per_epoch": null,
     "subdirs": [
       "FC01/pod5",
       "FC02/pod5",
@@ -59,7 +55,6 @@
         "FC02/pod5",
         "FC03/pod5"
       ],
-      "files_per_epoch": null,
       "segment_samples": 10000
     }
   },

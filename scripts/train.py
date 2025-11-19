@@ -31,7 +31,6 @@ from codec.data import NanoporeSignalDataset
 from codec.train import train_model_from_pod5
 from codec.utils import (
     discover_pod5_files,
-    pick_files_for_epoch,
     new_epoch_seed,
     init_wandb,
 )
@@ -43,11 +42,9 @@ def parse_args() -> argparse.Namespace:
     # Legacy CLI (kept for compatibility; ignored when --config is provided)
     p.add_argument("root", type=Path, nargs="?", help="Root directory containing POD5 files or subfolders")
     p.add_argument("--subdirs", nargs="*", default=None, help="Optional subdirectories under root to search")
-    p.add_argument("--files-per-epoch", type=int, default=32, help="How many files to cycle per epoch selection")
     p.add_argument("--segment-sec", type=float, default=2.0, help="Segment length in seconds for each training window (default 2.0 → L=10000 for sr=5000)")
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
-    p.add_argument("--batch-size", type=int, default=512)
-    p.add_argument("--steps", type=int, default=None)
+    p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
@@ -97,8 +94,6 @@ def _merge_split_cfg(base: Dict[str, Any], override: Dict[str, Any] | None) -> D
 def _collect_files_for_spec(
     *,
     split_cfg: Dict[str, Any],
-    seed: int,
-    allow_pick: bool,
 ) -> list[Path]:
     explicit = split_cfg.get("files")
     if explicit:
@@ -113,14 +108,6 @@ def _collect_files_for_spec(
             raise ValueError(f"Unknown data.type={data_type}")
     if not files:
         raise FileNotFoundError(f"No files found for split under {split_cfg.get('root')}")
-    if allow_pick:
-        fpe_raw = split_cfg.get("files_per_epoch")
-        try:
-            fpe = 0 if fpe_raw in (None, "") else int(fpe_raw)
-        except (TypeError, ValueError):
-            fpe = 0
-        if fpe > 0 and fpe < len(files):
-            files = pick_files_for_epoch(files, seed=seed, files_per_epoch=fpe)
     return files
 
 
@@ -150,8 +137,6 @@ def _build_dataset(
 def _prepare_split_dataset(
     *,
     split_cfg: Dict[str, Any],
-    seed: int,
-    allow_pick: bool,
 ) -> tuple[NanoporeSignalDataset, list[Path]]:
     segment_sec = float(split_cfg.get("segment_sec", 2.0))
     sample_rate = float(split_cfg.get("sample_rate", 5000.0))
@@ -168,7 +153,7 @@ def _prepare_split_dataset(
     data_type = split_cfg.get("type", "pod5")
     if data_type != "pod5":
         raise ValueError(f"Unsupported data type {data_type}")
-    files = _collect_files_for_spec(split_cfg=split_cfg, seed=seed, allow_pick=allow_pick)
+    files = _collect_files_for_spec(split_cfg=split_cfg)
     dataset = _build_dataset(
         files=files,
         window_ms=window_ms,
@@ -203,19 +188,13 @@ def main() -> None:
                 return None
             return intval if intval > 0 else None
 
-        steps = _positive_int(train_cfg.get("steps"))
         epochs = _positive_int(train_cfg.get("epochs"))
         cli_epochs = _positive_int(args.epochs)
-        cli_steps = _positive_int(args.steps)
         if cli_epochs is not None:
             epochs = cli_epochs
-            steps = None
-        elif cli_steps is not None:
-            steps = cli_steps
-            epochs = None
-        if steps is None and epochs is None:
-            steps = 50000
-        batch_size = int(train_cfg.get("batch_size", 512))
+        if epochs is None:
+            raise ValueError("Epoch-based training requires 'train.epochs' in the config or --epochs override.")
+        batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 512))
         lr = float(train_cfg.get("learning_rate", 5e-4))
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
@@ -237,10 +216,6 @@ def main() -> None:
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
         freeze_W = bool(optim_cfg.get("freeze_W", False))
-        lr_sched_cfg = train_cfg.get("lr_scheduler", {})
-        warmup_steps = lr_sched_cfg.get("warmup_steps")
-        total_sched_steps = lr_sched_cfg.get("total_steps")
-
         model_kwargs = model_cfg
 
         default_loader_workers = int(data_cfg.get("loader_workers", max(2, (os.cpu_count() or 4) // 2 or 1)))
@@ -253,7 +228,6 @@ def main() -> None:
             "segment_sec": float(data_cfg.get("segment_sec", 2.0)),
             "segment_samples": data_cfg.get("segment_samples"),
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
-            "files_per_epoch": data_cfg.get("files_per_epoch"),
             "loader_workers": max(1, default_loader_workers),
             "loader_prefetch_chunks": max(1, default_loader_prefetch),
         }
@@ -263,11 +237,7 @@ def main() -> None:
             base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
         train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
-        ds, _ = _prepare_split_dataset(
-            split_cfg=train_spec,
-            seed=seed,
-            allow_pick=True,
-        )
+        ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
         ckpt_dir = str(Path(ckpt_cfg.get("dir", "./checkpoints/vqgan")).resolve())
         resume_from = ckpt_cfg.get("resume_from", None)
@@ -286,7 +256,6 @@ def main() -> None:
         try:
             train_model_from_pod5(
                 ds,
-                num_steps=steps,
                 num_epochs=epochs,
                 learning_rate=lr,
                 seed=int(seed),
@@ -294,8 +263,6 @@ def main() -> None:
                 save_every=save_every,
                 keep_last=keep_last,
                 loss_weights=loss_weights,
-                lr_warmup_steps=int(warmup_steps) if warmup_steps is not None else None,
-                lr_total_steps=int(total_sched_steps) if total_sched_steps is not None else None,
                 disc_start=disc_start,
                 disc_factor=disc_factor,
                 model_cfg=model_kwargs,
@@ -339,10 +306,9 @@ def main() -> None:
             return None
         return intval if intval > 0 else None
 
-    legacy_steps = _legacy_positive(args.steps)
     legacy_epochs = _legacy_positive(args.epochs)
-    if legacy_epochs is None and legacy_steps is None:
-        legacy_steps = 50000
+    if legacy_epochs is None:
+        legacy_epochs = 1
 
     train_spec = {
         "type": "pod5",
@@ -350,26 +316,20 @@ def main() -> None:
         "subdirs": subdirs or ["."],
         "segment_sec": float(args.segment_sec),
         "sample_rate": float(args.sample_rate),
-        "files_per_epoch": args.files_per_epoch,
         "loader_workers": legacy_loader_workers,
         "loader_prefetch_chunks": legacy_loader_prefetch,
     }
-    ds, _ = _prepare_split_dataset(
-        split_cfg=train_spec,
-        seed=int(seed),
-        allow_pick=True,
-    )
+    ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
     ckpt_dir = str(args.ckpt_dir)
+    legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
     wandb_logger = None
     if args.wandb:
         run_name = args.wandb_run or f"vq-gan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         wandb_payload: Dict[str, Any] = {
             "mode": "cli",
-            "batch_size": int(args.batch_size),
+            "batch_size": legacy_batch_size,
         }
-        if legacy_steps is not None:
-            wandb_payload["steps"] = int(legacy_steps)
         if legacy_epochs is not None:
             wandb_payload["epochs"] = int(legacy_epochs)
         wandb_logger = init_wandb(args.wandb_project or "vq-gan", run_name, wandb_payload, api_key=None)
@@ -382,17 +342,14 @@ def main() -> None:
     try:
         train_model_from_pod5(
             ds,
-            num_steps=legacy_steps,
-            num_epochs=legacy_epochs,
+            num_epochs=int(legacy_epochs),
             learning_rate=float(args.lr),
             seed=int(seed),
             ckpt_dir=ckpt_dir,
             save_every=int(args.save_every),
             keep_last=int(args.keep_last),
             loss_weights=default_loss_weights,
-            lr_warmup_steps=0,
-            lr_total_steps=int(legacy_steps) if legacy_steps is not None else None,
-            batch_size=int(args.batch_size),
+            batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
         )
