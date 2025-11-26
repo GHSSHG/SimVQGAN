@@ -255,7 +255,7 @@ def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int, calibr
     outs = model.apply({"params": params, "vq": vq_in}, y, train=False, offset=0, rng=rng)
     wave_hat = np.asarray(outs["wave_hat"], dtype=np.float32).reshape(-1)
     _, adc = denormalize_to_adc(wave_hat, stats, cal)
-    reconstructed = np.clip(np.rint(adc), -32768, 32767).astype(np.int16, copy=False)
+    reconstructed = np.asarray(np.clip(np.rint(adc), -32768, 32767), dtype=np.int16)
     return reconstructed
 
 
@@ -324,7 +324,7 @@ def _write_truncated_pod5(
             if trimmed is None or trimmed.shape[0] < L:
                 continue
             read = record.to_read()
-            read.signal = trimmed.astype(np.int16, copy=False)
+            read.signal = np.asarray(trimmed, dtype=np.int16)
             writer.add_read(read)
             used_reads += 1
     print(f"[{label}] done. kept {used_reads}/{total_reads} reads", flush=True)

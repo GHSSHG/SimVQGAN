@@ -169,7 +169,7 @@ class NanoporeSignalDataset:
                             continue
                         norm_signal, stats, cal = _normalize_read_signal(raw_signal, getattr(read, "calibration", None))
                         for chunk in _iter_full_chunks(norm_signal, chunk_size=chunk_size):
-                            arr = chunk.astype(np.float32, copy=False)
+                            arr = np.asarray(chunk, dtype=np.float32)
                             if not self.return_metadata:
                                 yield arr
                             else:
@@ -190,7 +190,7 @@ class NanoporeSignalDataset:
     def _flush_batch(buf: List[np.ndarray]) -> np.ndarray:
         if buf and isinstance(buf[0], tuple):
             raise ValueError("return_metadata=True 数据集不支持批量堆叠；请迭代 chunk 自行处理元数据")
-        batch = np.stack(buf, axis=0).astype(np.float32, copy=False)
+        batch = np.asarray(np.stack(buf, axis=0), dtype=np.float32)
         return batch[:, np.newaxis, :]
 
     def iter_chunks(self, files_cycle: bool = False) -> Iterator[np.ndarray]:

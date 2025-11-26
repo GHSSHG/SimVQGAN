@@ -43,7 +43,7 @@ class Prefetcher:
                 if squeeze_channel_dim and arr.ndim == 3 and arr.shape[1] == 1:
                     arr = arr.squeeze(1)
                 if arr.dtype != self._dtype:
-                    arr = arr.astype(self._dtype, copy=False)
+                    arr = np.asarray(arr, dtype=self._dtype)
                 self._q.put(arr, block=True)
         except Exception as e:
             self._q.put(e)

@@ -7,9 +7,10 @@ _MAD_SCALE = 1.4826
 
 def robust_scale_with_stats(signal: np.ndarray, eps: float = 1e-6) -> tuple[np.ndarray, float, float]:
     """Normalize 1D signal using median/MAD and return stats for inversion."""
-    if signal.ndim != 1:
-        signal = signal.reshape(-1)
-    x = signal.astype(np.float32, copy=False)
+    arr = np.asarray(signal)
+    if arr.ndim != 1:
+        arr = arr.reshape(-1)
+    x = np.asarray(arr, dtype=np.float32)
     if x.size == 0:
         return x, 0.0, 1.0
     median = np.median(x).astype(np.float32)
@@ -18,7 +19,7 @@ def robust_scale_with_stats(signal: np.ndarray, eps: float = 1e-6) -> tuple[np.n
     scale = mad * np.float32(_MAD_SCALE)
     if not np.isfinite(scale) or scale < eps:
         scale = np.float32(eps)
-    normalized = ((x - median) / scale).astype(np.float32, copy=False)
+    normalized = np.asarray((x - median) / scale, dtype=np.float32)
     return normalized, float(median), float(scale)
 
 

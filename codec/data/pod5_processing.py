@@ -19,12 +19,13 @@ class CalibrationParams:
     scale: float = 1.0
 
     def to_picoamps(self, adc_samples: np.ndarray) -> np.ndarray:
-        adc = np.asarray(adc_samples, dtype=np.float32, copy=False)
+        # NumPy 2.0+ may raise when copy=False cannot be honored, so omit the flag.
+        adc = np.asarray(adc_samples, dtype=np.float32)
         safe_scale = self.scale if np.isfinite(self.scale) and self.scale != 0.0 else 1.0
         return (adc + self.offset) * safe_scale
 
     def to_adc(self, pa_samples: np.ndarray) -> np.ndarray:
-        pa = np.asarray(pa_samples, dtype=np.float32, copy=False)
+        pa = np.asarray(pa_samples, dtype=np.float32)
         safe_scale = self.scale if np.isfinite(self.scale) and self.scale != 0.0 else 1.0
         return (pa / safe_scale) - self.offset
 
@@ -95,7 +96,7 @@ def denormalize_to_adc(
     calibration: CalibrationParams,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Invert normalization to obtain (pA, ADC) arrays."""
-    norm = np.asarray(normalized, dtype=np.float32, copy=False)
+    norm = np.asarray(normalized, dtype=np.float32)
     pa = norm * float(stats.scale) + float(stats.shift)
     adc = calibration.to_adc(pa)
     return pa, adc
