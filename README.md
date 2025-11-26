@@ -57,7 +57,7 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
    ```bash
    python train.py --config configs/train_config.colab.json
    ```
-   - 默认 batch size=512、base LR=5e-4、epochs=2、单 GPU。
+   - 默认 batch size=256、base LR=5e-4、epochs=2、单 GPU（如遇 OOM 可用 `--batch-size` 降低到 128/64）。
    - 日志写入 `<ckpt_dir>/train.log`，WandB 可通过配置中的 `logging.wandb.enabled` 或 `--wandb` 开启。
 
 3. **自定义输出 & 保存频率**
@@ -87,7 +87,7 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 | 键 | 作用 | 备注 |
 | --- | --- | --- |
 | `train.epochs` | 训练完整遍历次数（默认 2） | 结合真实 POD5 文件流式迭代；`save_every` 仍按 step 计数。 |
-| `train.batch_size` | 每步样本数（默认 512） | 根据显存调整；训练始终遍历全部文件。 |
+| `train.batch_size` | 每步样本数（默认 256） | 若 Colab/T4 OOM，可在 CLI 传 `--batch-size 128` 或更低。 |
 | `train.learning_rate` | AdamW LR 基准（默认 5e-4） | 常数学习率，默认采用 AdamW。 |
 | `train.loss_weights` | L1 / commit / GAN / feature 权重 | 对应 `codec/train/losses.py`。 |
 | `model.*` | 编解码通道/步幅、`latent_dim`、`codebook_size` | 需保持 enc/dec schedule 对齐。 |

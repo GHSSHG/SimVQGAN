@@ -2,7 +2,7 @@
   "seed": 0,
   "train": {
     "epochs": 2,
-    "batch_size": 512,
+    "batch_size": 256,
     "learning_rate": 0.0005,
     "disc_start": 0,
     "disc_factor": 1.0,
