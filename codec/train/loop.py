@@ -126,6 +126,7 @@ def train_model_from_pod5(
     keep_last: int = 3,
     loss_weights: Dict[str, float] | None = None,
     disc_start: int = 0,
+    disc_steps: int = 1,
     disc_factor: float = 1.0,
     model_cfg: dict | None = None,
     log_file: str | None = None,
@@ -233,6 +234,8 @@ def train_model_from_pod5(
     _, L = init_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
 
+    disc_steps = max(1, int(disc_steps))
+
     if num_epochs is None:
         raise ValueError("Epoch-based training requires num_epochs > 0.")
     try:
@@ -337,18 +340,25 @@ def train_model_from_pod5(
         nonlocal step_rng, gen_state, disc_state
         step_rng, apply_rng = jax.random.split(step_rng)
         df = float(disc_factor if step >= int(disc_start) else 0.0)
-        g_grads, d_grads, logs, new_vq = compute_grads(
-            gen_state,
-            disc_state,
-            batch,
-            apply_rng,
-            loss_weights,
-            df,
-        )
+        if disc_steps > 1:
+            rngs = jax.random.split(apply_rng, disc_steps)
+        else:
+            rngs = (apply_rng,)
+        logs = {}
+        new_vq = None
+        for idx, rng_i in enumerate(rngs):
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                rng_i,
+                loss_weights,
+                df,
+            )
+            d_grads = _force_frozen(d_grads)
+            disc_state = disc_state.apply_gradients(grads=d_grads)
         g_grads = _force_frozen(g_grads)
-        d_grads = _force_frozen(d_grads)
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-        disc_state = disc_state.apply_gradients(grads=d_grads)
         logs = dict(logs)
         hist_counts = logs.pop("_code_hist_counts", None)
         hist_total = logs.pop("_code_hist_total", None)
@@ -433,6 +443,7 @@ def train_more(
     log_file: str | None = None,
     disc_factor: float = 1.0,
     disc_start: int = 0,
+    disc_steps: int = 1,
 ):
     if num_epochs <= 0:
         raise ValueError("num_epochs must be positive when continuing training.")
@@ -472,21 +483,30 @@ def train_more(
 
     current_global = int(getattr(gen_state, "step", 0))
 
+    disc_steps = max(1, int(disc_steps))
+
     def _train_step(batch, apply_rng):
         nonlocal gen_state, disc_state
         df = float(disc_factor if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0)
-        g_grads, d_grads, logs, new_vq = compute_grads(
-            gen_state,
-            disc_state,
-            batch,
-            apply_rng,
-            loss_weights,
-            df,
-        )
+        if disc_steps > 1:
+            rngs = jax.random.split(apply_rng, disc_steps)
+        else:
+            rngs = (apply_rng,)
+        logs = {}
+        new_vq = None
+        for rng_i in rngs:
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                rng_i,
+                loss_weights,
+                df,
+            )
+            d_grads = _force_frozen(d_grads)
+            disc_state = disc_state.apply_gradients(grads=d_grads)
         g_grads = _force_frozen(g_grads)
-        d_grads = _force_frozen(d_grads)
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-        disc_state = disc_state.apply_gradients(grads=d_grads)
         logs = dict(logs)
         hist_counts = logs.pop("_code_hist_counts", None)
         hist_total = logs.pop("_code_hist_total", None)

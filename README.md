@@ -90,6 +90,8 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 | `train.batch_size` | 每步样本数（默认 256） | 若 Colab/T4 OOM，可在 CLI 传 `--batch-size 128` 或更低。 |
 | `train.learning_rate` | AdamW LR 基准（默认 5e-4） | 常数学习率，默认采用 AdamW。 |
 | `train.loss_weights` | L1 / commit / GAN / feature 权重 | 对应 `codec/train/losses.py`。 |
+| `train.disc_start` | 开始引入 GAN/feature loss 的 step | 0 表示从第一步就启用判别器。 |
+| `train.disc_steps` | 每个 batch 的判别器更新次数（默认 1） | 可在配置中显式设为 2（示例配置已这样做）以防止判别器过早饱和。 |
 | `model.*` | 编解码通道/步幅、`latent_dim`、`codebook_size` | 需保持 enc/dec schedule 对齐。 |
 | `data.segment_sec` | 窗口长度（秒） | 2.0 → 10000 sample @ 5 kHz；与 `segment_samples` 联动。 |
 | `data.segment_samples` | 固定每个窗口的样本数 | 10000 时会跳过所有 <10000 read，并丢弃末尾不足的片段。 |

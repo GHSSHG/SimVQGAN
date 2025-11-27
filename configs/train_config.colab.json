@@ -3,17 +3,18 @@
   "train": {
     "epochs": 2,
     "batch_size": 256,
-    "learning_rate": 0.0002,
-    "disc_start": 5000,
+    "learning_rate": 0.0001,
+    "disc_start": 1000,
+    "disc_steps": 2,
     "disc_factor": 1.0,
     "save_every": 1000,
     "keep_last": 5,
     "log_every": 100,
     "loss_weights": {
-      "time_l1": 1.0,
+      "time_l1": 1.2,
       "commit": 1.0,
       "gan": 0.1,
-      "feature": 0.2
+      "feature": 0.1
     }
   },
   "model": {

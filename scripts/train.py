@@ -67,6 +67,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     p.add_argument("--wandb-run", type=str, default=None, help="WandB run name override")
     p.add_argument("--drive-backup-dir", type=Path, default=None, help="Optional Drive path to mirror checkpoints after training")
+    p.add_argument(
+        "--disc-steps",
+        type=int,
+        default=None,
+        help="Number of discriminator updates per batch (default 1; overrides config)",
+    )
     return p.parse_args()
 
 
@@ -210,6 +216,9 @@ def main() -> None:
 
         # adversarial scheduling
         disc_start = int(train_cfg.get("disc_start", 5000))
+        disc_steps = max(1, int(train_cfg.get("disc_steps", 1)))
+        if args.disc_steps is not None:
+            disc_steps = max(1, int(args.disc_steps))
         disc_factor = float(train_cfg.get("disc_factor", 1.0))
 
         # Optimization group overrides (optional)
@@ -264,6 +273,7 @@ def main() -> None:
                 keep_last=keep_last,
                 loss_weights=loss_weights,
                 disc_start=disc_start,
+                disc_steps=disc_steps,
                 disc_factor=disc_factor,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
@@ -297,6 +307,7 @@ def main() -> None:
     legacy_loader_prefetch = (
         max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
     )
+    legacy_disc_steps = max(1, int(args.disc_steps)) if args.disc_steps is not None else 1
     def _legacy_positive(value: Any) -> int | None:
         if value in (None, "", False):
             return None
@@ -352,6 +363,7 @@ def main() -> None:
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
+            disc_steps=legacy_disc_steps,
         )
     finally:
         if wandb_logger is not None:
