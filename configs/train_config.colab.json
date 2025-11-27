@@ -3,8 +3,8 @@
   "train": {
     "epochs": 2,
     "batch_size": 256,
-    "learning_rate": 0.0005,
-    "disc_start": 0,
+    "learning_rate": 0.0002,
+    "disc_start": 5000,
     "disc_factor": 1.0,
     "save_every": 1000,
     "keep_last": 5,
