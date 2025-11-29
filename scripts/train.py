@@ -211,6 +211,7 @@ def main() -> None:
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
         log_every = int(train_cfg.get("log_every", 50))
+        grad_clip = float(train_cfg.get("grad_clip", 0.7))
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 8)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 2)))
         if args.host_prefetch_size is not None:
@@ -295,6 +296,7 @@ def main() -> None:
                 disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
+                grad_clip=grad_clip,
             )
         finally:
             if wandb_logger is not None:

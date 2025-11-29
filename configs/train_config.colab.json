@@ -6,16 +6,17 @@
     "learning_rate": 0.0001,
     "host_prefetch_size": 64,
     "device_prefetch_size": 16,
+    "grad_clip": 0.7,
     "disc_start": 6000,
     "disc_ramp": 4000,
     "save_every": 1000,
     "keep_last": 5,
     "log_every": 100,
     "loss_weights": {
-      "time_l1": 1.5,
+      "time_l1": 2.0,
       "commit": 1.0,
-      "gan": 0.05,
-      "feature": 0.1
+      "gan": 0.02,
+      "feature": 0.05
     }
   },
   "model": {
@@ -75,7 +76,7 @@
   },
   "optim": {
     "codebook_lr_mult": 0.0,
-    "disc_lr_mult": 0.2,
+    "disc_lr_mult": 0.1,
     "freeze_W": false
   }
 }

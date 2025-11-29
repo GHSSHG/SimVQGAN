@@ -137,7 +137,7 @@ def train_model_from_pod5(
     # Optimization knobs
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
-    grad_clip: float = 1.0,
+    grad_clip: float = 0.7,
     disc_ramp: int = 4000,
     host_prefetch_size: int = 8,
     device_prefetch_size: int = 2,
