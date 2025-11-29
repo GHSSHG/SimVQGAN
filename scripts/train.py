@@ -46,7 +46,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--grad-accum", type=int, default=None, help="Micro-batch accumulation steps before applying generator grads")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
     p.add_argument("--save-every", type=int, default=1000)
@@ -212,9 +211,6 @@ def main() -> None:
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
         log_every = int(train_cfg.get("log_every", 50))
-        grad_accum = max(1, int(train_cfg.get("grad_accum_steps", 1)))
-        if args.grad_accum is not None:
-            grad_accum = max(1, int(args.grad_accum))
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 8)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 2)))
         if args.host_prefetch_size is not None:
@@ -232,9 +228,11 @@ def main() -> None:
 
         # adversarial scheduling
         disc_start = int(train_cfg.get("disc_start", 5000))
+        disc_ramp = int(train_cfg.get("disc_ramp", 4000))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
+        disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.2))
         freeze_W = bool(optim_cfg.get("freeze_W", False))
         model_kwargs = model_cfg
 
@@ -293,7 +291,8 @@ def main() -> None:
                 drive_backup_dir=str(drive_backup_dir) if drive_backup_dir else None,
                 codebook_lr_mult=codebook_lr_mult,
                 freeze_W=freeze_W,
-                grad_accum_steps=grad_accum,
+                disc_ramp=disc_ramp,
+                disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
             )
@@ -319,7 +318,6 @@ def main() -> None:
     legacy_loader_prefetch = (
         max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
     )
-    legacy_grad_accum = max(1, int(args.grad_accum)) if args.grad_accum is not None else 1
     legacy_host_prefetch = (
         max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 8
     )
@@ -381,7 +379,6 @@ def main() -> None:
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
-            grad_accum_steps=legacy_grad_accum,
             host_prefetch_size=legacy_host_prefetch,
             device_prefetch_size=legacy_device_prefetch,
         )
