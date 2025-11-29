@@ -180,6 +180,7 @@ from codec.models.model import SimVQAudioModel  # noqa: E402
 from codec.data.pod5_processing import (  # noqa: E402
     normalize_adc_signal,
     denormalize_to_adc,
+    CalibrationError,
 )
 
 try:
@@ -243,7 +244,11 @@ def _load_generator(ckpt_dir: Path, model_cfg: Dict, L: int):
 
 def _reconstruct_read(model, params, vq_vars, signal: np.ndarray, L: int, calibration) -> np.ndarray:
     """Normalize via calibration, window, run generator, and invert scale."""
-    norm, stats, cal = normalize_adc_signal(signal, calibration, eps=1e-6)
+    try:
+        norm, stats, cal = normalize_adc_signal(signal, calibration, eps=1e-6)
+    except CalibrationError as cal_exc:
+        print(f"[gen] skip read: {cal_exc}", flush=True)
+        return np.asarray([], dtype=np.int16)
     n = norm.shape[0]
     windows = n // L
     if windows <= 0:

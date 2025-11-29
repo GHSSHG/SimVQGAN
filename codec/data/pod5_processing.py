@@ -4,11 +4,16 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Tuple
 
 import numpy as np
-import warnings
 
-from .normalization import robust_scale_with_stats
+from .normalization import minmax_scale_with_stats
 
-_CAL_WARNING_KEYS: set[str] = set()
+
+class CalibrationError(RuntimeError):
+    """Raised when calibration metadata is missing or invalid."""
+
+
+class MissingCalibrationError(CalibrationError):
+    """Raised when calibration metadata is absent."""
 
 
 @dataclass(frozen=True)
@@ -32,16 +37,22 @@ class CalibrationParams:
 
 @dataclass(frozen=True)
 class NormalizationStats:
-    """Median/MAD statistics for robust scaling."""
+    """Per-read min/max statistics for reversible min-max scaling."""
 
-    shift: float = 0.0
-    scale: float = 1.0
+    data_min: float = 0.0
+    data_max: float = 0.0
+
+    @property
+    def data_range(self) -> float:
+        return float(self.data_max) - float(self.data_min)
 
 
 def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
-    """Extract CalibrationParams from pod5 Read/Run or fallback values."""
+    """Extract CalibrationParams from POD5 Read/Run or raise when absent."""
     if isinstance(calibration_obj, CalibrationParams):
         return calibration_obj
+    if calibration_obj is None:
+        raise MissingCalibrationError("missing calibration metadata")
     offset = 0.0
     scale = 1.0
     source = "unknown"
@@ -61,18 +72,10 @@ def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
     try:
         scale = float(scale)
     except Exception:
-        scale = 1.0
-    if calibration_obj is None and "missing_calibration" not in _CAL_WARNING_KEYS:
-        warnings.warn("[pod5] Missing calibration metadata; assuming offset=0, scale=1", RuntimeWarning)
-        _CAL_WARNING_KEYS.add("missing_calibration")
+        scale = np.nan
     if not np.isfinite(scale) or np.isclose(scale, 0.0):
-        if "invalid_scale" not in _CAL_WARNING_KEYS:
-            warnings.warn(
-                f"[pod5] Invalid calibration scale '{scale}' from {source}; falling back to 1.0",
-                RuntimeWarning,
-            )
-            _CAL_WARNING_KEYS.add("invalid_scale")
-        scale = 1.0
+        msg = f"[pod5] Invalid calibration scale '{scale}' from {source}; skipping read."
+        raise CalibrationError(msg)
     return CalibrationParams(offset=offset, scale=scale)
 
 
@@ -85,8 +88,8 @@ def normalize_adc_signal(
     """Convert ADC signal to normalized values with reversible metadata."""
     cal = parse_calibration(calibration)
     pa = cal.to_picoamps(signal)
-    norm, shift, scale = robust_scale_with_stats(pa, eps=eps)
-    stats = NormalizationStats(shift=shift, scale=scale)
+    norm, data_min, data_max = minmax_scale_with_stats(pa, eps=eps)
+    stats = NormalizationStats(data_min=data_min, data_max=data_max)
     return norm, stats, cal
 
 
@@ -94,10 +97,18 @@ def denormalize_to_adc(
     normalized: np.ndarray,
     stats: NormalizationStats,
     calibration: CalibrationParams,
+    *,
+    eps: float = 1e-6,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Invert normalization to obtain (pA, ADC) arrays."""
+    """Invert min-max normalization to obtain (pA, ADC) arrays."""
     norm = np.asarray(normalized, dtype=np.float32)
-    pa = norm * float(stats.scale) + float(stats.shift)
+    data_min = float(stats.data_min)
+    data_max = float(stats.data_max)
+    data_range = data_max - data_min
+    if data_range < eps:
+        pa = np.full_like(norm, data_min, dtype=np.float32)
+    else:
+        pa = ((norm + 1.0) * 0.5) * data_range + data_min
     adc = calibration.to_adc(pa)
     return pa, adc
 

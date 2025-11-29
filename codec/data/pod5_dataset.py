@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
@@ -14,6 +15,7 @@ from .pod5_processing import (
     resolve_sample_rate,
     NormalizationStats,
     CalibrationParams,
+    CalibrationError,
 )
 
 
@@ -50,9 +52,9 @@ def _should_skip_pod5(exc: Exception) -> bool:
 
 """POD5 dataset utilities.
 
-Each read is streamed from POD5, converted to picoamps via calibration, robust
-normalized once, and then chunked so every window shares the same per-read
-statistics (median≈0, MAD≈1). Sample-rate hints stored in POD5 are preferred,
+Each read is streamed from POD5, converted to picoamps via calibration, scaled
+once to [-1, 1] using its own min/max, and then chunked so every window shares
+the same per-read statistics. Sample-rate hints stored in POD5 are preferred,
 falling back to configured defaults only when metadata is absent.
 """
 
@@ -69,6 +71,7 @@ class NanoporeSignalDataset:
     loader_prefetch_chunks: int = 128
     _invalid_files: set[Path] = field(default_factory=set, init=False, repr=False)
     _cached_length: Optional[int] = field(default=None, init=False, repr=False)
+    _calibration_warned_files: set[Path] = field(default_factory=set, init=False, repr=False)
 
     @classmethod
     def from_paths(
@@ -167,7 +170,20 @@ class NanoporeSignalDataset:
                         raw_signal = read.signal
                         if raw_signal.shape[0] < chunk_size:
                             continue
-                        norm_signal, stats, cal = _normalize_read_signal(raw_signal, getattr(read, "calibration", None))
+                        try:
+                            # Normalize the full read prior to slicing windows to keep stats consistent across chunks.
+                            norm_signal, stats, cal = _normalize_read_signal(
+                                raw_signal, getattr(read, "calibration", None)
+                            )
+                        except CalibrationError as cal_exc:
+                            if file_path not in self._calibration_warned_files:
+                                read_id = getattr(read, "read_id", "unknown")
+                                warnings.warn(
+                                    f"[pod5] Skipping reads in {file_path.name} (first failing read {read_id}): {cal_exc}",
+                                    RuntimeWarning,
+                                )
+                                self._calibration_warned_files.add(file_path)
+                            continue
                         for chunk in _iter_full_chunks(norm_signal, chunk_size=chunk_size):
                             arr = np.asarray(chunk, dtype=np.float32)
                             if not self.return_metadata:
