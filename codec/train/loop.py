@@ -150,6 +150,8 @@ def train_model_from_pod5(
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
     grad_accum_steps: int = 1,
+    grad_clip: float = 1.0,
+    disc_ramp: int = 2000,
     host_prefetch_size: int = 8,
     device_prefetch_size: int = 2,
 ):
@@ -268,13 +270,20 @@ def train_model_from_pod5(
         generator,
         (B, L),
         lr_value,
+        grad_clip=grad_clip,
         group_lrs={
             "default": 1.0,
             "codebook": float(codebook_lr_mult),
             "W": 0.0 if bool(freeze_W) else 1.0,
         },
     )
-    disc_state, _ = create_discriminator_state(disc_init_rng, discriminator, (B, L), lr_value)
+    disc_state, _ = create_discriminator_state(
+        disc_init_rng,
+        discriminator,
+        (B, L),
+        learning_rate=lr_value * 0.5,
+        grad_clip=grad_clip,
+    )
 
     base_vq_vars = gen_state.vq_vars
 
@@ -321,12 +330,24 @@ def train_model_from_pod5(
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
+    def _disc_mask(step_hint: int) -> float:
+        if step_hint < int(disc_start):
+            return 0.0
+        if disc_ramp <= 0:
+            return 1.0
+        progress = (step_hint - int(disc_start)) / float(disc_ramp)
+        if progress < 0.0:
+            progress = 0.0
+        if progress > 1.0:
+            progress = 1.0
+        return progress
+
     # Optional compile warmup on dummy batch to avoid long stalls on first real step (e.g., Colab).
     if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
         _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
         dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        disc_mask_warm = jnp.asarray(1.0 if int(disc_start) <= 0 else 0.0, dtype=jnp.float32)
+        disc_mask_warm = jnp.asarray(_disc_mask(0), dtype=jnp.float32)
         # Trigger JIT compile; ignore outputs.
         compute_grads(
             gen_state,
@@ -431,7 +452,7 @@ def train_model_from_pod5(
     def _consume_batch(batch, step_hint: int) -> bool:
         nonlocal step_rng, gen_state, disc_state, pending_gen_grads, pending_disc_grads, pending_accum
         step_rng, apply_rng = jax.random.split(step_rng)
-        disc_mask = 1.0 if step_hint >= int(disc_start) else 0.0
+        disc_mask = _disc_mask(step_hint)
         logs = {}
         new_vq = None
         g_grads, d_grads, logs, new_vq = compute_grads(
@@ -518,6 +539,7 @@ def train_more(
     keep_last: int,
     log_file: str | None = None,
     disc_start: int = 0,
+    disc_ramp: int = 2000,
 ):
     if num_epochs <= 0:
         raise ValueError("num_epochs must be positive when continuing training.")
@@ -559,7 +581,14 @@ def train_more(
 
     def _train_step(batch, apply_rng):
         nonlocal gen_state, disc_state
-        disc_mask = 1.0 if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0
+        current_step = int(getattr(gen_state, "step", 0))
+        if current_step < int(disc_start):
+            disc_mask = 0.0
+        elif disc_ramp <= 0:
+            disc_mask = 1.0
+        else:
+            progress = (current_step - int(disc_start)) / float(disc_ramp)
+            disc_mask = float(np.clip(progress, 0.0, 1.0))
         logs = {}
         new_vq = None
         g_grads, d_grads, logs, new_vq = compute_grads(

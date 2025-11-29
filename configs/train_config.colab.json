@@ -12,8 +12,8 @@
     "keep_last": 5,
     "log_every": 50,
     "loss_weights": {
-      "time_l1": 1.0,
-      "commit": 1.0,
+      "time_l1": 2.0,
+      "commit": 1.5,
       "gan": 0.05,
       "feature": 0.1
     }
