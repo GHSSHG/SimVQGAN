@@ -153,6 +153,7 @@ python scripts/dorado_validate.py \
 3. **提交信息**：使用简短祈使句（如 “add pod5 cache guard”），一次提交涵盖相关修改。
 4. **安全**：不要提交 POD5、大型 checkpoint 或密钥；通过环境变量提供 `WANDB_API_KEY`、`CUDA_VISIBLE_DEVICES` 等。
 5. **资源**：若只想 CPU 运行，设置 `CUDA_VISIBLE_DEVICES=""`；如需自定义 JAX cache 路径，设置 `XLA_CACHE_DIR`。
+6. **吞吐**：若 batch size 已触顶，可将 `train.grad_accum_steps` 设为 2（或更高）配合 `--grad-accum` CLI 做梯度累积，同时保持 `data.loader_prefetch_chunks`、`train.host_prefetch_size`、`train.device_prefetch_size` > 0 确保线程/设备预取持续启用。
 
 ---
 

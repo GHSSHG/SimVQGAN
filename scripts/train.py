@@ -46,6 +46,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--grad-accum", type=int, default=None, help="Micro-batch accumulation steps before applying generator grads")
     p.add_argument("--lr", type=float, default=5e-4)
     p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
     p.add_argument("--save-every", type=int, default=1000)
@@ -61,6 +62,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Override data.loader_prefetch_chunks for threaded POD5 loader",
+    )
+    p.add_argument(
+        "--host-prefetch-size",
+        type=int,
+        default=None,
+        help="Override host-side Prefetcher queue length (default: config or 8)",
+    )
+    p.add_argument(
+        "--device-prefetch-size",
+        type=int,
+        default=None,
+        help="Override device prefetch depth (default: config or 2)",
     )
     p.add_argument("--seed", type=int, default=None, help="Optional seed; if omitted, derive a new epoch seed")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -205,6 +218,15 @@ def main() -> None:
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
         log_every = int(train_cfg.get("log_every", 50))
+        grad_accum = max(1, int(train_cfg.get("grad_accum_steps", 1)))
+        if args.grad_accum is not None:
+            grad_accum = max(1, int(args.grad_accum))
+        host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 8)))
+        device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 2)))
+        if args.host_prefetch_size is not None:
+            host_prefetch_size = max(1, int(args.host_prefetch_size))
+        if args.device_prefetch_size is not None:
+            device_prefetch_size = max(1, int(args.device_prefetch_size))
         # weights aligned with SimVQ losses
         lw = train_cfg.get("loss_weights", {})
         loss_weights = {
@@ -284,6 +306,9 @@ def main() -> None:
                 drive_backup_dir=str(drive_backup_dir) if drive_backup_dir else None,
                 codebook_lr_mult=codebook_lr_mult,
                 freeze_W=freeze_W,
+                grad_accum_steps=grad_accum,
+                host_prefetch_size=host_prefetch_size,
+                device_prefetch_size=device_prefetch_size,
             )
         finally:
             if wandb_logger is not None:
@@ -308,6 +333,13 @@ def main() -> None:
         max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
     )
     legacy_disc_steps = max(1, int(args.disc_steps)) if args.disc_steps is not None else 1
+    legacy_grad_accum = max(1, int(args.grad_accum)) if args.grad_accum is not None else 1
+    legacy_host_prefetch = (
+        max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 8
+    )
+    legacy_device_prefetch = (
+        max(1, int(args.device_prefetch_size)) if args.device_prefetch_size is not None else 2
+    )
     def _legacy_positive(value: Any) -> int | None:
         if value in (None, "", False):
             return None
@@ -364,6 +396,9 @@ def main() -> None:
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
             disc_steps=legacy_disc_steps,
+            grad_accum_steps=legacy_grad_accum,
+            host_prefetch_size=legacy_host_prefetch,
+            device_prefetch_size=legacy_device_prefetch,
         )
     finally:
         if wandb_logger is not None:

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Dict, Iterator, Tuple, List
 
 from collections import deque
 
@@ -23,6 +23,18 @@ from .losses import compute_generator_losses, hinge_d_loss
 from ..data.prefetch import Prefetcher, make_device_prefetcher
 from ..data.pod5_dataset import NanoporeSignalDataset
 from ..utils.checkpoint import sync_checkpoints
+
+
+def _tree_add(acc, update):
+    if acc is None:
+        return update
+    return jax.tree_util.tree_map(lambda a, b: a + b, acc, update)
+
+
+def _tree_scale(tree, scale: float):
+    if tree is None:
+        return None
+    return jax.tree_util.tree_map(lambda x: x * scale, tree)
 
 
 def _force_frozen(tree):
@@ -138,6 +150,9 @@ def train_model_from_pod5(
     # Optimization knobs
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
+    grad_accum_steps: int = 1,
+    host_prefetch_size: int = 8,
+    device_prefetch_size: int = 2,
 ):
     import jax
     from ..models.model import SimVQAudioModel
@@ -235,6 +250,9 @@ def train_model_from_pod5(
     B = int(batch_size) if batch_size and batch_size > 0 else 1
 
     disc_steps = max(1, int(disc_steps))
+    grad_accum_steps = max(1, int(grad_accum_steps))
+    host_prefetch_size = max(1, int(host_prefetch_size))
+    device_prefetch_size = max(1, int(device_prefetch_size))
 
     if num_epochs is None:
         raise ValueError("Epoch-based training requires num_epochs > 0.")
@@ -282,12 +300,12 @@ def train_model_from_pod5(
     def _make_data_iterator() -> tuple[Prefetcher, Iterator[np.ndarray]]:
         host_iter = Prefetcher(
             ds.batches(batch_size=B, drop_last=True, files_cycle=False),
-            prefetch_size=8,
+            prefetch_size=host_prefetch_size,
         )
         data_iter = iter(
             make_device_prefetcher(
                 host_iter,
-                device_prefetch_size=2,
+                device_prefetch_size=device_prefetch_size,
                 shard_for_multigpu=False,
                 global_batch_size=B,
             )
@@ -335,37 +353,15 @@ def train_model_from_pod5(
 
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
     global_step = 0
+    next_step = 1
+    pending_gen_grads = None
+    pending_disc_grads = None
+    pending_logs: List[Dict[str, Any]] = []
+    pending_accum = 0
+    use_accum = grad_accum_steps > 1
 
-    def _consume_batch(batch, step: int) -> None:
-        nonlocal step_rng, gen_state, disc_state
-        step_rng, apply_rng = jax.random.split(step_rng)
-        df = float(disc_factor if step >= int(disc_start) else 0.0)
-        if disc_steps > 1:
-            rngs = jax.random.split(apply_rng, disc_steps)
-        else:
-            rngs = (apply_rng,)
-        logs = {}
-        new_vq = None
-        for idx, rng_i in enumerate(rngs):
-            g_grads, d_grads, logs, new_vq = compute_grads(
-                gen_state,
-                disc_state,
-                batch,
-                rng_i,
-                loss_weights,
-                df,
-            )
-            d_grads = _force_frozen(d_grads)
-            disc_state = disc_state.apply_gradients(grads=d_grads)
-        g_grads = _force_frozen(g_grads)
-        gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-        logs = dict(logs)
-        hist_counts = logs.pop("_code_hist_counts", None)
-        hist_total = logs.pop("_code_hist_total", None)
-        if hist_counts is not None and hist_total is not None:
-            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
-            total_np = float(jax.device_get(hist_total))
-            code_hist_window.add(hist_np, total_np)
+    def _finalize_step(step: int, logs: Dict[str, Any] | None, df_value: float) -> None:
+        logs = dict(logs or {})
         usage_ratio = (
             float(jax.device_get(jnp.asarray(logs["code_usage"])))
             if "code_usage" in logs
@@ -379,9 +375,9 @@ def train_model_from_pod5(
                 usage, perplexity = agg
                 logs["code_usage"] = usage
                 logs["perplexity"] = perplexity
-        formatted_logs = _simvq_style_logs(logs, "train", df)
+        formatted_logs = _simvq_style_logs(logs, "train", df_value)
         float_logs = _logs_to_float_dict(formatted_logs)
-        if should_log:
+        if should_log and float_logs:
             _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
             _log_wandb(float_logs, step)
         if ckpt_dir and save_every > 0 and (step % save_every == 0):
@@ -394,6 +390,90 @@ def train_model_from_pod5(
             )
             _log(f"[ckpt] saved step={step} to {ckpt_dir}")
 
+    def _aggregate_pending_logs() -> Dict[str, Any]:
+        if not pending_logs:
+            return {}
+        agg: Dict[str, Any] = {}
+        for entry in pending_logs:
+            for key, val in entry.items():
+                if val is None:
+                    continue
+                prev = agg.get(key)
+                if prev is None:
+                    agg[key] = val
+                else:
+                    agg[key] = prev + val
+        count = len(pending_logs)
+        if count > 1:
+            inv = 1.0 / float(count)
+            for key, val in list(agg.items()):
+                agg[key] = val * inv
+        pending_logs.clear()
+        return agg
+
+    def _apply_pending(step_hint: int, df_value: float) -> bool:
+        nonlocal pending_gen_grads, pending_disc_grads, pending_accum, gen_state, disc_state
+        if pending_accum <= 0 or pending_gen_grads is None:
+            return False
+        scale = 1.0 / float(pending_accum)
+        avg_grads = _tree_scale(pending_gen_grads, scale)
+        avg_grads = _force_frozen(avg_grads)
+        gen_state = gen_state.apply_gradients(grads=avg_grads, vq_vars=gen_state.vq_vars)
+        if use_accum and pending_disc_grads is not None:
+            avg_disc = _tree_scale(pending_disc_grads, scale)
+            avg_disc = _force_frozen(avg_disc)
+            disc_state = disc_state.apply_gradients(grads=avg_disc)
+            pending_disc_grads = None
+        logs_for_step = _aggregate_pending_logs()
+        pending_gen_grads = None
+        pending_accum = 0
+        _finalize_step(step_hint, logs_for_step, df_value)
+        return True
+
+    def _consume_batch(batch, step_hint: int) -> bool:
+        nonlocal step_rng, gen_state, disc_state, pending_gen_grads, pending_disc_grads, pending_accum
+        step_rng, apply_rng = jax.random.split(step_rng)
+        df = float(disc_factor if step_hint >= int(disc_start) else 0.0)
+        if disc_steps > 1:
+            rngs = jax.random.split(apply_rng, disc_steps)
+        else:
+            rngs = (apply_rng,)
+        logs = {}
+        new_vq = None
+        local_disc_grads = None
+        for rng_i in rngs:
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                rng_i,
+                loss_weights,
+                df,
+            )
+            if use_accum:
+                local_disc_grads = _tree_add(local_disc_grads, d_grads)
+            else:
+                d_grads = _force_frozen(d_grads)
+                disc_state = disc_state.apply_gradients(grads=d_grads)
+            if new_vq is not None:
+                gen_state = gen_state.replace(vq_vars=_force_frozen(new_vq))
+        logs = dict(logs)
+        hist_counts = logs.pop("_code_hist_counts", None)
+        hist_total = logs.pop("_code_hist_total", None)
+        if hist_counts is not None and hist_total is not None:
+            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
+            total_np = float(jax.device_get(hist_total))
+            code_hist_window.add(hist_np, total_np)
+        if use_accum and local_disc_grads is not None:
+            pending_disc_grads = _tree_add(pending_disc_grads, local_disc_grads)
+        pending_gen_grads = _tree_add(pending_gen_grads, g_grads)
+        pending_logs.append(logs)
+        pending_accum += 1
+        applied = False
+        if pending_accum >= grad_accum_steps:
+            applied = _apply_pending(step_hint, df)
+        return applied
+
     for epoch_idx in range(1, epochs_limit + 1):
         host_iter, data_iter = _make_data_iterator()
         steps_this_epoch = 0
@@ -403,11 +483,18 @@ def train_model_from_pod5(
                     batch = next(data_iter)
                 except StopIteration:
                     break
-                global_step += 1
-                steps_this_epoch += 1
-                _consume_batch(batch, global_step)
+                applied = _consume_batch(batch, next_step)
+                if applied:
+                    steps_this_epoch += 1
+                    global_step = next_step
+                    next_step = global_step + 1
         finally:
             host_iter.close()
+        df_next = float(disc_factor if next_step >= int(disc_start) else 0.0)
+        if _apply_pending(next_step, df_next):
+            steps_this_epoch += 1
+            global_step = next_step
+            next_step = global_step + 1
         if steps_this_epoch == 0:
             raise ValueError(
                 f"Epoch {epoch_idx} yielded no training batches; check segment/window settings."
