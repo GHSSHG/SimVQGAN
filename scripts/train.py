@@ -80,12 +80,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     p.add_argument("--wandb-run", type=str, default=None, help="WandB run name override")
     p.add_argument("--drive-backup-dir", type=Path, default=None, help="Optional Drive path to mirror checkpoints after training")
-    p.add_argument(
-        "--disc-steps",
-        type=int,
-        default=None,
-        help="Number of discriminator updates per batch (default 1; overrides config)",
-    )
     return p.parse_args()
 
 
@@ -238,9 +232,6 @@ def main() -> None:
 
         # adversarial scheduling
         disc_start = int(train_cfg.get("disc_start", 5000))
-        disc_steps = max(1, int(train_cfg.get("disc_steps", 1)))
-        if args.disc_steps is not None:
-            disc_steps = max(1, int(args.disc_steps))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
@@ -293,7 +284,6 @@ def main() -> None:
                 keep_last=keep_last,
                 loss_weights=loss_weights,
                 disc_start=disc_start,
-                disc_steps=disc_steps,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
@@ -329,7 +319,6 @@ def main() -> None:
     legacy_loader_prefetch = (
         max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
     )
-    legacy_disc_steps = max(1, int(args.disc_steps)) if args.disc_steps is not None else 1
     legacy_grad_accum = max(1, int(args.grad_accum)) if args.grad_accum is not None else 1
     legacy_host_prefetch = (
         max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 8
@@ -392,7 +381,6 @@ def main() -> None:
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
-            disc_steps=legacy_disc_steps,
             grad_accum_steps=legacy_grad_accum,
             host_prefetch_size=legacy_host_prefetch,
             device_prefetch_size=legacy_device_prefetch,

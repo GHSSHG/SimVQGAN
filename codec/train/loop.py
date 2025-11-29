@@ -138,8 +138,7 @@ def train_model_from_pod5(
     save_every: int = 1000,
     keep_last: int = 3,
     loss_weights: Dict[str, float] | None = None,
-        disc_start: int = 0,
-        disc_steps: int = 1,
+    disc_start: int = 0,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
@@ -249,7 +248,6 @@ def train_model_from_pod5(
     _, L = init_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
 
-    disc_steps = max(1, int(disc_steps))
     grad_accum_steps = max(1, int(grad_accum_steps))
     host_prefetch_size = max(1, int(host_prefetch_size))
     device_prefetch_size = max(1, int(device_prefetch_size))
@@ -434,29 +432,23 @@ def train_model_from_pod5(
         nonlocal step_rng, gen_state, disc_state, pending_gen_grads, pending_disc_grads, pending_accum
         step_rng, apply_rng = jax.random.split(step_rng)
         disc_mask = 1.0 if step_hint >= int(disc_start) else 0.0
-        if disc_steps > 1:
-            rngs = jax.random.split(apply_rng, disc_steps)
-        else:
-            rngs = (apply_rng,)
         logs = {}
         new_vq = None
-        local_disc_grads = None
-        for rng_i in rngs:
-            g_grads, d_grads, logs, new_vq = compute_grads(
-                gen_state,
-                disc_state,
-                batch,
-                rng_i,
-                loss_weights,
-                disc_mask,
-            )
-            if use_accum:
-                local_disc_grads = _tree_add(local_disc_grads, d_grads)
-            else:
-                d_grads = _force_frozen(d_grads)
-                disc_state = disc_state.apply_gradients(grads=d_grads)
-            if new_vq is not None:
-                gen_state = gen_state.replace(vq_vars=_force_frozen(new_vq))
+        g_grads, d_grads, logs, new_vq = compute_grads(
+            gen_state,
+            disc_state,
+            batch,
+            apply_rng,
+            loss_weights,
+            disc_mask,
+        )
+        if use_accum:
+            pending_disc_grads = _tree_add(pending_disc_grads, d_grads)
+        else:
+            d_grads = _force_frozen(d_grads)
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+        if new_vq is not None:
+            gen_state = gen_state.replace(vq_vars=_force_frozen(new_vq))
         logs = dict(logs)
         hist_counts = logs.pop("_code_hist_counts", None)
         hist_total = logs.pop("_code_hist_total", None)
@@ -464,8 +456,6 @@ def train_model_from_pod5(
             hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
             total_np = float(jax.device_get(hist_total))
             code_hist_window.add(hist_np, total_np)
-        if use_accum:
-            pending_disc_grads = _tree_add(pending_disc_grads, local_disc_grads)
         pending_gen_grads = _tree_add(pending_gen_grads, g_grads)
         pending_logs.append(logs)
         pending_accum += 1
@@ -528,7 +518,6 @@ def train_more(
     keep_last: int,
     log_file: str | None = None,
     disc_start: int = 0,
-    disc_steps: int = 1,
 ):
     if num_epochs <= 0:
         raise ValueError("num_epochs must be positive when continuing training.")
@@ -568,28 +557,21 @@ def train_more(
 
     current_global = int(getattr(gen_state, "step", 0))
 
-    disc_steps = max(1, int(disc_steps))
-
     def _train_step(batch, apply_rng):
         nonlocal gen_state, disc_state
         disc_mask = 1.0 if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0
-        if disc_steps > 1:
-            rngs = jax.random.split(apply_rng, disc_steps)
-        else:
-            rngs = (apply_rng,)
         logs = {}
         new_vq = None
-        for rng_i in rngs:
-            g_grads, d_grads, logs, new_vq = compute_grads(
-                gen_state,
-                disc_state,
-                batch,
-                rng_i,
-                loss_weights,
-                disc_mask,
-            )
-            d_grads = _force_frozen(d_grads)
-            disc_state = disc_state.apply_gradients(grads=d_grads)
+        g_grads, d_grads, logs, new_vq = compute_grads(
+            gen_state,
+            disc_state,
+            batch,
+            apply_rng,
+            loss_weights,
+            disc_mask,
+        )
+        d_grads = _force_frozen(d_grads)
+        disc_state = disc_state.apply_gradients(grads=d_grads)
         g_grads = _force_frozen(g_grads)
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
         logs = dict(logs)
