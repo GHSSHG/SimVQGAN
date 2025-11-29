@@ -60,6 +60,8 @@ _SIMVQ_KEY_MAPPING = {
     "perplexity": "codebook_perplexity",
     "code_usage": "codebook_util",
     "disc_loss": "disc_loss",
+    "disc_loss_raw": "disc_loss_raw",
+    "disc_mask": "disc_mask",
 }
 
 _CODEBOOK_STATS_WINDOW = 100
@@ -108,8 +110,7 @@ def _value_to_float(val):
         return float(val)
 
 
-def _simvq_style_logs(raw_logs: Dict[str, Any], split: str, disc_factor: float) -> Dict[str, Any]:
-    del disc_factor
+def _simvq_style_logs(raw_logs: Dict[str, Any], split: str) -> Dict[str, Any]:
     pref = "" if split == "train" else f"{split}/"
     out: Dict[str, Any] = {}
     for src, dst in _SIMVQ_KEY_MAPPING.items():
@@ -137,9 +138,8 @@ def train_model_from_pod5(
     save_every: int = 1000,
     keep_last: int = 3,
     loss_weights: Dict[str, float] | None = None,
-    disc_start: int = 0,
-    disc_steps: int = 1,
-    disc_factor: float = 1.0,
+        disc_start: int = 0,
+        disc_steps: int = 1,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
@@ -315,8 +315,8 @@ def train_model_from_pod5(
         loss_weights = {
             "time_l1": 1.0,
             "commit": 1.0,
-            "gan": 0.1,
-            "feature": 0.0,
+            "gan": 0.05,
+            "feature": 0.1,
         }
     else:
         loss_weights = dict(loss_weights)
@@ -328,7 +328,7 @@ def train_model_from_pod5(
         _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
         dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        df_warm = float(disc_factor if int(disc_start) <= 0 else 0.0)
+        disc_mask_warm = jnp.asarray(1.0 if int(disc_start) <= 0 else 0.0, dtype=jnp.float32)
         # Trigger JIT compile; ignore outputs.
         compute_grads(
             gen_state,
@@ -336,7 +336,7 @@ def train_model_from_pod5(
             dummy_batch,
             warm_rng,
             loss_weights,
-            df_warm,
+            disc_mask_warm,
         )
         _log("[warmup] Compile finished; starting real data iterator.")
 
@@ -360,7 +360,7 @@ def train_model_from_pod5(
     pending_accum = 0
     use_accum = grad_accum_steps > 1
 
-    def _finalize_step(step: int, logs: Dict[str, Any] | None, df_value: float) -> None:
+    def _finalize_step(step: int, logs: Dict[str, Any] | None) -> None:
         logs = dict(logs or {})
         usage_ratio = (
             float(jax.device_get(jnp.asarray(logs["code_usage"])))
@@ -375,7 +375,7 @@ def train_model_from_pod5(
                 usage, perplexity = agg
                 logs["code_usage"] = usage
                 logs["perplexity"] = perplexity
-        formatted_logs = _simvq_style_logs(logs, "train", df_value)
+        formatted_logs = _simvq_style_logs(logs, "train")
         float_logs = _logs_to_float_dict(formatted_logs)
         if should_log and float_logs:
             _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
@@ -411,7 +411,7 @@ def train_model_from_pod5(
         pending_logs.clear()
         return agg
 
-    def _apply_pending(step_hint: int, df_value: float) -> bool:
+    def _apply_pending(step_hint: int) -> bool:
         nonlocal pending_gen_grads, pending_disc_grads, pending_accum, gen_state, disc_state
         if pending_accum <= 0 or pending_gen_grads is None:
             return False
@@ -427,13 +427,13 @@ def train_model_from_pod5(
         logs_for_step = _aggregate_pending_logs()
         pending_gen_grads = None
         pending_accum = 0
-        _finalize_step(step_hint, logs_for_step, df_value)
+        _finalize_step(step_hint, logs_for_step)
         return True
 
     def _consume_batch(batch, step_hint: int) -> bool:
         nonlocal step_rng, gen_state, disc_state, pending_gen_grads, pending_disc_grads, pending_accum
         step_rng, apply_rng = jax.random.split(step_rng)
-        df = float(disc_factor if step_hint >= int(disc_start) else 0.0)
+        disc_mask = 1.0 if step_hint >= int(disc_start) else 0.0
         if disc_steps > 1:
             rngs = jax.random.split(apply_rng, disc_steps)
         else:
@@ -448,7 +448,7 @@ def train_model_from_pod5(
                 batch,
                 rng_i,
                 loss_weights,
-                df,
+                disc_mask,
             )
             if use_accum:
                 local_disc_grads = _tree_add(local_disc_grads, d_grads)
@@ -464,14 +464,14 @@ def train_model_from_pod5(
             hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
             total_np = float(jax.device_get(hist_total))
             code_hist_window.add(hist_np, total_np)
-        if use_accum and local_disc_grads is not None:
+        if use_accum:
             pending_disc_grads = _tree_add(pending_disc_grads, local_disc_grads)
         pending_gen_grads = _tree_add(pending_gen_grads, g_grads)
         pending_logs.append(logs)
         pending_accum += 1
         applied = False
         if pending_accum >= grad_accum_steps:
-            applied = _apply_pending(step_hint, df)
+            applied = _apply_pending(step_hint)
         return applied
 
     for epoch_idx in range(1, epochs_limit + 1):
@@ -490,8 +490,7 @@ def train_model_from_pod5(
                     next_step = global_step + 1
         finally:
             host_iter.close()
-        df_next = float(disc_factor if next_step >= int(disc_start) else 0.0)
-        if _apply_pending(next_step, df_next):
+        if _apply_pending(next_step):
             steps_this_epoch += 1
             global_step = next_step
             next_step = global_step + 1
@@ -528,7 +527,6 @@ def train_more(
     save_every: int,
     keep_last: int,
     log_file: str | None = None,
-    disc_factor: float = 1.0,
     disc_start: int = 0,
     disc_steps: int = 1,
 ):
@@ -574,7 +572,7 @@ def train_more(
 
     def _train_step(batch, apply_rng):
         nonlocal gen_state, disc_state
-        df = float(disc_factor if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0)
+        disc_mask = 1.0 if int(getattr(gen_state, "step", 0)) >= int(disc_start) else 0.0
         if disc_steps > 1:
             rngs = jax.random.split(apply_rng, disc_steps)
         else:
@@ -588,7 +586,7 @@ def train_more(
                 batch,
                 rng_i,
                 loss_weights,
-                df,
+                disc_mask,
             )
             d_grads = _force_frozen(d_grads)
             disc_state = disc_state.apply_gradients(grads=d_grads)
@@ -612,7 +610,7 @@ def train_more(
             usage, perplexity = agg
             logs["code_usage"] = usage
             logs["perplexity"] = perplexity
-        formatted = _simvq_style_logs(logs, "train", df)
+        formatted = _simvq_style_logs(logs, "train")
         return _logs_to_float_dict(formatted)
 
     for epoch_idx in range(1, num_epochs + 1):

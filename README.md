@@ -15,7 +15,6 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 | `train.py` | 入口脚本：配置 runtime 后转调 `scripts/train.py`。 |
 | `scripts/train.py` | CLI 训练管线（配置解析、数据集构建、模型组装、日志/断点）。 |
 | `scripts/dorado_validate.py` | 训练后验证（重建 POD5 + Dorado basecalling + identity 报告）。 |
-| `scripts/setup_local_repo.py` | Colab 上将仓库镜像到 `/content` SSD 以提升 I/O。 |
 | `configs/` | JSON 配置（训练、验证）。默认：`train_config.colab.json`、`validate_dorado.colab.json`。 |
 | `codec/data/` | POD5 正规化、窗口切分、线程/设备预取；核心类 `NanoporeSignalDataset`。 |
 | `codec/models/` | 编码器、解码器、量化器、PatchGAN 判别器、整合模型。 |
@@ -71,11 +70,6 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 4. **冒烟测试**
    ```bash
   python scripts/train.py --config configs/train_config.colab.json --epochs 1 --log-every 1
-   ```
-
-5. **在 Colab 镜像仓库**
-   ```bash
-   python scripts/setup_local_repo.py --target /content/SimVQGAN
    ```
 
 ---

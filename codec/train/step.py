@@ -13,8 +13,9 @@ def compute_grads(
     batch,
     rng,
     loss_weights,
-    disc_factor: float,
+    disc_mask: float,
 ):
+    disc_mask = jnp.asarray(disc_mask, dtype=jnp.float32)
     def gen_loss_fn(params):
         vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
         outs = gen_state.apply_fn(
@@ -39,9 +40,10 @@ def compute_grads(
             return_features=True,
         )
         weights = dict(loss_weights)
-        gan_scale = jnp.asarray(weights.get("gan", 0.1), dtype=jnp.float32)
-        disc_scale = jnp.asarray(disc_factor, dtype=jnp.float32)
-        weights["gan"] = gan_scale * disc_scale
+        gan_w = jnp.asarray(weights.get("gan", 0.1), dtype=jnp.float32)
+        feat_w = jnp.asarray(weights.get("feature", 0.0), dtype=jnp.float32)
+        weights["gan"] = disc_mask * gan_w
+        weights["feature"] = disc_mask * feat_w
         total_loss, logs = compute_generator_losses(
             y=batch,
             y_hat=wave_hat,
@@ -74,8 +76,9 @@ def compute_grads(
             jax.lax.stop_gradient(aux["wave_hat"]),
             train=True,
         )
-        loss = hinge_d_loss(real_map, fake_map)
-        logs = {"disc_loss": loss}
+        raw_loss = hinge_d_loss(real_map, fake_map)
+        loss = disc_mask * raw_loss
+        logs = {"disc_loss": loss, "disc_loss_raw": raw_loss, "disc_mask": disc_mask}
         return loss, logs
 
     (d_loss, d_logs), d_grads = jax.value_and_grad(disc_loss_fn, has_aux=True)(disc_state.params)

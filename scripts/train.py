@@ -232,8 +232,8 @@ def main() -> None:
         loss_weights = {
             "time_l1": float(lw.get("time_l1", lw.get("recon", 1.0))),
             "commit": float(lw.get("commit", 1.0)),
-            "gan": float(lw.get("gan", 0.1)),
-            "feature": float(lw.get("feature", 0.0)),
+            "gan": float(lw.get("gan", 0.05)),
+            "feature": float(lw.get("feature", 0.1)),
         }
 
         # adversarial scheduling
@@ -241,8 +241,6 @@ def main() -> None:
         disc_steps = max(1, int(train_cfg.get("disc_steps", 1)))
         if args.disc_steps is not None:
             disc_steps = max(1, int(args.disc_steps))
-        disc_factor = float(train_cfg.get("disc_factor", 1.0))
-
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
@@ -296,7 +294,6 @@ def main() -> None:
                 loss_weights=loss_weights,
                 disc_start=disc_start,
                 disc_steps=disc_steps,
-                disc_factor=disc_factor,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
