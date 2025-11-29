@@ -5,8 +5,8 @@
     "batch_size": 256,
     "learning_rate": 0.0002,
     "grad_accum_steps": 2,
-    "host_prefetch_size": 8,
-    "device_prefetch_size": 2,
+    "host_prefetch_size": 128,
+    "device_prefetch_size": 32,
     "disc_start": 5000,
     "disc_steps": 2,
     "disc_factor": 1.0,
@@ -50,8 +50,8 @@
       "FC02/pod5",
       "FC03/pod5"
     ],
-    "loader_workers": 4,
-    "loader_prefetch_chunks": 256,
+    "loader_workers": 12,
+    "loader_prefetch_chunks": 512,
     "train": {
       "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5",
       "subdirs": [
