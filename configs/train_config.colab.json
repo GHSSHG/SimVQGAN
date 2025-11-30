@@ -6,7 +6,7 @@
     "learning_rate": 0.0001,
     "host_prefetch_size": 64,
     "device_prefetch_size": 16,
-    "grad_clip": 0.7,
+    "grad_clip": 1.0,
     "disc_start": 6000,
     "disc_ramp": 4000,
     "save_every": 1000,
@@ -15,8 +15,8 @@
     "loss_weights": {
       "time_l1": 2.0,
       "commit": 1.0,
-      "gan": 0.02,
-      "feature": 0.05
+      "gan": 0.03,
+      "feature": 0.1
     }
   },
   "model": {
@@ -24,8 +24,8 @@
     "enc_channels": [32, 32, 64, 64, 128],
     "enc_down_strides": [4, 4, 5, 1],
     "enc_num_res_blocks": 2,
-    "latent_dim": 128,
-    "codebook_size": 4096,
+    "latent_dim": 256,
+    "codebook_size": 16384,
     "beta": 0.25,
     "legacy_beta": false,
     "dec_channels": [128, 64, 64, 32, 32],
