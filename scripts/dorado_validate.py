@@ -30,6 +30,8 @@ from argparse import BooleanOptionalAction
 from pathlib import Path
 from typing import Dict, Tuple, Optional
 
+import edlib  # type: ignore
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -447,32 +449,15 @@ def _read_fastq(path: Path) -> Dict[str, str]:
 
 
 def _levenshtein_identity(a: str, b: str) -> float:
-    """Compute identity tolerant to indels: 1 - edit_distance / max_len."""
+    """Compute identity tolerant to indels using edlib global alignment."""
     if not a and not b:
         return 1.0
-    if not a:
+    if not a or not b:
         return 0.0
-    if not b:
-        return 0.0
-    # Keep the smaller string as "b" to reduce memory.
-    if len(a) < len(b):
-        a, b = b, a
-    la, lb = len(a), len(b)
-    prev = list(range(lb + 1))
-    curr = [0] * (lb + 1)
-    for i, ca in enumerate(a, start=1):
-        curr[0] = i
-        for j, cb in enumerate(b, start=1):
-            cost = 0 if ca == cb else 1
-            curr[j] = min(
-                prev[j] + 1,        # deletion
-                curr[j - 1] + 1,    # insertion
-                prev[j - 1] + cost  # substitution
-            )
-        prev, curr = curr, prev
-    dist = prev[lb]
-    denom = max(la, lb)
-    return 1.0 - (dist / denom)
+    res = edlib.align(a, b, mode="NW", task="distance")
+    dist = res["editDistance"]
+    denom = max(len(a), len(b))
+    return 1.0 - (float(dist) / float(denom))
 
 
 def _compute_identity(real_fastq: Path, gen_fastq: Path) -> Dict[str, float]:
@@ -706,7 +691,7 @@ def main() -> None:
         }
     }
     if real_fastq:
-        reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
+    reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
     reports["final"] = _process_ckpt("final", ckpt_final_local)
 
     (out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
