@@ -446,14 +446,33 @@ def _read_fastq(path: Path) -> Dict[str, str]:
     return seqs
 
 
-def _base_identity(a: str, b: str) -> float:
-    if not a or not b:
+def _levenshtein_identity(a: str, b: str) -> float:
+    """Compute identity tolerant to indels: 1 - edit_distance / max_len."""
+    if not a and not b:
+        return 1.0
+    if not a:
         return 0.0
-    m = min(len(a), len(b))
-    if m == 0:
+    if not b:
         return 0.0
-    matches = sum(1 for i in range(m) if a[i] == b[i])
-    return matches / m
+    # Keep the smaller string as "b" to reduce memory.
+    if len(a) < len(b):
+        a, b = b, a
+    la, lb = len(a), len(b)
+    prev = list(range(lb + 1))
+    curr = [0] * (lb + 1)
+    for i, ca in enumerate(a, start=1):
+        curr[0] = i
+        for j, cb in enumerate(b, start=1):
+            cost = 0 if ca == cb else 1
+            curr[j] = min(
+                prev[j] + 1,        # deletion
+                curr[j - 1] + 1,    # insertion
+                prev[j - 1] + cost  # substitution
+            )
+        prev, curr = curr, prev
+    dist = prev[lb]
+    denom = max(la, lb)
+    return 1.0 - (dist / denom)
 
 
 def _compute_identity(real_fastq: Path, gen_fastq: Path) -> Dict[str, float]:
@@ -463,9 +482,9 @@ def _compute_identity(real_fastq: Path, gen_fastq: Path) -> Dict[str, float]:
     for rid, seq in real.items():
         gseq = gen.get(rid)
         if gseq:
-            scores[rid] = _base_identity(seq, gseq)
+            scores[rid] = _levenshtein_identity(seq, gseq)
     if not scores:
-        return {"mean_identity": 0.0, "count": 0}
+        return {"mean_identity": 0.0, "median_identity": 0.0, "count": 0}
     vals = list(scores.values())
     return {
         "mean_identity": float(np.mean(vals)),
