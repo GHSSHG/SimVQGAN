@@ -691,7 +691,7 @@ def main() -> None:
         }
     }
     if real_fastq:
-    reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
+        reports["real"]["real_fastq"] = str(real_fastq_persist or real_fastq)
     reports["final"] = _process_ckpt("final", ckpt_final_local)
 
     (out_dir / "dorado_report.json").write_text(json.dumps(reports, indent=2))
