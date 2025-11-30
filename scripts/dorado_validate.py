@@ -200,9 +200,9 @@ def _build_model(model_cfg: Dict, L: int):
     base_channels = int(model_cfg.get("base_channels", 32))
     enc_channels = _tuple("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple("enc_down_strides", (4, 4, 5, 1))
+    enc_down_strides = _tuple("enc_down_strides", (2, 4, 5, 1))
     dec_channels = _tuple("dec_channels", (128, 64, 64, 32, 32))
-    dec_up_strides = _tuple("dec_up_strides", (1, 5, 4, 4))
+    dec_up_strides = _tuple("dec_up_strides", (1, 5, 4, 2))
     model = SimVQAudioModel(
         in_channels=1,
         base_channels=base_channels,
@@ -210,7 +210,7 @@ def _build_model(model_cfg: Dict, L: int):
         enc_num_res_blocks=int(model_cfg.get("enc_num_res_blocks", model_cfg.get("num_res_blocks", 2))),
         enc_down_strides=enc_down_strides,
         latent_dim=int(model_cfg.get("latent_dim", 128)),
-        codebook_size=int(model_cfg.get("codebook_size", 4096)),
+        codebook_size=int(model_cfg.get("codebook_size", 16384)),
         beta=float(model_cfg.get("beta", 0.25)),
         legacy_beta=bool(model_cfg.get("legacy_beta", False)),
         dec_channel_schedule=dec_channels,
@@ -551,7 +551,7 @@ def main() -> None:
     if not window_cfg and train_cfg:
         window_cfg = train_cfg.get("data")
     window_cfg = window_cfg or {}
-    segment_sec = float(window_cfg.get("segment_sec", 2.0))
+    segment_sec = float(window_cfg.get("segment_sec", 1.0))
     sample_rate = float(window_cfg.get("sample_rate", 5000.0))
     L = int(round(segment_sec * sample_rate))
 

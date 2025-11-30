@@ -17,14 +17,14 @@ class SimVQAudioModel(nn.Module):
     base_channels: int = 32
     enc_channel_multipliers: Tuple[int, ...] = (1, 1, 2, 2, 4)
     enc_num_res_blocks: int = 2
-    enc_down_strides: Tuple[int, ...] = (4, 4, 5, 1)
+    enc_down_strides: Tuple[int, ...] = (2, 4, 5, 1)
     latent_dim: int = 128
-    codebook_size: int = 4096
+    codebook_size: int = 16384
     beta: float = 0.25
     legacy_beta: bool = False
     dec_channel_schedule: Tuple[int, ...] = (128, 64, 64, 32, 32)
     dec_num_res_blocks: int = 2
-    dec_up_strides: Tuple[int, ...] = (1, 5, 4, 4)
+    dec_up_strides: Tuple[int, ...] = (1, 5, 4, 2)
     enc_dtype: Any = jnp.float32
     dec_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32

@@ -2,7 +2,7 @@
 
 SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于对 Nanopore POD5 原始电流信号进行时域重建。项目聚焦于：
 
-- **自监督压缩与重建**：SimVQ 编码器/解码器 + PatchGAN 判别器，共 80× 下采样、约 2 s（10000 sample @ 5 kHz）窗口。
+- **自监督压缩与重建**：SimVQ 编码器/解码器 + PatchGAN 判别器，共 40× 下采样、约 1 s（5000 sample @ 5 kHz）窗口。
 - **面向 Colab/A100 的流水线**：线程化 POD5 流式读取、设备预取、XLA cache、TF32。
 - **训练后验证**：借助 `scripts/dorado_validate.py` 将真实/生成信号交给 ONT Dorado basecaller，得到简单 identity 指标。
 
@@ -28,16 +28,16 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 
 1. **文件发现**：`scripts/train.py` 读取配置 → `codec/utils/pod5_files.py` 枚举 POD5 → 每个 epoch 顺序遍历所有文件。
 2. **流式读取**：`NanoporeSignalDataset` 在独立线程中顺序读取 POD5，每个 read 通过 `codec/data/pod5_processing.py` 将 int16 ADC → pA，并执行鲁棒 median/MAD 归一化。
-3. **窗口化**：`segment_sec=2.0` 与 `segment_samples=10000`（固定每个窗口 10000 sample）共同约束 chunk 大小，短于 10000 的 read 会被直接跳过，末尾不足的片段也会被丢弃。训练阶段仅消费归一化波形；验证/生成阶段额外保留 normalization stats 用于还原。
+3. **窗口化**：`segment_sec=1.0` 与 `segment_samples=5000`（固定每个窗口 5000 sample）共同约束 chunk 大小，短于 5000 的 read 会被直接跳过，末尾不足的片段也会被丢弃。训练阶段仅消费归一化波形；验证/生成阶段额外保留 normalization stats 用于还原。
 4. **预取**：`Prefetcher` 将 CPU 线程产出的 batch 推送到主进程，`make_device_prefetcher`（可选）再搬运到 GPU，以减少输入瓶颈。
 
 ---
 
 ### 模型结构（默认）
 
-- **编码器 `SimVQEncoder1D`**：`base_channels=32`、channel multipliers `(1,1,2,2,4)`，down-strides `(4,4,5,1)`（总 80×），残差块每级 2 个。
-- **量化器 `SimVQ1D`**：`codebook_size=4096`、`latent_dim=128`，无 EMA，支持 perplexity/usage 统计。
-- **解码器 `SimVQDecoder1D`**：镜像上采样 schedule `(128,64,64,32,32)`、up-strides `(1,5,4,4)`，PixelShuffle 风格。
+- **编码器 `SimVQEncoder1D`**：`base_channels=32`、channel multipliers `(1,1,2,2,4)`，down-strides `(2,4,5,1)`（总 40×），残差块每级 2 个。
+- **量化器 `SimVQ1D`**：`codebook_size=16384`、`latent_dim=128`，无 EMA，支持 perplexity/usage 统计。
+- **解码器 `SimVQDecoder1D`**：镜像上采样 schedule `(128,64,64,32,32)`、up-strides `(1,5,4,2)`，PixelShuffle 风格。
 - **判别器 `PatchDiscriminator1D`**：通道 `(32,64,128,256)`，每层卷积+残差，hinge GAN 损失。
 - **Loss 组合**：时间域 L1（`time_l1`）、commitment（`beta`）、GAN（`gan`）、feature matching（`feature`），权重可在配置中调整。
 
@@ -56,7 +56,7 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
    ```bash
    python train.py --config configs/train_config.colab.json
    ```
-   - 默认 batch size=256、base LR=5e-4、epochs=2、单 GPU（如遇 OOM 可用 `--batch-size` 降低到 128/64）。
+   - 默认 batch size=512、base LR=1e-4、epochs=2、单 GPU（如遇 OOM 可用 `--batch-size` 降低到 256/128/64）。
    - 日志写入 `<ckpt_dir>/train.log`，WandB 可通过配置中的 `logging.wandb.enabled` 或 `--wandb` 开启。
 
 3. **自定义输出 & 保存频率**
@@ -81,13 +81,13 @@ SimVQGAN 是一个基于 JAX/Flax 的 1D 向量量化生成对抗网络，用于
 | 键 | 作用 | 备注 |
 | --- | --- | --- |
 | `train.epochs` | 训练完整遍历次数（默认 2） | 结合真实 POD5 文件流式迭代；`save_every` 仍按 step 计数。 |
-| `train.batch_size` | 每步样本数（默认 256） | 若 Colab/T4 OOM，可在 CLI 传 `--batch-size 128` 或更低。 |
-| `train.learning_rate` | AdamW LR 基准（默认 5e-4） | 常数学习率，默认采用 AdamW。 |
+| `train.batch_size` | 每步样本数（默认 512） | 若 Colab/T4 OOM，可在 CLI 传 `--batch-size 256/128/64`。 |
+| `train.learning_rate` | AdamW LR 基准（默认 1e-4） | 常数学习率，默认采用 AdamW。 |
 | `train.loss_weights` | L1 / commit / GAN / feature 权重 | 对应 `codec/train/losses.py`。 |
 | `train.disc_start` | 开始引入 GAN/feature loss 的 step | 0 表示从第一步就启用判别器。 |
 | `model.*` | 编解码通道/步幅、`latent_dim`、`codebook_size` | 需保持 enc/dec schedule 对齐。 |
-| `data.segment_sec` | 窗口长度（秒） | 2.0 → 10000 sample @ 5 kHz；与 `segment_samples` 联动。 |
-| `data.segment_samples` | 固定每个窗口的样本数 | 10000 时会跳过所有 <10000 read，并丢弃末尾不足的片段。 |
+| `data.segment_sec` | 窗口长度（秒） | 1.0 → 5000 sample @ 5 kHz；与 `segment_samples` 联动。 |
+| `data.segment_samples` | 固定每个窗口的样本数 | 5000 时会跳过所有 <5000 read，并丢弃末尾不足的片段。 |
 | `checkpoint.dir` | 断点输出目录 | 可配合 `drive_backup_dir` 做镜像。 |
 | `logging.wandb.*` | WandB 开关、项目/Run 名 | `api_key` 建议改用环境变量 `WANDB_API_KEY`。 |
 

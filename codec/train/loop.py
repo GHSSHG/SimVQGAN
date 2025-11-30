@@ -185,10 +185,10 @@ def train_model_from_pod5(
     base_channels = int(mcfg.get("base_channels", 32))
     enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple_cfg("enc_down_strides", (4, 4, 5, 1))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 4, 5, 1))
     enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 5, 4, 4))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 5, 4, 2))
     dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     generator = SimVQAudioModel(
         in_channels=1,
@@ -197,7 +197,7 @@ def train_model_from_pod5(
         enc_num_res_blocks=enc_num_res_blocks,
         enc_down_strides=enc_down_strides,
         latent_dim=latent_dim,
-        codebook_size=int(mcfg.get("codebook_size", 4096)),
+        codebook_size=int(mcfg.get("codebook_size", 16384)),
         beta=float(mcfg.get("beta", 0.25)),
         legacy_beta=bool(mcfg.get("legacy_beta", False)),
         dec_channel_schedule=dec_channels,

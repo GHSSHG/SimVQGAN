@@ -42,7 +42,7 @@ def parse_args() -> argparse.Namespace:
     # Legacy CLI (kept for compatibility; ignored when --config is provided)
     p.add_argument("root", type=Path, nargs="?", help="Root directory containing POD5 files or subfolders")
     p.add_argument("--subdirs", nargs="*", default=None, help="Optional subdirectories under root to search")
-    p.add_argument("--segment-sec", type=float, default=2.0, help="Segment length in seconds for each training window (default 2.0 → L=10000 for sr=5000)")
+    p.add_argument("--segment-sec", type=float, default=1.0, help="Segment length in seconds for each training window (default 1.0 → L=5000 for sr=5000)")
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
@@ -150,7 +150,7 @@ def _prepare_split_dataset(
     *,
     split_cfg: Dict[str, Any],
 ) -> tuple[NanoporeSignalDataset, list[Path]]:
-    segment_sec = float(split_cfg.get("segment_sec", 2.0))
+    segment_sec = float(split_cfg.get("segment_sec", 1.0))
     sample_rate = float(split_cfg.get("sample_rate", 5000.0))
     window_ms = int(round(segment_sec * 1000))
     segment_samples_raw = split_cfg.get("segment_samples")
@@ -207,7 +207,7 @@ def main() -> None:
         if epochs is None:
             raise ValueError("Epoch-based training requires 'train.epochs' in the config or --epochs override.")
         batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 512))
-        lr = float(train_cfg.get("learning_rate", 5e-4))
+        lr = float(train_cfg.get("learning_rate", 1e-4))
         save_every = int(train_cfg.get("save_every", 1000))
         keep_last = int(train_cfg.get("keep_last", 10))
         log_every = int(train_cfg.get("log_every", 50))
@@ -244,7 +244,7 @@ def main() -> None:
             "type": data_cfg.get("type", "pod5"),
             "root": base_root,
             "subdirs": data_cfg.get("subdirs", ["."]),
-            "segment_sec": float(data_cfg.get("segment_sec", 2.0)),
+            "segment_sec": float(data_cfg.get("segment_sec", 1.0)),
             "segment_samples": data_cfg.get("segment_samples"),
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "loader_workers": max(1, default_loader_workers),

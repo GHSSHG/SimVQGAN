@@ -2,7 +2,7 @@
   "seed": 42,
   "train": {
     "epochs": 2,
-    "batch_size": 256,
+    "batch_size": 512,
     "learning_rate": 0.0001,
     "host_prefetch_size": 64,
     "device_prefetch_size": 16,
@@ -22,14 +22,14 @@
   "model": {
     "base_channels": 32,
     "enc_channels": [32, 32, 64, 64, 128],
-    "enc_down_strides": [4, 4, 5, 1],
+    "enc_down_strides": [2, 4, 5, 1],
     "enc_num_res_blocks": 2,
-    "latent_dim": 256,
+    "latent_dim": 128,
     "codebook_size": 16384,
     "beta": 0.25,
     "legacy_beta": false,
     "dec_channels": [128, 64, 64, 32, 32],
-    "dec_up_strides": [1, 5, 4, 4],
+    "dec_up_strides": [1, 5, 4, 2],
     "dec_num_res_blocks": 2,
     "discriminator": {
       "channels": [32, 64, 128, 256],
@@ -41,8 +41,8 @@
   "data": {
     "type": "pod5",
     "root": "/content/drive/MyDrive/ont_open_data/hereditary_cancer_2025.09_raw_pod5",
-    "segment_sec": 2.0,
-    "segment_samples": 10000,
+    "segment_sec": 1.0,
+    "segment_samples": 5000,
     "sample_rate": 5000,
     "subdirs": [
       "FC01/pod5",
@@ -58,7 +58,7 @@
         "FC02/pod5",
         "FC03/pod5"
       ],
-      "segment_samples": 10000
+      "segment_samples": 5000
     }
   },
   "checkpoint": {
