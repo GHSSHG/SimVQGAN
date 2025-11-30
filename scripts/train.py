@@ -46,10 +46,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
-    p.add_argument("--lr", type=float, default=5e-4)
-    p.add_argument("--ckpt-dir", type=Path, default=Path("checkpoints/audio_codec_wgangp"))
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--ckpt-dir", type=Path, default=Path("/content/VQGAN/checkpoints"))
     p.add_argument("--save-every", type=int, default=1000)
-    p.add_argument("--keep-last", type=int, default=10)
+    p.add_argument("--keep-last", type=int, default=5)
     p.add_argument(
         "--loader-workers",
         type=int,
@@ -66,13 +66,13 @@ def parse_args() -> argparse.Namespace:
         "--host-prefetch-size",
         type=int,
         default=None,
-        help="Override host-side Prefetcher queue length (default: config or 8)",
+        help="Override host-side Prefetcher queue length (default: config or 64)",
     )
     p.add_argument(
         "--device-prefetch-size",
         type=int,
         default=None,
-        help="Override device prefetch depth (default: config or 2)",
+        help="Override device prefetch depth (default: config or 16)",
     )
     p.add_argument("--seed", type=int, default=None, help="Optional seed; if omitted, derive a new epoch seed")
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
@@ -209,11 +209,11 @@ def main() -> None:
         batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 512))
         lr = float(train_cfg.get("learning_rate", 1e-4))
         save_every = int(train_cfg.get("save_every", 1000))
-        keep_last = int(train_cfg.get("keep_last", 10))
-        log_every = int(train_cfg.get("log_every", 50))
-        grad_clip = float(train_cfg.get("grad_clip", 0.7))
-        host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 8)))
-        device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 2)))
+        keep_last = int(train_cfg.get("keep_last", 5))
+        log_every = int(train_cfg.get("log_every", 100))
+        grad_clip = float(train_cfg.get("grad_clip", 1.0))
+        host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
+        device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
         if args.host_prefetch_size is not None:
             host_prefetch_size = max(1, int(args.host_prefetch_size))
         if args.device_prefetch_size is not None:
@@ -221,24 +221,24 @@ def main() -> None:
         # weights aligned with SimVQ losses
         lw = train_cfg.get("loss_weights", {})
         loss_weights = {
-            "time_l1": float(lw.get("time_l1", lw.get("recon", 1.0))),
+            "time_l1": float(lw.get("time_l1", lw.get("recon", 2.0))),
             "commit": float(lw.get("commit", 1.0)),
-            "gan": float(lw.get("gan", 0.05)),
+            "gan": float(lw.get("gan", 0.03)),
             "feature": float(lw.get("feature", 0.1)),
         }
 
         # adversarial scheduling
-        disc_start = int(train_cfg.get("disc_start", 5000))
+        disc_start = int(train_cfg.get("disc_start", 6000))
         disc_ramp = int(train_cfg.get("disc_ramp", 4000))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
-        disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.2))
+        disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.1))
         freeze_W = bool(optim_cfg.get("freeze_W", False))
         model_kwargs = model_cfg
 
-        default_loader_workers = int(data_cfg.get("loader_workers", max(2, (os.cpu_count() or 4) // 2 or 1)))
-        default_loader_prefetch = int(data_cfg.get("loader_prefetch_chunks", data_cfg.get("loader_prefetch") or 128))
+        default_loader_workers = int(data_cfg.get("loader_workers", 8))
+        default_loader_prefetch = int(data_cfg.get("loader_prefetch_chunks", data_cfg.get("loader_prefetch") or 512))
         base_root = _resolve_data_path(data_cfg.get("root", "./nanopore"), cfg_dir)
         base_data_cfg: Dict[str, Any] = {
             "type": data_cfg.get("type", "pod5"),
@@ -258,15 +258,15 @@ def main() -> None:
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-        ckpt_dir = str(Path(ckpt_cfg.get("dir", "./checkpoints/vqgan")).resolve())
+        ckpt_dir = str(Path(ckpt_cfg.get("dir", "/content/VQGAN/checkpoints")).resolve())
         resume_from = ckpt_cfg.get("resume_from", None)
         drive_backup_dir = ckpt_cfg.get("drive_backup_dir", None)
 
         logging_cfg = cfg.get("logging", {})
         wandb_cfg = logging_cfg.get("wandb", {})
         wandb_enabled = bool(wandb_cfg.get("enabled", False) or args.wandb)
-        wandb_project = wandb_cfg.get("project", args.wandb_project or "vq-gan")
-        wandb_run_name = wandb_cfg.get("run_name") or args.wandb_run or f"vq-gan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        wandb_project = wandb_cfg.get("project", args.wandb_project or "simvq-nanopore")
+        wandb_run_name = wandb_cfg.get("run_name") or args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         wandb_api_key = wandb_cfg.get("api_key")
         wandb_logger = None
         if wandb_enabled:
@@ -315,16 +315,16 @@ def main() -> None:
     legacy_loader_workers = (
         max(1, int(args.loader_workers))
         if args.loader_workers is not None
-        else max(1, (os.cpu_count() or 4) // 2 or 1)
+        else 8
     )
     legacy_loader_prefetch = (
-        max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 128
+        max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 512
     )
     legacy_host_prefetch = (
-        max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 8
+        max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 64
     )
     legacy_device_prefetch = (
-        max(1, int(args.device_prefetch_size)) if args.device_prefetch_size is not None else 2
+        max(1, int(args.device_prefetch_size)) if args.device_prefetch_size is not None else 16
     )
     def _legacy_positive(value: Any) -> int | None:
         if value in (None, "", False):
@@ -337,7 +337,7 @@ def main() -> None:
 
     legacy_epochs = _legacy_positive(args.epochs)
     if legacy_epochs is None:
-        legacy_epochs = 1
+        legacy_epochs = 2
 
     train_spec = {
         "type": "pod5",
@@ -354,19 +354,19 @@ def main() -> None:
     legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
     wandb_logger = None
     if args.wandb:
-        run_name = args.wandb_run or f"vq-gan-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        run_name = args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         wandb_payload: Dict[str, Any] = {
             "mode": "cli",
             "batch_size": legacy_batch_size,
         }
         if legacy_epochs is not None:
             wandb_payload["epochs"] = int(legacy_epochs)
-        wandb_logger = init_wandb(args.wandb_project or "vq-gan", run_name, wandb_payload, api_key=None)
+        wandb_logger = init_wandb(args.wandb_project or "simvq-nanopore", run_name, wandb_payload, api_key=None)
     default_loss_weights = {
-        "time_l1": 1.0,
+        "time_l1": 2.0,
         "commit": 1.0,
-        "gan": 0.1,
-        "feature": 0.0,
+        "gan": 0.03,
+        "feature": 0.1,
     }
     try:
         train_model_from_pod5(

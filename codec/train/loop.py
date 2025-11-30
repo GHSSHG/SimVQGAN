@@ -120,28 +120,28 @@ def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
     num_epochs: int | None = None,
-    learning_rate: float = 5e-4,
+    learning_rate: float = 1e-4,
     seed: int = 0,
     ckpt_dir: str | None = None,
     save_every: int = 1000,
-    keep_last: int = 3,
+    keep_last: int = 5,
     loss_weights: Dict[str, float] | None = None,
-    disc_start: int = 0,
+    disc_start: int = 6000,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
     resume_from: str | None = None,
-    log_every: int = 50,
+    log_every: int = 100,
     wandb_logger: Any | None = None,
     drive_backup_dir: str | None = None,
     # Optimization knobs
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
-    grad_clip: float = 0.7,
+    grad_clip: float = 1.0,
     disc_ramp: int = 4000,
-    host_prefetch_size: int = 8,
-    device_prefetch_size: int = 2,
-    disc_lr_mult: float = 0.2,
+    host_prefetch_size: int = 64,
+    device_prefetch_size: int = 16,
+    disc_lr_mult: float = 0.1,
 ):
     import jax
     from ..models.model import SimVQAudioModel
@@ -307,9 +307,9 @@ def train_model_from_pod5(
         return host_iter, data_iter
     if loss_weights is None:
         loss_weights = {
-            "time_l1": 1.0,
+            "time_l1": 2.0,
             "commit": 1.0,
-            "gan": 0.05,
+            "gan": 0.03,
             "feature": 0.1,
         }
     else:
@@ -470,7 +470,7 @@ def train_more(
     save_every: int,
     keep_last: int,
     log_file: str | None = None,
-    disc_start: int = 0,
+    disc_start: int = 6000,
     disc_ramp: int = 4000,
 ):
     if num_epochs <= 0:
@@ -485,8 +485,8 @@ def train_more(
     L = probe.shape[-1]
 
     def _make_iter():
-        host = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=False), prefetch_size=8)
-        dev_iter = iter(make_device_prefetcher(host, device_prefetch_size=2, shard_for_multigpu=False))
+        host = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=False), prefetch_size=64)
+        dev_iter = iter(make_device_prefetcher(host, device_prefetch_size=16, shard_for_multigpu=False))
         return host, dev_iter
 
     step_rng = jax.random.PRNGKey(int(getattr(gen_state, "step", 0)))
