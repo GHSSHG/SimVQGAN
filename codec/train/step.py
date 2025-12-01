@@ -31,13 +31,11 @@ def compute_grads(
             {"params": disc_state.params},
             wave_hat,
             train=True,
-            return_features=True,
         )
         real_map, real_feats = disc_state.apply_fn(
             {"params": disc_state.params},
             batch,
             train=True,
-            return_features=True,
         )
         weights = dict(loss_weights)
         gan_w = jnp.asarray(weights.get("gan", 0.1), dtype=jnp.float32)
@@ -70,8 +68,8 @@ def compute_grads(
     (g_loss, aux), g_grads = jax.value_and_grad(gen_loss_fn, has_aux=True)(gen_state.params)
 
     def disc_loss_fn(disc_params):
-        real_map = disc_state.apply_fn({"params": disc_params}, batch, train=True)
-        fake_map = disc_state.apply_fn(
+        real_map, _ = disc_state.apply_fn({"params": disc_params}, batch, train=True)
+        fake_map, _ = disc_state.apply_fn(
             {"params": disc_params},
             jax.lax.stop_gradient(aux["wave_hat"]),
             train=True,

@@ -28,9 +28,14 @@ class SimVQAudioModel(nn.Module):
     enc_dtype: Any = jnp.float32
     dec_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
+    remat_encoder: bool = False
+    remat_decoder: bool = False
 
     def setup(self):
-        self.encoder = SimVQEncoder1D(
+        encoder_cls = SimVQEncoder1D
+        if self.remat_encoder:
+            encoder_cls = nn.remat(encoder_cls)
+        self.encoder = encoder_cls(
             in_channels=self.in_channels,
             base_channels=self.base_channels,
             channel_multipliers=self.enc_channel_multipliers,
@@ -40,7 +45,10 @@ class SimVQAudioModel(nn.Module):
             dtype=self.enc_dtype,
             param_dtype=self.param_dtype,
         )
-        self.decoder = SimVQDecoder1D(
+        decoder_cls = SimVQDecoder1D
+        if self.remat_decoder:
+            decoder_cls = nn.remat(decoder_cls)
+        self.decoder = decoder_cls(
             out_channels=self.in_channels,
             channel_schedule=self.dec_channel_schedule,
             num_res_blocks=self.dec_num_res_blocks,

@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core import FrozenDict, freeze
+from flax import linen as nn
 from flax.training import checkpoints as flax_ckpt
 
 from .states import (
@@ -205,7 +206,10 @@ def train_model_from_pod5(
     disc_cfg = dict(mcfg.get("discriminator", {}))
     disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
     disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
-    discriminator = PatchDiscriminator1D(
+    disc_cls = PatchDiscriminator1D
+    if bool(disc_cfg.get("remat", False)):
+        disc_cls = nn.remat(disc_cls)
+    discriminator = disc_cls(
         channels=disc_channels,
         strides=disc_strides,
         kernel_size=int(disc_cfg.get("kernel_size", 15)),

@@ -8,3 +8,4 @@ runs
 .cache
 wandb
 AGENTS.md
+.*

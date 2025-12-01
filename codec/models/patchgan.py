@@ -19,7 +19,7 @@ class PatchDiscriminator1D(nn.Module):
     param_dtype: Any = jnp.float32
 
     @nn.compact
-    def __call__(self, x: jnp.ndarray, *, train: bool = False, return_features: bool = False):
+    def __call__(self, x: jnp.ndarray, *, train: bool = False):
         # accept (B,T) or (B,T,1)
         if x.ndim == 2:
             h = x[..., None]
@@ -67,6 +67,4 @@ class PatchDiscriminator1D(nn.Module):
             name="out",
         )(h)
         logits = logits.squeeze(-1)
-        if return_features:
-            return logits, tuple(feats)
-        return logits  # (B, T')
+        return logits, tuple(feats)
