@@ -66,7 +66,16 @@ class Prefetcher:
     def close(self) -> None:
         """Signal the worker to stop and drain the queue."""
         self._stop.set()
-        self._q.put(self._SENTINEL)
+        # Drain pending batches so worker threads unstick even if the queue was full.
+        try:
+            while True:
+                self._q.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._q.put_nowait(self._SENTINEL)
+        except queue.Full:
+            pass
         self.join()
 
     def __enter__(self):

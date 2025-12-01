@@ -89,20 +89,20 @@
     }
   },
   "checkpoint": {
-    "dir": "checkpoints/local",
+    "dir": "checkpoints",
     "resume_from": null
   },
   "logging": {
     "wandb": {
       "enabled": false,
       "project": "simvq-local",
-      "run_name": null,
-      "api_key": null
+      "run_name": "v1.0",
+      "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },
   "optim": {
     "codebook_lr_mult": 0.0,
-    "disc_lr_mult": 0.1,
+    "disc_lr_mult": 0.15,
     "freeze_W": false
   }
 }
