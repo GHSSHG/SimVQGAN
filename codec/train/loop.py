@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterator, Tuple
 
-from collections import deque
+from collections import deque, defaultdict
 
+import math
 import os
 
 import jax
@@ -22,7 +23,6 @@ from .step import compute_grads
 from .losses import compute_generator_losses, hinge_d_loss
 from ..data.prefetch import Prefetcher, make_device_prefetcher
 from ..data.pod5_dataset import NanoporeSignalDataset
-from ..utils.checkpoint import sync_checkpoints
 
 
 def _force_frozen(tree):
@@ -123,25 +123,25 @@ def train_model_from_pod5(
     learning_rate: float = 1e-4,
     seed: int = 0,
     ckpt_dir: str | None = None,
-    save_every: int = 1000,
-    keep_last: int = 5,
     loss_weights: Dict[str, float] | None = None,
-    disc_start: int = 6000,
+    disc_start_epoch: float = 0.0,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
     resume_from: str | None = None,
-    log_every: int = 100,
+    log_every_steps: int = 100,
+    checkpoints_per_epoch: int = 10,
     wandb_logger: Any | None = None,
-    drive_backup_dir: str | None = None,
     # Optimization knobs
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
     grad_clip: float = 1.0,
-    disc_ramp: int = 4000,
+    disc_warmup_epochs: float = 0.0,
     host_prefetch_size: int = 64,
     device_prefetch_size: int = 16,
     disc_lr_mult: float = 0.1,
+    max_steps_total: int | None = None,
+    max_steps_per_epoch: int | None = None,
 ):
     import jax
     from ..models.model import SimVQAudioModel
@@ -317,25 +317,56 @@ def train_model_from_pod5(
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
-    def _disc_mask(step_hint: int) -> float:
-        if step_hint < int(disc_start):
-            return 0.0
-        if disc_ramp <= 0:
-            return 1.0
-        progress = (step_hint - int(disc_start)) / float(disc_ramp)
-        if progress < 0.0:
-            progress = 0.0
-        if progress > 1.0:
-            progress = 1.0
-        return progress
+    def _safe_int(value: int | None) -> int | None:
+        if value is None:
+            return None
+        try:
+            ivalue = int(value)
+        except (TypeError, ValueError):
+            return None
+        return ivalue if ivalue > 0 else None
 
-    # Optional compile warmup on dummy batch to avoid long stalls on first real step (e.g., Colab).
+    total_step_cap = _safe_int(max_steps_total)
+    epoch_step_cap = _safe_int(max_steps_per_epoch)
+    log_every_steps_int = max(0, int(log_every_steps))
+    checkpoints_per_epoch_int = max(0, int(checkpoints_per_epoch))
+
+    def _epoch_position(epoch_idx: int, steps_in_epoch: int, last_epoch_steps: int | None) -> float:
+        denom = last_epoch_steps if last_epoch_steps and last_epoch_steps > 0 else None
+        if denom is None and epoch_step_cap:
+            denom = epoch_step_cap
+        if denom is None or denom <= 0:
+            denom = steps_in_epoch + 1
+        frac = float(steps_in_epoch) / max(denom, 1.0)
+        frac = float(np.clip(frac, 0.0, 1.0))
+        return float(epoch_idx - 1) + frac
+
+    def _disc_mask_from_progress(epoch_idx: int, steps_in_epoch: int, last_epoch_steps: int | None) -> float:
+        pos = _epoch_position(epoch_idx, steps_in_epoch, last_epoch_steps)
+        if pos < float(disc_start_epoch):
+            return 0.0
+        if disc_warmup_epochs <= 0:
+            return 1.0
+        ramp = (pos - float(disc_start_epoch)) / float(disc_warmup_epochs)
+        return float(np.clip(ramp, 0.0, 1.0))
+
+    def _log_step(step: int, logs: Dict[str, Any] | None) -> None:
+        if log_every_steps_int <= 0 or step % log_every_steps_int != 0:
+            return
+        formatted = _simvq_style_logs(logs or {}, "train")
+        floats = _logs_to_float_dict(formatted)
+        if not floats:
+            return
+        msg = "[step {}] ".format(step) + ", ".join(f"{k}={v:.4f}" for k, v in sorted(floats.items()))
+        _log(msg)
+        _log_wandb(floats, step)
+
+    # Optional compile warmup on dummy batch to avoid long stalls on first real step.
     if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
         _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
         dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        disc_mask_warm = jnp.asarray(_disc_mask(0), dtype=jnp.float32)
-        # Trigger JIT compile; ignore outputs.
+        disc_mask_warm = jnp.asarray(_disc_mask_from_progress(1, 0, None), dtype=jnp.float32)
         compute_grads(
             gen_state,
             disc_state,
@@ -359,43 +390,19 @@ def train_model_from_pod5(
 
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
     global_step = 0
-    next_step = 1
+    last_epoch_steps: int | None = None
 
-    def _finalize_step(step: int, logs: Dict[str, Any] | None) -> None:
-        logs = dict(logs or {})
-        usage_ratio = (
-            float(jax.device_get(jnp.asarray(logs["code_usage"])))
-            if "code_usage" in logs
-            else 0.0
-        )
-        logs["code_usage"] = usage_ratio
-        should_log = log_every > 0 and step % int(log_every) == 0
-        if should_log:
-            agg = code_hist_window.metrics()
-            if agg is not None:
-                usage, perplexity = agg
-                logs["code_usage"] = usage
-                logs["perplexity"] = perplexity
-        formatted_logs = _simvq_style_logs(logs, "train")
-        float_logs = _logs_to_float_dict(formatted_logs)
-        if should_log and float_logs:
-            _log("step " + str(step) + ", " + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items()))
-            _log_wandb(float_logs, step)
-        if ckpt_dir and save_every > 0 and (step % save_every == 0):
-            flax_ckpt.save_checkpoint(
-                ckpt_dir,
-                target={"gen": gen_state, "disc": disc_state},
-                step=step,
-                overwrite=True,
-                keep=keep_last,
-            )
-            _log(f"[ckpt] saved step={step} to {ckpt_dir}")
-
-    def _consume_batch(batch, step_hint: int) -> bool:
+    def _consume_batch(
+        batch,
+        *,
+        epoch_idx: int,
+        steps_this_epoch: int,
+        last_epoch_steps_hint: int | None,
+    ) -> Dict[str, Any]:
         nonlocal step_rng, gen_state, disc_state
         step_rng, apply_rng = jax.random.split(step_rng)
-        disc_mask = _disc_mask(step_hint)
-        logs = {}
+        disc_mask = _disc_mask_from_progress(epoch_idx, steps_this_epoch, last_epoch_steps_hint)
+        logs: Dict[str, Any] = {}
         new_vq = None
         g_grads, d_grads, logs, new_vq = compute_grads(
             gen_state,
@@ -416,45 +423,107 @@ def train_model_from_pod5(
             hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
             total_np = float(jax.device_get(hist_total))
             code_hist_window.add(hist_np, total_np)
+            agg = code_hist_window.metrics()
+            if agg is not None:
+                logs.setdefault("code_usage", agg[0])
+                logs.setdefault("perplexity", agg[1])
         g_grads = _force_frozen(g_grads)
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-        _finalize_step(step_hint, logs)
-        return True
+        return logs
+
+    def _initial_checkpoint_estimate() -> int:
+        if checkpoints_per_epoch_int <= 0:
+            return 0
+        candidates = (
+            last_epoch_steps,
+            epoch_step_cap,
+            checkpoints_per_epoch_int * max(log_every_steps_int or 1, 100),
+        )
+        for cand in candidates:
+            if cand is not None and cand > 0:
+                return int(cand)
+        return checkpoints_per_epoch_int * 100
+
+    stop_training = False
 
     for epoch_idx in range(1, epochs_limit + 1):
+        if stop_training:
+            break
         host_iter, data_iter = _make_data_iterator()
         steps_this_epoch = 0
+        epoch_saves_done = 0
+        estimated_steps = _initial_checkpoint_estimate()
+        next_checkpoint_step = (
+            max(1, int(math.ceil(estimated_steps / checkpoints_per_epoch_int)))
+            if checkpoints_per_epoch_int > 0
+            else None
+        )
         try:
             while True:
+                if epoch_step_cap and steps_this_epoch >= epoch_step_cap:
+                    break
+                if total_step_cap and global_step >= total_step_cap:
+                    stop_training = True
+                    break
                 try:
                     batch = next(data_iter)
                 except StopIteration:
                     break
-                applied = _consume_batch(batch, next_step)
-                if applied:
-                    steps_this_epoch += 1
-                    global_step = next_step
-                    next_step = global_step + 1
+                logs = _consume_batch(
+                    batch,
+                    epoch_idx=epoch_idx,
+                    steps_this_epoch=steps_this_epoch,
+                    last_epoch_steps_hint=last_epoch_steps,
+                )
+                steps_this_epoch += 1
+                global_step += 1
+                _log_step(global_step, logs)
+                if (
+                    ckpt_dir
+                    and checkpoints_per_epoch_int > 0
+                    and next_checkpoint_step is not None
+                ):
+                    estimated_steps = max(estimated_steps, steps_this_epoch)
+                    while (
+                        epoch_saves_done < checkpoints_per_epoch_int
+                        and steps_this_epoch >= next_checkpoint_step
+                    ):
+                        flax_ckpt.save_checkpoint(
+                            ckpt_dir,
+                            target={"gen": gen_state, "disc": disc_state},
+                            step=global_step,
+                            overwrite=True,
+                        )
+                        epoch_saves_done += 1
+                        _log(
+                            f"[ckpt] epoch={epoch_idx} save {epoch_saves_done}/{checkpoints_per_epoch_int} (step={global_step}) written to {ckpt_dir}"
+                        )
+                        if epoch_saves_done >= checkpoints_per_epoch_int:
+                            break
+                        saves_remaining = checkpoints_per_epoch_int - epoch_saves_done
+                        estimated_steps = max(estimated_steps, steps_this_epoch + saves_remaining)
+                        remaining_est = max(estimated_steps - steps_this_epoch, saves_remaining)
+                        interval = max(1, int(math.ceil(remaining_est / saves_remaining)))
+                        next_checkpoint_step = steps_this_epoch + interval
         finally:
             host_iter.close()
         if steps_this_epoch == 0:
             raise ValueError(
                 f"Epoch {epoch_idx} yielded no training batches; check segment/window settings."
             )
+        usage_log = ""
+        agg = code_hist_window.metrics()
+        if agg is not None:
+            usage_log = f" code_usage={agg[0]:.4f} perplexity={agg[1]:.4f}"
         _log(
-            f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global step={global_step})."
+            f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global={global_step}).{usage_log}"
         )
+        last_epoch_steps = steps_this_epoch
     if log_fp is not None:
         try:
             log_fp.close()
         except Exception:
             pass
-    if drive_backup_dir and ckpt_dir:
-        try:
-            sync_checkpoints(ckpt_dir, drive_backup_dir)
-            _log(f"[drive] Synced checkpoints to {drive_backup_dir}")
-        except Exception as exc:
-            _log(f"[warn] Drive sync failed: {exc}")
     return gen_state, disc_state
 
 
@@ -468,7 +537,6 @@ def train_more(
     loss_weights: Dict[str, float],
     ckpt_dir: str | None,
     save_every: int,
-    keep_last: int,
     log_file: str | None = None,
     disc_start: int = 6000,
     disc_ramp: int = 4000,
@@ -582,7 +650,6 @@ def train_more(
                         target={"gen": gen_state, "disc": disc_state},
                         step=current_global,
                         overwrite=True,
-                        keep=keep_last,
                     )
                     _log(f"[ckpt] saved step={current_global} to {ckpt_dir}")
         finally:

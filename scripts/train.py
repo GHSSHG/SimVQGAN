@@ -47,9 +47,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size", type=int, default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--lr", type=float, default=1e-4)
-    p.add_argument("--ckpt-dir", type=Path, default=Path("/content/VQGAN/checkpoints"))
-    p.add_argument("--save-every", type=int, default=1000)
-    p.add_argument("--keep-last", type=int, default=5)
+    p.add_argument("--ckpt-dir", type=Path, default=None)
+    p.add_argument("--log-every-steps", type=int, default=None, help="Override per-step logging interval")
+    p.add_argument("--checkpoints-per-epoch", type=int, default=None, help="Override number of checkpoints to emit each epoch")
     p.add_argument(
         "--loader-workers",
         type=int,
@@ -78,7 +78,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     p.add_argument("--wandb-run", type=str, default=None, help="WandB run name override")
-    p.add_argument("--drive-backup-dir", type=Path, default=None, help="Optional Drive path to mirror checkpoints after training")
+    p.add_argument("--max-steps", type=int, default=None, help="Optional cap on global training steps (for quick tests)")
+    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="Optional cap on steps per epoch (for quick tests)")
     return p.parse_args()
 
 
@@ -208,9 +209,12 @@ def main() -> None:
             raise ValueError("Epoch-based training requires 'train.epochs' in the config or --epochs override.")
         batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 512))
         lr = float(train_cfg.get("learning_rate", 1e-4))
-        save_every = int(train_cfg.get("save_every", 1000))
-        keep_last = int(train_cfg.get("keep_last", 5))
-        log_every = int(train_cfg.get("log_every", 100))
+        log_every_steps = int(train_cfg.get("log_every_steps", 100))
+        if args.log_every_steps is not None:
+            log_every_steps = int(args.log_every_steps)
+        checkpoints_per_epoch = int(train_cfg.get("checkpoints_per_epoch", 10))
+        if args.checkpoints_per_epoch is not None:
+            checkpoints_per_epoch = int(args.checkpoints_per_epoch)
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
@@ -227,9 +231,9 @@ def main() -> None:
             "feature": float(lw.get("feature", 0.1)),
         }
 
-        # adversarial scheduling
-        disc_start = int(train_cfg.get("disc_start", 6000))
-        disc_ramp = int(train_cfg.get("disc_ramp", 4000))
+        # adversarial scheduling (epoch-based)
+        disc_start_epoch = float(train_cfg.get("disc_start_epoch", 0.0))
+        disc_warmup_epochs = float(train_cfg.get("disc_warmup_epochs", 0.0))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
@@ -258,9 +262,16 @@ def main() -> None:
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-        ckpt_dir = str(Path(ckpt_cfg.get("dir", "/content/VQGAN/checkpoints")).resolve())
-        resume_from = ckpt_cfg.get("resume_from", None)
-        drive_backup_dir = ckpt_cfg.get("drive_backup_dir", None)
+        ckpt_dir_raw = args.ckpt_dir or ckpt_cfg.get("dir") or "checkpoints"
+        ckpt_dir = str(Path(ckpt_dir_raw).expanduser().resolve())
+        resume_from_cfg = ckpt_cfg.get("resume_from")
+        resume_from = None
+        if resume_from_cfg:
+            resume_path = Path(resume_from_cfg)
+            if not resume_path.is_absolute():
+                resume_from = str((cfg_dir / resume_path).resolve())
+            else:
+                resume_from = str(resume_path.resolve())
 
         logging_cfg = cfg.get("logging", {})
         wandb_cfg = logging_cfg.get("wandb", {})
@@ -279,24 +290,24 @@ def main() -> None:
                 learning_rate=lr,
                 seed=int(seed),
                 ckpt_dir=ckpt_dir,
-                save_every=save_every,
-                keep_last=keep_last,
                 loss_weights=loss_weights,
-                disc_start=disc_start,
+                disc_start_epoch=disc_start_epoch,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
-                resume_from=str(resume_from) if resume_from is not None else None,
-                log_every=log_every,
+                resume_from=resume_from,
+                log_every_steps=log_every_steps,
+                checkpoints_per_epoch=checkpoints_per_epoch,
                 wandb_logger=wandb_logger,
-                drive_backup_dir=str(drive_backup_dir) if drive_backup_dir else None,
                 codebook_lr_mult=codebook_lr_mult,
                 freeze_W=freeze_W,
-                disc_ramp=disc_ramp,
+                disc_warmup_epochs=disc_warmup_epochs,
                 disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
                 grad_clip=grad_clip,
+                max_steps_total=args.max_steps,
+                max_steps_per_epoch=args.max_steps_per_epoch,
             )
         finally:
             if wandb_logger is not None:
@@ -350,8 +361,10 @@ def main() -> None:
     }
     ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-    ckpt_dir = str(args.ckpt_dir)
+    ckpt_dir = str(args.ckpt_dir) if args.ckpt_dir is not None else str(Path("checkpoints").resolve())
     legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
+    legacy_log_every_steps = int(args.log_every_steps) if args.log_every_steps is not None else 100
+    legacy_checkpoints_per_epoch = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 10
     wandb_logger = None
     if args.wandb:
         run_name = args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -375,14 +388,15 @@ def main() -> None:
             learning_rate=float(args.lr),
             seed=int(seed),
             ckpt_dir=ckpt_dir,
-            save_every=int(args.save_every),
-            keep_last=int(args.keep_last),
             loss_weights=default_loss_weights,
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
-            drive_backup_dir=str(args.drive_backup_dir) if args.drive_backup_dir else None,
+            log_every_steps=legacy_log_every_steps,
+            checkpoints_per_epoch=legacy_checkpoints_per_epoch,
             host_prefetch_size=legacy_host_prefetch,
             device_prefetch_size=legacy_device_prefetch,
+            max_steps_total=args.max_steps,
+            max_steps_per_epoch=args.max_steps_per_epoch,
         )
     finally:
         if wandb_logger is not None:

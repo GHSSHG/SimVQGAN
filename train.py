@@ -21,19 +21,10 @@ def main() -> None:
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from scripts.train import main as run_main  # noqa: E402
-    # 如果用户未传 --config，则默认使用本地 SSD 配置
+    # 如果用户未传 --config，则默认使用仓库内的本地训练配置
     if not any(arg.startswith("--config") for arg in sys.argv[1:]):
-        candidates = [
-            Path("/content/VQGAN/configs/train_config.colab.json"),
-            Path("/content/drive/MyDrive/VQGAN/configs/train_config.colab.json"),
-            Path(__file__).resolve().parent / "configs" / "train_config.colab.json",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                sys.argv += ["--config", str(candidate)]
-                break
-        else:
-            sys.argv += ["--config", "configs/train_config.colab.json"]
+        default_cfg = Path(__file__).resolve().parent / "configs" / "train_config.local.json"
+        sys.argv += ["--config", str(default_cfg)]
     run_main()
 
 

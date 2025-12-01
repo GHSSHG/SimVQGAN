@@ -1,6 +1,10 @@
-AGENTS.md
 __pycache__
-test/
-.venv
 *.fastq
 *.png
+hereditary_cancer_data
+checkpoints
+runs
+.local_cache
+.cache
+wandb
+AGENTS.md

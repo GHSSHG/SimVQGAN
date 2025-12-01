@@ -1,0 +1,108 @@
+{
+  "seed": 42,
+  "train": {
+    "epochs": 3,
+    "batch_size": 256,
+    "learning_rate": 0.0001,
+    "host_prefetch_size": 16,
+    "device_prefetch_size": 4,
+    "grad_clip": 1.0,
+    "disc_start_epoch": 1.0,
+    "disc_warmup_epochs": 0.5,
+    "log_every_steps": 100,
+    "checkpoints_per_epoch": 10,
+    "loss_weights": {
+      "time_l1": 2.0,
+      "commit": 1.0,
+      "gan": 0.03,
+      "feature": 0.1
+    }
+  },
+  "model": {
+    "base_channels": 32,
+    "enc_channels": [
+      32,
+      32,
+      64,
+      64,
+      128
+    ],
+    "enc_down_strides": [
+      2,
+      4,
+      5,
+      1
+    ],
+    "enc_num_res_blocks": 2,
+    "latent_dim": 128,
+    "codebook_size": 16384,
+    "beta": 0.25,
+    "legacy_beta": false,
+    "dec_channels": [
+      128,
+      64,
+      64,
+      32,
+      32
+    ],
+    "dec_up_strides": [
+      1,
+      5,
+      4,
+      2
+    ],
+    "dec_num_res_blocks": 2,
+    "discriminator": {
+      "channels": [
+        32,
+        64,
+        128,
+        256
+      ],
+      "strides": [
+        2,
+        2,
+        2,
+        2
+      ],
+      "kernel_size": 15,
+      "resblock_layers": 2
+    }
+  },
+  "data": {
+    "type": "pod5",
+    "root": "../hereditary_cancer_data/FC01/pod5",
+    "segment_sec": 1.0,
+    "segment_samples": 5000,
+    "sample_rate": 5000,
+    "subdirs": [
+      "."
+    ],
+    "loader_workers": 4,
+    "loader_prefetch_chunks": 64,
+    "train": {
+      "root": "../hereditary_cancer_data/FC01/pod5",
+      "subdirs": [
+        "."
+      ],
+      "segment_samples": 5000
+    }
+  },
+  "checkpoint": {
+    "dir": "checkpoints/local",
+    "resume_from": null
+  },
+  "logging": {
+    "wandb": {
+      "enabled": false,
+      "project": "simvq-local",
+      "run_name": null,
+      "api_key": null
+    }
+  },
+  "optim": {
+    "codebook_lr_mult": 0.0,
+    "disc_lr_mult": 0.1,
+    "freeze_W": false
+  }
+}

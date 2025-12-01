@@ -57,8 +57,10 @@ def configure_runtime_env() -> None:
     """Set environment defaults before importing JAX/Flax."""
     os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "3")  # hide duplicate cuFFT/cuDNN logs
     os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")  # avoid full-GPU prealloc on Colab
-    if "JAX_PLATFORMS" not in os.environ and _detect_cuda_available():
-        os.environ["JAX_PLATFORMS"] = "cuda,cpu"
+    gpu_available = _detect_cuda_available()
+    if not gpu_available:
+        raise RuntimeError("No CUDA GPU detected. SimVQGAN now requires an A100-class GPU for all runs.")
+    os.environ["JAX_PLATFORMS"] = "cuda"
     # Autotune hints to reduce slow_operation_alarm noise when compiling large convs.
     for flag in _XLA_FLAG_SNIPPETS:
         _ensure_flag(flag)
@@ -67,12 +69,18 @@ def configure_runtime_env() -> None:
 @lru_cache(maxsize=1)
 def enable_jax_compilation_cache(cache_dir: Optional[str] = None) -> None:
     """Point XLA at a persistent cache directory for faster rebuilds."""
-    target = Path(
+    preferred = Path(
         cache_dir
         or os.environ.get("XLA_CACHE_DIR")
         or (Path.home() / ".cache" / "jax_compilation_cache")
     ).expanduser()
-    target.mkdir(parents=True, exist_ok=True)
+    target = preferred
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        fallback = Path(__file__).resolve().parents[1] / ".local_cache" / "jax_compilation_cache"
+        fallback.mkdir(parents=True, exist_ok=True)
+        target = fallback
     os.environ["XLA_CACHE_DIR"] = str(target)
     # Some XLA builds do not recognize --xla_cache_dir; stick to env var to avoid crash.
     # _ensure_flag(f"--xla_cache_dir={target}")

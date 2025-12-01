@@ -7,12 +7,12 @@ Steps:
 2) Read a POD5 file, normalize each read, reconstruct with the model, and write a new POD5 containing generated signals (metadata preserved).
 3) Optionally call Dorado on both real and generated POD5 files and compute simple per-read identity.
 
-Usage (Colab):
+Usage (local GPU host):
     python scripts/dorado_validate.py \\
-        --config configs/validate_dorado.colab.json \\
-        --pod5 /content/drive/MyDrive/ont_open_data/.../PBC83240_b2b54521_13d14a35_116.pod5 \\
-        --ckpt-final /content/drive/MyDrive/VQGAN/checkpoints/final \\
-        --out-dir /content/VQGAN/dorado_eval \\
+        --config configs/validate_dorado.local.json \\
+        --pod5 hereditary_cancer_data/FC01/pod5/PBC83240_b2b54521_13d14a35_116.pod5 \\
+        --ckpt-final checkpoints/local/checkpoint_final \\
+        --out-dir runs/dorado_eval \\
         --dorado-model dna_r10.4.1_e8.2_260bps_sup@v4.3.0 \\
         --dorado-bin dorado
 """
@@ -41,7 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-DEFAULT_VAL_CONFIG = REPO_ROOT / "configs/validate_dorado.colab.json"
+DEFAULT_VAL_CONFIG = REPO_ROOT / "configs/validate_dorado.local.json"
 OUTPUT_FILES = [
     "real_trimmed.pod5",
     "real.fastq",
@@ -52,8 +52,8 @@ OUTPUT_FILES = [
 
 
 def _pick_local_root() -> Path:
-    """Choose a writable staging root: prefer /content in Colab, else repo-local."""
-    for cand in (Path("/content"), REPO_ROOT / ".local_cache"):
+    """Choose a writable staging root under ~/.cache or the repo."""
+    for cand in (Path.home() / ".cache" / "simvqgan", REPO_ROOT / ".local_cache"):
         try:
             cand.mkdir(parents=True, exist_ok=True)
             probe = cand / ".probe"
@@ -130,7 +130,7 @@ def _repo_path(path: Optional[Path]) -> Optional[Path]:
 
 
 def _localize_file(src: Optional[Path], dst_dir: Path, keep_name: Optional[str] = None) -> Optional[Path]:
-    """Copy a file into dst_dir if it is not already under /content; return destination path."""
+    """Copy a file into dst_dir if it is not already mirrored in the local cache."""
     if src is None:
         return None
     src = Path(src)
@@ -146,7 +146,7 @@ def _localize_file(src: Optional[Path], dst_dir: Path, keep_name: Optional[str] 
 
 
 def _localize_tree(src: Optional[Path], dst_dir: Path) -> Optional[Path]:
-    """Copy a directory (or file) into dst_dir; if src is under /content, return as-is."""
+    """Copy a directory (or file) into dst_dir unless it already resides in the local cache."""
     if src is None:
         return None
     src = Path(src)
