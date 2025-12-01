@@ -2,15 +2,14 @@
   "seed": 42,
   "train": {
     "epochs": 3,
-    "batch_size": 256,
+    "batch_size": 128,
     "learning_rate": 0.0001,
     "host_prefetch_size": 16,
     "device_prefetch_size": 4,
     "grad_clip": 1.0,
-    "disc_start_epoch": 1.0,
-    "disc_warmup_epochs": 0.5,
+    "disc_start_step": 50000,
+    "disc_warmup_steps": 20000,
     "log_every_steps": 100,
-    "checkpoints_per_epoch": 10,
     "loss_weights": {
       "time_l1": 2.0,
       "commit": 1.0,
@@ -90,11 +89,12 @@
   },
   "checkpoint": {
     "dir": "checkpoints",
-    "resume_from": null
+    "resume_from": null,
+    "every_steps": 5000
   },
   "logging": {
     "wandb": {
-      "enabled": false,
+      "enabled": true,
       "project": "simvq-local",
       "run_name": "v1.0",
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"

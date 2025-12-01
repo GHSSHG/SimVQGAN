@@ -212,9 +212,6 @@ def main() -> None:
         log_every_steps = int(train_cfg.get("log_every_steps", 100))
         if args.log_every_steps is not None:
             log_every_steps = int(args.log_every_steps)
-        checkpoints_per_epoch = int(train_cfg.get("checkpoints_per_epoch", 10))
-        if args.checkpoints_per_epoch is not None:
-            checkpoints_per_epoch = int(args.checkpoints_per_epoch)
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
@@ -231,9 +228,9 @@ def main() -> None:
             "feature": float(lw.get("feature", 0.1)),
         }
 
-        # adversarial scheduling (epoch-based)
-        disc_start_epoch = float(train_cfg.get("disc_start_epoch", 0.0))
-        disc_warmup_epochs = float(train_cfg.get("disc_warmup_epochs", 0.0))
+        # adversarial scheduling (step-based)
+        disc_start_step = int(train_cfg.get("disc_start_step", 0))
+        disc_warmup_steps = int(train_cfg.get("disc_warmup_steps", 0))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
@@ -265,6 +262,9 @@ def main() -> None:
         ckpt_dir_raw = args.ckpt_dir or ckpt_cfg.get("dir") or "checkpoints"
         ckpt_dir = str(Path(ckpt_dir_raw).expanduser().resolve())
         resume_from_cfg = ckpt_cfg.get("resume_from")
+        checkpoint_every_steps = int(ckpt_cfg.get("every_steps", 5000))
+        if args.checkpoints_per_epoch is not None:
+            checkpoint_every_steps = max(1, int(args.checkpoints_per_epoch))
         resume_from = None
         if resume_from_cfg:
             resume_path = Path(resume_from_cfg)
@@ -276,12 +276,19 @@ def main() -> None:
         logging_cfg = cfg.get("logging", {})
         wandb_cfg = logging_cfg.get("wandb", {})
         wandb_enabled = bool(wandb_cfg.get("enabled", False) or args.wandb)
-        wandb_project = wandb_cfg.get("project", args.wandb_project or "simvq-nanopore")
+        wandb_project = wandb_cfg.get("project") or args.wandb_project or "simvq-nanopore"
         wandb_run_name = wandb_cfg.get("run_name") or args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        wandb_entity = wandb_cfg.get("entity")
         wandb_api_key = wandb_cfg.get("api_key")
         wandb_logger = None
         if wandb_enabled:
-            wandb_logger = init_wandb(wandb_project, wandb_run_name, cfg, api_key=wandb_api_key)
+            wandb_logger = init_wandb(
+                wandb_project,
+                wandb_run_name,
+                cfg,
+                api_key=wandb_api_key,
+                entity=wandb_entity,
+            )
 
         try:
             train_model_from_pod5(
@@ -291,17 +298,17 @@ def main() -> None:
                 seed=int(seed),
                 ckpt_dir=ckpt_dir,
                 loss_weights=loss_weights,
-                disc_start_epoch=disc_start_epoch,
+                disc_start_step=disc_start_step,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
                 resume_from=resume_from,
                 log_every_steps=log_every_steps,
-                checkpoints_per_epoch=checkpoints_per_epoch,
+                checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
                 codebook_lr_mult=codebook_lr_mult,
                 freeze_W=freeze_W,
-                disc_warmup_epochs=disc_warmup_epochs,
+                disc_warmup_steps=disc_warmup_steps,
                 disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
@@ -364,7 +371,7 @@ def main() -> None:
     ckpt_dir = str(args.ckpt_dir) if args.ckpt_dir is not None else str(Path("checkpoints").resolve())
     legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
     legacy_log_every_steps = int(args.log_every_steps) if args.log_every_steps is not None else 100
-    legacy_checkpoints_per_epoch = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 10
+    legacy_checkpoint_every_steps = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 5000
     wandb_logger = None
     if args.wandb:
         run_name = args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
@@ -392,7 +399,7 @@ def main() -> None:
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             log_every_steps=legacy_log_every_steps,
-            checkpoints_per_epoch=legacy_checkpoints_per_epoch,
+            checkpoint_every_steps=legacy_checkpoint_every_steps,
             host_prefetch_size=legacy_host_prefetch,
             device_prefetch_size=legacy_device_prefetch,
             max_steps_total=args.max_steps,

@@ -24,15 +24,33 @@ class WandbLogger:
                 pass
 
 
-def init_wandb(project: str, run_name: Optional[str], config: Dict[str, Any], api_key: Optional[str] = None) -> Optional[WandbLogger]:
+def init_wandb(
+    project: str,
+    run_name: Optional[str],
+    config: Dict[str, Any],
+    api_key: Optional[str] = None,
+    entity: Optional[str] = None,
+) -> Optional[WandbLogger]:
     try:
         import wandb
     except Exception as exc:
         print(f"[warn] wandb import failed: {exc}")
         return None
+    init_kwargs: Dict[str, Any] = {
+        "project": project,
+        "name": run_name,
+        "config": config,
+        "reinit": True,
+    }
+    if entity:
+        init_kwargs["entity"] = entity
     if api_key:
-        os.environ.setdefault("WANDB_API_KEY", api_key)
-    run = wandb.init(project=project, name=run_name, config=config, reinit=True)
+        os.environ["WANDB_API_KEY"] = api_key
+        try:
+            wandb.login(key=api_key, relogin=True)
+        except TypeError:
+            wandb.login(relogin=True)
+    run = wandb.init(**init_kwargs)
     if run is None:
         return None
     return WandbLogger(run=run)

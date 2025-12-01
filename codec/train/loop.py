@@ -3,8 +3,6 @@ from __future__ import annotations
 from typing import Any, Dict, Iterator, Tuple
 
 from collections import deque, defaultdict
-
-import math
 import os
 
 import jax
@@ -124,19 +122,19 @@ def train_model_from_pod5(
     seed: int = 0,
     ckpt_dir: str | None = None,
     loss_weights: Dict[str, float] | None = None,
-    disc_start_epoch: float = 0.0,
+    disc_start_step: int = 0,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
     resume_from: str | None = None,
     log_every_steps: int = 100,
-    checkpoints_per_epoch: int = 10,
+    checkpoint_every_steps: int = 5000,
     wandb_logger: Any | None = None,
     # Optimization knobs
     codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
     grad_clip: float = 1.0,
-    disc_warmup_epochs: float = 0.0,
+    disc_warmup_steps: int = 0,
     host_prefetch_size: int = 64,
     device_prefetch_size: int = 16,
     disc_lr_mult: float = 0.1,
@@ -329,25 +327,16 @@ def train_model_from_pod5(
     total_step_cap = _safe_int(max_steps_total)
     epoch_step_cap = _safe_int(max_steps_per_epoch)
     log_every_steps_int = max(0, int(log_every_steps))
-    checkpoints_per_epoch_int = max(0, int(checkpoints_per_epoch))
+    checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
+    disc_start_step_int = max(0, int(disc_start_step))
+    disc_warmup_steps_int = max(0, int(disc_warmup_steps))
 
-    def _epoch_position(epoch_idx: int, steps_in_epoch: int, last_epoch_steps: int | None) -> float:
-        denom = last_epoch_steps if last_epoch_steps and last_epoch_steps > 0 else None
-        if denom is None and epoch_step_cap:
-            denom = epoch_step_cap
-        if denom is None or denom <= 0:
-            denom = steps_in_epoch + 1
-        frac = float(steps_in_epoch) / max(denom, 1.0)
-        frac = float(np.clip(frac, 0.0, 1.0))
-        return float(epoch_idx - 1) + frac
-
-    def _disc_mask_from_progress(epoch_idx: int, steps_in_epoch: int, last_epoch_steps: int | None) -> float:
-        pos = _epoch_position(epoch_idx, steps_in_epoch, last_epoch_steps)
-        if pos < float(disc_start_epoch):
+    def _disc_mask_for_step(step_idx: int) -> float:
+        if step_idx < disc_start_step_int:
             return 0.0
-        if disc_warmup_epochs <= 0:
+        if disc_warmup_steps_int <= 0:
             return 1.0
-        ramp = (pos - float(disc_start_epoch)) / float(disc_warmup_epochs)
+        ramp = (step_idx - disc_start_step_int) / max(1, disc_warmup_steps_int)
         return float(np.clip(ramp, 0.0, 1.0))
 
     def _log_step(step: int, logs: Dict[str, Any] | None) -> None:
@@ -366,7 +355,7 @@ def train_model_from_pod5(
         _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
         dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        disc_mask_warm = jnp.asarray(_disc_mask_from_progress(1, 0, None), dtype=jnp.float32)
+        disc_mask_warm = jnp.asarray(_disc_mask_for_step(0), dtype=jnp.float32)
         compute_grads(
             gen_state,
             disc_state,
@@ -390,18 +379,18 @@ def train_model_from_pod5(
 
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
     global_step = 0
-    last_epoch_steps: int | None = None
+    next_checkpoint_step = (
+        checkpoint_every_steps_int if checkpoint_every_steps_int > 0 else None
+    )
 
     def _consume_batch(
         batch,
         *,
-        epoch_idx: int,
-        steps_this_epoch: int,
-        last_epoch_steps_hint: int | None,
+        global_step_idx: int,
     ) -> Dict[str, Any]:
         nonlocal step_rng, gen_state, disc_state
         step_rng, apply_rng = jax.random.split(step_rng)
-        disc_mask = _disc_mask_from_progress(epoch_idx, steps_this_epoch, last_epoch_steps_hint)
+        disc_mask = _disc_mask_for_step(global_step_idx)
         logs: Dict[str, Any] = {}
         new_vq = None
         g_grads, d_grads, logs, new_vq = compute_grads(
@@ -431,19 +420,6 @@ def train_model_from_pod5(
         gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
         return logs
 
-    def _initial_checkpoint_estimate() -> int:
-        if checkpoints_per_epoch_int <= 0:
-            return 0
-        candidates = (
-            last_epoch_steps,
-            epoch_step_cap,
-            checkpoints_per_epoch_int * max(log_every_steps_int or 1, 100),
-        )
-        for cand in candidates:
-            if cand is not None and cand > 0:
-                return int(cand)
-        return checkpoints_per_epoch_int * 100
-
     stop_training = False
 
     for epoch_idx in range(1, epochs_limit + 1):
@@ -451,13 +427,6 @@ def train_model_from_pod5(
             break
         host_iter, data_iter = _make_data_iterator()
         steps_this_epoch = 0
-        epoch_saves_done = 0
-        estimated_steps = _initial_checkpoint_estimate()
-        next_checkpoint_step = (
-            max(1, int(math.ceil(estimated_steps / checkpoints_per_epoch_int)))
-            if checkpoints_per_epoch_int > 0
-            else None
-        )
         try:
             while True:
                 if epoch_step_cap and steps_this_epoch >= epoch_step_cap:
@@ -471,40 +440,24 @@ def train_model_from_pod5(
                     break
                 logs = _consume_batch(
                     batch,
-                    epoch_idx=epoch_idx,
-                    steps_this_epoch=steps_this_epoch,
-                    last_epoch_steps_hint=last_epoch_steps,
+                    global_step_idx=global_step,
                 )
                 steps_this_epoch += 1
                 global_step += 1
                 _log_step(global_step, logs)
                 if (
                     ckpt_dir
-                    and checkpoints_per_epoch_int > 0
                     and next_checkpoint_step is not None
+                    and global_step >= next_checkpoint_step
                 ):
-                    estimated_steps = max(estimated_steps, steps_this_epoch)
-                    while (
-                        epoch_saves_done < checkpoints_per_epoch_int
-                        and steps_this_epoch >= next_checkpoint_step
-                    ):
-                        flax_ckpt.save_checkpoint(
-                            ckpt_dir,
-                            target={"gen": gen_state, "disc": disc_state},
-                            step=global_step,
-                            overwrite=True,
-                        )
-                        epoch_saves_done += 1
-                        _log(
-                            f"[ckpt] epoch={epoch_idx} save {epoch_saves_done}/{checkpoints_per_epoch_int} (step={global_step}) written to {ckpt_dir}"
-                        )
-                        if epoch_saves_done >= checkpoints_per_epoch_int:
-                            break
-                        saves_remaining = checkpoints_per_epoch_int - epoch_saves_done
-                        estimated_steps = max(estimated_steps, steps_this_epoch + saves_remaining)
-                        remaining_est = max(estimated_steps - steps_this_epoch, saves_remaining)
-                        interval = max(1, int(math.ceil(remaining_est / saves_remaining)))
-                        next_checkpoint_step = steps_this_epoch + interval
+                    flax_ckpt.save_checkpoint(
+                        ckpt_dir,
+                        target={"gen": gen_state, "disc": disc_state},
+                        step=global_step,
+                        overwrite=True,
+                    )
+                    _log(f"[ckpt] step={global_step} written to {ckpt_dir}")
+                    next_checkpoint_step += checkpoint_every_steps_int
         finally:
             host_iter.close()
         if steps_this_epoch == 0:

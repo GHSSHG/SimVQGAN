@@ -25,7 +25,6 @@ def _patch_config(base: Path, pod5_file: Path, ckpt_dir: Path) -> dict:
     train_cfg = cfg["train"]
     train_cfg["epochs"] = max(1, int(train_cfg.get("epochs", 1)))
     train_cfg["log_every_steps"] = 1
-    train_cfg["checkpoints_per_epoch"] = 0
     train_cfg["batch_size"] = min(int(train_cfg.get("batch_size", 4) or 4), 4)
     train_cfg["host_prefetch_size"] = 2
     train_cfg["device_prefetch_size"] = 1
@@ -47,6 +46,7 @@ def _patch_config(base: Path, pod5_file: Path, ckpt_dir: Path) -> dict:
     ckpt = dict(cfg.get("checkpoint") or {})
     ckpt["dir"] = str(ckpt_dir.resolve())
     ckpt["resume_from"] = None
+    ckpt["every_steps"] = 0
     cfg["checkpoint"] = ckpt
     return cfg
 
