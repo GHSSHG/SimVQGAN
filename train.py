@@ -23,7 +23,7 @@ def main() -> None:
     from scripts.train import main as run_main  # noqa: E402
     # 如果用户未传 --config，则默认使用仓库内的本地训练配置
     if not any(arg.startswith("--config") for arg in sys.argv[1:]):
-        default_cfg = Path(__file__).resolve().parent / "configs" / "train_config.local.json"
+        default_cfg = Path(__file__).resolve().parent / "configs" / "train.json"
         sys.argv += ["--config", str(default_cfg)]
     run_main()
 

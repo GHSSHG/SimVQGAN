@@ -14,8 +14,26 @@ from pathlib import Path
 from typing import Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_CONFIG = REPO_ROOT / "configs" / "train_config.local.json"
-DEFAULT_POD5 = REPO_ROOT / "hereditary_cancer_data" / "FC01" / "pod5" / "PBC83386_d6237e35_45a4dd55_0.pod5"
+DEFAULT_CONFIG = REPO_ROOT / "configs" / "train.json"
+DEFAULT_DATA_ROOT = Path("/data/nanopore/hereditary_cancer_2025.09/raw")
+DEFAULT_DATA_SUBDIRS = (
+    "FC01/pod5",
+    "FC02/pod5",
+    "FC03/pod5",
+)
+
+
+def _default_pod5() -> Path:
+    for subdir in DEFAULT_DATA_SUBDIRS:
+        base = DEFAULT_DATA_ROOT / subdir
+        if not base.exists():
+            continue
+        for candidate in sorted(base.rglob("*.pod5")):
+            return candidate
+    return DEFAULT_DATA_ROOT / "FC01" / "pod5" / "sample.pod5"
+
+
+DEFAULT_POD5 = _default_pod5()
 SEED_STATE = REPO_ROOT / ".last_epoch_seed.txt"
 
 
@@ -26,6 +44,7 @@ def _patch_config(base: Path, pod5_file: Path, ckpt_dir: Path) -> dict:
     train_cfg["epochs"] = max(1, int(train_cfg.get("epochs", 1)))
     train_cfg["log_every_steps"] = 1
     train_cfg["batch_size"] = min(int(train_cfg.get("batch_size", 4) or 4), 4)
+    train_cfg["data_parallel"] = False
     train_cfg["host_prefetch_size"] = 2
     train_cfg["device_prefetch_size"] = 1
     cfg["train"] = train_cfg
@@ -48,6 +67,13 @@ def _patch_config(base: Path, pod5_file: Path, ckpt_dir: Path) -> dict:
     ckpt["resume_from"] = None
     ckpt["every_steps"] = 0
     cfg["checkpoint"] = ckpt
+    logging_cfg = dict(cfg.get("logging") or {})
+    wandb_cfg = dict(logging_cfg.get("wandb") or {})
+    wandb_cfg["enabled"] = False
+    if "api_key" in wandb_cfg:
+        wandb_cfg["api_key"] = None
+    logging_cfg["wandb"] = wandb_cfg
+    cfg["logging"] = logging_cfg
     return cfg
 
 

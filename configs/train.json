@@ -2,10 +2,11 @@
   "seed": 42,
   "train": {
     "epochs": 3,
-    "batch_size": 256,
+    "batch_size": 384,
+    "data_parallel": true,
     "learning_rate": 0.0001,
-    "host_prefetch_size": 16,
-    "device_prefetch_size": 4,
+    "host_prefetch_size": 32,
+    "device_prefetch_size": 8,
     "grad_clip": 1.0,
     "disc_start_step": 50000,
     "disc_warmup_steps": 20000,
@@ -69,23 +70,33 @@
       "kernel_size": 15,
       "resblock_layers": 2,
       "remat": true
-    }
+    },
+    "pre_quant_transformer_layers": 2,
+    "post_quant_transformer_layers": 2,
+    "transformer_heads": 8,
+    "transformer_mlp_ratio": 4.0,
+    "transformer_dropout": 0.1,
+    "remat_transformer": false
   },
   "data": {
     "type": "pod5",
-    "root": "../hereditary_cancer_data/FC01/pod5",
+    "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
     "segment_sec": 1.0,
     "segment_samples": 5000,
     "sample_rate": 5000,
     "subdirs": [
-      "."
+      "FC01/pod5",
+      "FC02/pod5",
+      "FC03/pod5"
     ],
-    "loader_workers": 4,
-    "loader_prefetch_chunks": 64,
+    "loader_workers": 12,
+    "loader_prefetch_chunks": 256,
     "train": {
-      "root": "../hereditary_cancer_data/FC01/pod5",
+      "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [
-        "."
+        "FC01/pod5",
+        "FC02/pod5",
+        "FC03/pod5"
       ],
       "segment_samples": 5000
     }

@@ -9,6 +9,7 @@ from flax import linen as nn
 from .encoder import SimVQEncoder1D
 from .decoder import SimVQDecoder1D
 from .quantize import SimVQ1D
+from .transformer import TransformerBlock1D
 from ..jaxlayers import Conv1d
 
 
@@ -30,6 +31,12 @@ class SimVQAudioModel(nn.Module):
     param_dtype: Any = jnp.float32
     remat_encoder: bool = False
     remat_decoder: bool = False
+    pre_quant_transformer_layers: int = 0
+    post_quant_transformer_layers: int = 0
+    transformer_heads: int = 4
+    transformer_mlp_ratio: float = 4.0
+    transformer_dropout: float = 0.0
+    remat_transformer: bool = False
 
     def setup(self):
         encoder_cls = SimVQEncoder1D
@@ -80,6 +87,33 @@ class SimVQAudioModel(nn.Module):
             dtype=self.enc_dtype,
             param_dtype=self.param_dtype,
         )
+        tf_block_cls = TransformerBlock1D
+        if self.remat_transformer:
+            tf_block_cls = nn.remat(tf_block_cls)
+        self.pre_quant_blocks = tuple(
+            tf_block_cls(
+                dim=self.latent_dim,
+                num_heads=self.transformer_heads,
+                mlp_ratio=self.transformer_mlp_ratio,
+                dropout=self.transformer_dropout,
+                dtype=self.enc_dtype,
+                param_dtype=self.param_dtype,
+                name=f"pre_quant_tf_{i}",
+            )
+            for i in range(max(0, int(self.pre_quant_transformer_layers)))
+        )
+        self.post_quant_blocks = tuple(
+            tf_block_cls(
+                dim=self.latent_dim,
+                num_heads=self.transformer_heads,
+                mlp_ratio=self.transformer_mlp_ratio,
+                dropout=self.transformer_dropout,
+                dtype=self.dec_dtype,
+                param_dtype=self.param_dtype,
+                name=f"post_quant_tf_{i}",
+            )
+            for i in range(max(0, int(self.post_quant_transformer_layers)))
+        )
 
     def encode(
         self,
@@ -91,11 +125,23 @@ class SimVQAudioModel(nn.Module):
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
         h_e = self.encoder(x, train=train, offset=offset)
         h_qin = self.quant_conv(h_e)
-        rng, quant_rng = jax.random.split(rng)
+        if self.pre_quant_blocks:
+            split_rngs = jax.random.split(rng, len(self.pre_quant_blocks) + 1)
+            for block, block_rng in zip(self.pre_quant_blocks, split_rngs[:-1]):
+                h_qin = block(h_qin, train=train, rng=block_rng)
+            quant_rng = split_rngs[-1]
+        else:
+            _, quant_rng = jax.random.split(rng)
         z_q, info = self.quantizer(h_qin, rng=quant_rng, train=train)
         return h_qin, z_q, info
 
-    def decode(self, z_q: jnp.ndarray, *, train: bool = False):
+    def decode(self, z_q: jnp.ndarray, *, train: bool = False, rng: jax.random.KeyArray | None = None):
+        if self.post_quant_blocks:
+            block_rngs = [None] * len(self.post_quant_blocks)
+            if rng is not None:
+                block_rngs = jax.random.split(rng, len(self.post_quant_blocks))
+            for block, block_rng in zip(self.post_quant_blocks, block_rngs):
+                z_q = block(z_q, train=train, rng=block_rng)
         # map back to decoder channel dim
         z_dec = self.post_quant_conv(z_q)
         wave, aux = self.decoder(z_dec, train=train)
@@ -112,8 +158,9 @@ class SimVQAudioModel(nn.Module):
         offset: int = 0,
         rng: jax.random.KeyArray,
     ) -> Dict[str, Any]:
-        z_e, z_q, info = self.encode(x, train=train, offset=offset, rng=rng)
-        wave_hat, dec_aux = self.decode(z_q, train=train)
+        _, enc_rng, dec_rng = jax.random.split(rng, 3)
+        z_e, z_q, info = self.encode(x, train=train, offset=offset, rng=enc_rng)
+        wave_hat, dec_aux = self.decode(z_q, train=train, rng=dec_rng)
         usage_ratio = info.get("usage_ratio", jnp.array(0.0, dtype=z_e.dtype))
         return {
             "wave_hat": wave_hat,
@@ -125,6 +172,8 @@ class SimVQAudioModel(nn.Module):
                 "perplexity": info["perplexity"],
                 "usage_ratio": usage_ratio,
                 "code_usage": usage_ratio,
+                "token_counts": info.get("token_counts"),
+                "total_tokens": info.get("total_tokens"),
             },
             "dec": dec_aux,
         }

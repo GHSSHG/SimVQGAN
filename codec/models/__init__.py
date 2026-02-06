@@ -3,6 +3,7 @@ from .decoder import SimVQDecoder1D
 from .model import SimVQAudioModel
 from .patchgan import PatchDiscriminator1D
 from .quantize import SimVQ1D
+from .transformer import TransformerBlock1D
 
 # Backwards-compatible aliases for downstream scripts
 Encoder = SimVQEncoder1D
@@ -16,4 +17,5 @@ __all__ = [
     "SimVQAudioModel",
     "PatchDiscriminator1D",
     "SimVQ1D",
+    "TransformerBlock1D",
 ]

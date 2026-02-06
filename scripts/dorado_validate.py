@@ -216,6 +216,14 @@ def _build_model(model_cfg: Dict, L: int):
         dec_channel_schedule=dec_channels,
         dec_num_res_blocks=int(model_cfg.get("dec_num_res_blocks", model_cfg.get("num_res_blocks", 2))),
         dec_up_strides=dec_up_strides,
+        remat_encoder=bool(model_cfg.get("remat_encoder", False)),
+        remat_decoder=bool(model_cfg.get("remat_decoder", False)),
+        pre_quant_transformer_layers=int(model_cfg.get("pre_quant_transformer_layers", 0)),
+        post_quant_transformer_layers=int(model_cfg.get("post_quant_transformer_layers", 0)),
+        transformer_heads=int(model_cfg.get("transformer_heads", 4)),
+        transformer_mlp_ratio=float(model_cfg.get("transformer_mlp_ratio", 4.0)),
+        transformer_dropout=float(model_cfg.get("transformer_dropout", 0.0)),
+        remat_transformer=bool(model_cfg.get("remat_transformer", False)),
     )
     rng = jax.random.PRNGKey(0)
     dummy = jnp.zeros((1, L), dtype=jnp.float32)

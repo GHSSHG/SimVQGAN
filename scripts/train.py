@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
+from argparse import BooleanOptionalAction
 
 import sys
 # 确保以 "python scripts/train.py" 运行时可导入项目根下的 `codec` 包
@@ -38,7 +39,7 @@ from codec.utils import (
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Train 1D codec (JAX/Flax) from config or CLI")
-    p.add_argument("--config", type=Path, default=None, help="Path to train_config.json (recommended)")
+    p.add_argument("--config", type=Path, default=None, help="Path to training config JSON (recommended: configs/train.json)")
     # Legacy CLI (kept for compatibility; ignored when --config is provided)
     p.add_argument("root", type=Path, nargs="?", help="Root directory containing POD5 files or subfolders")
     p.add_argument("--subdirs", nargs="*", default=None, help="Optional subdirectories under root to search")
@@ -78,6 +79,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
     p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
     p.add_argument("--wandb-run", type=str, default=None, help="WandB run name override")
+    p.add_argument(
+        "--data-parallel",
+        action=BooleanOptionalAction,
+        default=None,
+        help="Enable/disable multi-GPU data parallel training (default: auto from config and device count)",
+    )
     p.add_argument("--max-steps", type=int, default=None, help="Optional cap on global training steps (for quick tests)")
     p.add_argument("--max-steps-per-epoch", type=int, default=None, help="Optional cap on steps per epoch (for quick tests)")
     return p.parse_args()
@@ -213,6 +220,9 @@ def main() -> None:
         if args.log_every_steps is not None:
             log_every_steps = int(args.log_every_steps)
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
+        data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
+        if args.data_parallel is not None:
+            data_parallel = bool(args.data_parallel)
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
         if args.host_prefetch_size is not None:
@@ -313,6 +323,7 @@ def main() -> None:
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
                 grad_clip=grad_clip,
+                use_data_parallel=(None if data_parallel is None else bool(data_parallel)),
                 max_steps_total=args.max_steps,
                 max_steps_per_epoch=args.max_steps_per_epoch,
             )
@@ -402,6 +413,7 @@ def main() -> None:
             checkpoint_every_steps=legacy_checkpoint_every_steps,
             host_prefetch_size=legacy_host_prefetch,
             device_prefetch_size=legacy_device_prefetch,
+            use_data_parallel=args.data_parallel,
             max_steps_total=args.max_steps,
             max_steps_per_epoch=args.max_steps_per_epoch,
         )

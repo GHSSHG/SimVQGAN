@@ -4,12 +4,14 @@ from typing import Any, Dict, Iterator, Tuple
 
 from collections import deque, defaultdict
 import os
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core import FrozenDict, freeze
 from flax import linen as nn
+from flax import jax_utils as flax_jax_utils
 from flax.training import checkpoints as flax_ckpt
 
 from .states import (
@@ -139,6 +141,7 @@ def train_model_from_pod5(
     host_prefetch_size: int = 64,
     device_prefetch_size: int = 16,
     disc_lr_mult: float = 0.1,
+    use_data_parallel: bool | None = None,
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
 ):
@@ -202,6 +205,14 @@ def train_model_from_pod5(
         dec_channel_schedule=dec_channels,
         dec_num_res_blocks=dec_num_res_blocks,
         dec_up_strides=dec_up_strides,
+        remat_encoder=bool(mcfg.get("remat_encoder", False)),
+        remat_decoder=bool(mcfg.get("remat_decoder", False)),
+        pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
+        post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
+        transformer_heads=int(mcfg.get("transformer_heads", 4)),
+        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
+        transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
+        remat_transformer=bool(mcfg.get("remat_transformer", False)),
     )
     disc_cfg = dict(mcfg.get("discriminator", {}))
     disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
@@ -239,6 +250,19 @@ def train_model_from_pod5(
         init_batch = init_batch[..., 0]
     _, L = init_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
+    ndev = max(1, int(jax.local_device_count()))
+    data_parallel = (ndev > 1) if use_data_parallel is None else (bool(use_data_parallel) and ndev > 1)
+    if bool(use_data_parallel) and ndev <= 1:
+        _log("[warn] data_parallel requested, but only one local device is visible; falling back to single-device.")
+    if data_parallel and (B % ndev != 0):
+        raise ValueError(
+            f"Global batch_size={B} must be divisible by local_device_count={ndev} for data parallel training."
+        )
+    per_device_batch = (B // ndev) if data_parallel else B
+    if data_parallel:
+        _log(
+            f"[setup] Data parallel enabled on {ndev} devices (global_batch={B}, per_device_batch={per_device_batch})."
+        )
 
     host_prefetch_size = max(1, int(host_prefetch_size))
     device_prefetch_size = max(1, int(device_prefetch_size))
@@ -257,7 +281,7 @@ def train_model_from_pod5(
     gen_state, _ = create_generator_state(
         gen_init_rng,
         generator,
-        (B, L),
+        (per_device_batch, L),
         lr_value,
         grad_clip=grad_clip,
         group_lrs={
@@ -269,7 +293,7 @@ def train_model_from_pod5(
     disc_state, _ = create_discriminator_state(
         disc_init_rng,
         discriminator,
-        (B, L),
+        (per_device_batch, L),
         learning_rate=lr_value * float(disc_lr_mult),
         grad_clip=grad_clip,
     )
@@ -293,6 +317,30 @@ def train_model_from_pod5(
     if not isinstance(disc_state.params, FrozenDict):
         disc_state = disc_state.replace(params=freeze(disc_state.params))
 
+    def _is_replicated_state(state: Any) -> bool:
+        step = getattr(state, "step", None)
+        if step is None:
+            return False
+        ndim = getattr(step, "ndim", 0)
+        return bool(ndim and int(ndim) > 0)
+
+    def _ensure_replicated_states() -> None:
+        nonlocal gen_state, disc_state
+        if not data_parallel:
+            return
+        if not _is_replicated_state(gen_state):
+            gen_state = flax_jax_utils.replicate(gen_state)
+        if not _is_replicated_state(disc_state):
+            disc_state = flax_jax_utils.replicate(disc_state)
+
+    def _state_step_as_int(state: Any) -> int:
+        step = getattr(state, "step", 0)
+        if getattr(step, "ndim", 0):
+            step = step[0]
+        return int(jax.device_get(step))
+
+    _ensure_replicated_states()
+
     def _make_data_iterator() -> tuple[Prefetcher, Iterator[np.ndarray]]:
         host_iter = Prefetcher(
             ds.batches(batch_size=B, drop_last=True, files_cycle=False),
@@ -302,7 +350,7 @@ def train_model_from_pod5(
             make_device_prefetcher(
                 host_iter,
                 device_prefetch_size=device_prefetch_size,
-                shard_for_multigpu=False,
+                shard_for_multigpu=data_parallel,
                 global_batch_size=B,
             )
         )
@@ -354,21 +402,46 @@ def train_model_from_pod5(
         _log(msg)
         _log_wandb(floats, step)
 
-    # Optional compile warmup on dummy batch to avoid long stalls on first real step.
-    if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
-        _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
-        warm_rng, step_rng = jax.random.split(step_rng)
-        dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
-        disc_mask_warm = jnp.asarray(_disc_mask_for_step(0), dtype=jnp.float32)
-        compute_grads(
-            gen_state,
-            disc_state,
-            dummy_batch,
-            warm_rng,
-            loss_weights,
-            disc_mask_warm,
-        )
-        _log("[warmup] Compile finished; starting real data iterator.")
+    if data_parallel:
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
+        def _p_train_step(gen_state, disc_state, batch, apply_rngs, disc_mask):
+            g_grads, d_grads, logs, _ = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rngs,
+                loss_weights,
+                disc_mask,
+            )
+            g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
+            d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
+            reduced_logs = {}
+            for k, v in logs.items():
+                if k in ("_code_hist_counts", "_code_hist_total"):
+                    reduced_logs[k] = jax.lax.psum(v, "data")
+                else:
+                    reduced_logs[k] = jax.lax.pmean(v, "data")
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
+            return gen_state, disc_state, reduced_logs
+        _jit_train_step = None
+    else:
+        _p_train_step = None
+
+        @jax.jit
+        def _jit_train_step(gen_state, disc_state, batch, apply_rng, disc_mask):
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rng,
+                loss_weights,
+                disc_mask,
+            )
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+            gen_state = gen_state.replace(vq_vars=new_vq)
+            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
+            return gen_state, disc_state, logs
 
     # Optional resume
     if resume_from is not None and os.path.exists(resume_from):
@@ -377,14 +450,37 @@ def train_model_from_pod5(
             if isinstance(ckpt, dict) and "gen" in ckpt and "disc" in ckpt:
                 gen_state = _with_vq_default(ckpt["gen"])
                 disc_state = ckpt["disc"]
+                _ensure_replicated_states()
                 _log(f"[resume] Restored from {resume_from}")
         except Exception as _:
             pass
 
+    # Optional compile warmup on dummy batch to avoid long stalls on first real step.
+    if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
+        _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
+        warm_rng, step_rng = jax.random.split(step_rng)
+        disc_mask_warm = jnp.asarray(_disc_mask_for_step(0), dtype=jnp.float32)
+        if data_parallel:
+            warm_rngs = jax.random.split(warm_rng, ndev)
+            dummy_batch = jnp.zeros((ndev, per_device_batch, L), dtype=jnp.float32)
+            _p_train_step(gen_state, disc_state, dummy_batch, warm_rngs, disc_mask_warm)
+        else:
+            dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
+            _jit_train_step(
+                gen_state,
+                disc_state,
+                dummy_batch,
+                warm_rng,
+                disc_mask_warm,
+            )
+        _log("[warmup] Compile finished; starting real data iterator.")
+
     code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
-    global_step = 0
+    global_step = _state_step_as_int(gen_state)
     next_checkpoint_step = (
-        checkpoint_every_steps_int if checkpoint_every_steps_int > 0 else None
+        ((global_step // checkpoint_every_steps_int) + 1) * checkpoint_every_steps_int
+        if checkpoint_every_steps_int > 0
+        else None
     )
 
     def _consume_batch(
@@ -395,21 +491,26 @@ def train_model_from_pod5(
         nonlocal step_rng, gen_state, disc_state
         step_rng, apply_rng = jax.random.split(step_rng)
         disc_mask = _disc_mask_for_step(global_step_idx)
-        logs: Dict[str, Any] = {}
-        new_vq = None
-        g_grads, d_grads, logs, new_vq = compute_grads(
-            gen_state,
-            disc_state,
-            batch,
-            apply_rng,
-            loss_weights,
-            disc_mask,
-        )
-        d_grads = _force_frozen(d_grads)
-        disc_state = disc_state.apply_gradients(grads=d_grads)
-        if new_vq is not None:
-            gen_state = gen_state.replace(vq_vars=_force_frozen(new_vq))
-        logs = dict(logs)
+        if data_parallel:
+            apply_rngs = jax.random.split(apply_rng, ndev)
+            gen_state, disc_state, logs = _p_train_step(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rngs,
+                disc_mask,
+            )
+            logs = jax.tree_util.tree_map(lambda x: x[0], logs)
+            logs = dict(logs)
+        else:
+            gen_state, disc_state, logs = _jit_train_step(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rng,
+                disc_mask,
+            )
+            logs = dict(logs)
         hist_counts = logs.pop("_code_hist_counts", None)
         hist_total = logs.pop("_code_hist_total", None)
         if hist_counts is not None and hist_total is not None:
@@ -420,8 +521,6 @@ def train_model_from_pod5(
             if agg is not None:
                 logs.setdefault("code_usage", agg[0])
                 logs.setdefault("perplexity", agg[1])
-        g_grads = _force_frozen(g_grads)
-        gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
         return logs
 
     stop_training = False
@@ -454,9 +553,11 @@ def train_model_from_pod5(
                     and next_checkpoint_step is not None
                     and global_step >= next_checkpoint_step
                 ):
+                    save_gen = flax_jax_utils.unreplicate(gen_state) if data_parallel else gen_state
+                    save_disc = flax_jax_utils.unreplicate(disc_state) if data_parallel else disc_state
                     flax_ckpt.save_checkpoint(
                         ckpt_dir,
-                        target={"gen": gen_state, "disc": disc_state},
+                        target={"gen": save_gen, "disc": save_disc},
                         step=global_step,
                         overwrite=True,
                     )
@@ -481,6 +582,9 @@ def train_model_from_pod5(
             log_fp.close()
         except Exception:
             pass
+    if data_parallel:
+        gen_state = flax_jax_utils.unreplicate(gen_state)
+        disc_state = flax_jax_utils.unreplicate(disc_state)
     return gen_state, disc_state
 
 
