@@ -2,17 +2,17 @@
   "seed": 42,
   "train": {
     "epochs": 3,
-    "batch_size": 384,
+    "batch_size": 1536,
     "data_parallel": true,
-    "learning_rate": 0.0001,
+    "learning_rate": 0.0002,
     "host_prefetch_size": 32,
     "device_prefetch_size": 8,
     "grad_clip": 1.0,
-    "disc_start_step": 50000,
-    "disc_warmup_steps": 20000,
+    "disc_start_step": 20000,
+    "disc_warmup_steps": 10000,
     "log_every_steps": 100,
     "loss_weights": {
-      "time_l1": 2.0,
+      "time_l1": 5.0,
       "commit": 1.0,
       "gan": 0.03,
       "feature": 0.1
@@ -21,11 +21,11 @@
   "model": {
     "base_channels": 32,
     "enc_channels": [
-      32,
-      32,
       64,
       64,
-      128
+      128,
+      128,
+      256
     ],
     "enc_down_strides": [
       2,
@@ -34,16 +34,16 @@
       1
     ],
     "enc_num_res_blocks": 2,
-    "latent_dim": 128,
-    "codebook_size": 16384,
+    "latent_dim": 256,
+    "codebook_size": 65536,
     "beta": 0.25,
     "legacy_beta": false,
     "dec_channels": [
+      256,
+      128,
       128,
       64,
-      64,
-      32,
-      32
+      64
     ],
     "dec_up_strides": [
       1,
@@ -52,8 +52,8 @@
       2
     ],
     "dec_num_res_blocks": 2,
-    "remat_encoder": true,
-    "remat_decoder": true,
+    "remat_encoder": false,
+    "remat_decoder": false,
     "discriminator": {
       "channels": [
         32,
@@ -69,7 +69,7 @@
       ],
       "kernel_size": 15,
       "resblock_layers": 2,
-      "remat": true
+      "remat": false
     },
     "pre_quant_transformer_layers": 2,
     "post_quant_transformer_layers": 2,
@@ -110,7 +110,7 @@
     "wandb": {
       "enabled": true,
       "project": "simvq-local",
-      "run_name": "v1.0",
+      "run_name": "v2.0",
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },
