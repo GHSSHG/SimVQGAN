@@ -97,7 +97,7 @@ def make_device_prefetcher(host_iter, device_prefetch_size=2, shard_for_multigpu
                 assert x.shape[0] % ndev == 0, f"global batch {x.shape[0]} not divisible by {ndev}"
                 per = x.shape[0] // ndev
                 return x.reshape((ndev, per) + x.shape[1:])
-            return jax.tree_map(_reshape, batch)
+            return jax.tree_util.tree_map(_reshape, batch)
         sharded_iter = (_shard(b) for b in host_iter)
         return prefetch_to_device(sharded_iter, device_prefetch_size)
     else:

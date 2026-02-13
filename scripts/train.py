@@ -199,6 +199,19 @@ def main() -> None:
         model_cfg = cfg.get("model", {})
         data_cfg = cfg.get("data", {})
         ckpt_cfg = cfg.get("checkpoint", {})
+
+        beta_cfg = model_cfg.get("beta", None)
+        legacy_beta_cfg = model_cfg.get("legacy_beta", None)
+        if beta_cfg is not None or legacy_beta_cfg is not None:
+            beta_value = float(model_cfg.get("beta", 0.25))
+            legacy_beta_value = bool(model_cfg.get("legacy_beta", False))
+            if beta_value != 0.25 or legacy_beta_value:
+                raise ValueError(
+                    "DiVeQ mode does not use model.beta / model.legacy_beta. "
+                    "Please remove legacy VQ-VAE auxiliary-loss settings from the model config."
+                )
+            print("[warn] model.beta and model.legacy_beta are deprecated in DiVeQ mode and ignored.")
+
         def _positive_int(value: Any) -> int | None:
             if value in (None, "", False):
                 return None
@@ -219,6 +232,7 @@ def main() -> None:
         log_every_steps = int(train_cfg.get("log_every_steps", 100))
         if args.log_every_steps is not None:
             log_every_steps = int(args.log_every_steps)
+        codebook_stats_every_steps = train_cfg.get("codebook_stats_every_steps", None)
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
         if args.data_parallel is not None:
@@ -237,6 +251,10 @@ def main() -> None:
             "gan": float(lw.get("gan", 0.03)),
             "feature": float(lw.get("feature", 0.1)),
         }
+        if abs(float(loss_weights.get("commit", 0.0))) > 1e-12:
+            raise ValueError(
+                "DiVeQ removes VQ auxiliary losses. Set train.loss_weights.commit to 0.0."
+            )
 
         # adversarial scheduling (step-based)
         disc_start_step = int(train_cfg.get("disc_start_step", 0))
@@ -314,6 +332,7 @@ def main() -> None:
                 batch_size=batch_size,
                 resume_from=resume_from,
                 log_every_steps=log_every_steps,
+                codebook_stats_every_steps=codebook_stats_every_steps,
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
                 codebook_lr_mult=codebook_lr_mult,
@@ -395,7 +414,7 @@ def main() -> None:
         wandb_logger = init_wandb(args.wandb_project or "simvq-nanopore", run_name, wandb_payload, api_key=None)
     default_loss_weights = {
         "time_l1": 2.0,
-        "commit": 1.0,
+        "commit": 0.0,
         "gan": 0.03,
         "feature": 0.1,
     }

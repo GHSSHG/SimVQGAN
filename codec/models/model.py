@@ -21,8 +21,6 @@ class SimVQAudioModel(nn.Module):
     enc_down_strides: Tuple[int, ...] = (2, 4, 5, 1)
     latent_dim: int = 128
     codebook_size: int = 16384
-    beta: float = 0.25
-    legacy_beta: bool = False
     dec_channel_schedule: Tuple[int, ...] = (128, 64, 64, 32, 32)
     dec_num_res_blocks: int = 2
     dec_up_strides: Tuple[int, ...] = (1, 5, 4, 2)
@@ -37,6 +35,8 @@ class SimVQAudioModel(nn.Module):
     transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.0
     remat_transformer: bool = False
+    diveq_sigma2: float = 1e-3
+    search_chunk_size: int = 2048
 
     def setup(self):
         encoder_cls = SimVQEncoder1D
@@ -82,9 +82,10 @@ class SimVQAudioModel(nn.Module):
         self.quantizer = SimVQ1D(
             codebook_size=self.codebook_size,
             code_dim=self.latent_dim,
-            beta=self.beta,
-            legacy_beta=self.legacy_beta,
-            dtype=self.enc_dtype,
+            diveq_sigma2=self.diveq_sigma2,
+            search_chunk_size=max(1, int(self.search_chunk_size)),
+            # Keep quantizer/codebook statistics in fp32 even when model compute is bf16.
+            dtype=self.param_dtype,
             param_dtype=self.param_dtype,
         )
         tf_block_cls = TransformerBlock1D
@@ -122,7 +123,8 @@ class SimVQAudioModel(nn.Module):
         train: bool = False,
         offset: int = 0,
         rng: jax.random.KeyArray,
-    ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, jnp.ndarray]]:
+        collect_codebook_stats: bool = True,
+    ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
         h_e = self.encoder(x, train=train, offset=offset)
         h_qin = self.quant_conv(h_e)
         if self.pre_quant_blocks:
@@ -132,7 +134,12 @@ class SimVQAudioModel(nn.Module):
             quant_rng = split_rngs[-1]
         else:
             _, quant_rng = jax.random.split(rng)
-        z_q, info = self.quantizer(h_qin, rng=quant_rng, train=train)
+        z_q, info = self.quantizer(
+            h_qin,
+            rng=quant_rng,
+            train=train,
+            collect_codebook_stats=collect_codebook_stats,
+        )
         return h_qin, z_q, info
 
     def decode(self, z_q: jnp.ndarray, *, train: bool = False, rng: jax.random.KeyArray | None = None):
@@ -157,9 +164,16 @@ class SimVQAudioModel(nn.Module):
         train: bool = False,
         offset: int = 0,
         rng: jax.random.KeyArray,
+        collect_codebook_stats: bool = True,
     ) -> Dict[str, Any]:
         _, enc_rng, dec_rng = jax.random.split(rng, 3)
-        z_e, z_q, info = self.encode(x, train=train, offset=offset, rng=enc_rng)
+        z_e, z_q, info = self.encode(
+            x,
+            train=train,
+            offset=offset,
+            rng=enc_rng,
+            collect_codebook_stats=collect_codebook_stats,
+        )
         wave_hat, dec_aux = self.decode(z_q, train=train, rng=dec_rng)
         usage_ratio = info.get("usage_ratio", jnp.array(0.0, dtype=z_e.dtype))
         return {

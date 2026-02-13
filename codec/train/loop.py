@@ -117,6 +117,25 @@ def _logs_to_float_dict(logs: Dict[str, Any]) -> Dict[str, float]:
     return floats
 
 
+def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
+    if dtype_value is None:
+        return fallback
+    if isinstance(dtype_value, str):
+        key = dtype_value.strip().lower()
+        mapping = {
+            "fp32": jnp.float32,
+            "float32": jnp.float32,
+            "bf16": jnp.bfloat16,
+            "bfloat16": jnp.bfloat16,
+            "fp16": jnp.float16,
+            "float16": jnp.float16,
+        }
+        if key not in mapping:
+            raise ValueError(f"Unsupported dtype {dtype_value}.")
+        return mapping[key]
+    return dtype_value
+
+
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
@@ -144,6 +163,7 @@ def train_model_from_pod5(
     use_data_parallel: bool | None = None,
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
+    codebook_stats_every_steps: int | None = None,
 ):
     import jax
     from ..models.model import SimVQAudioModel
@@ -185,6 +205,9 @@ def train_model_from_pod5(
 
     latent_dim = int(mcfg.get("latent_dim", 128))
     base_channels = int(mcfg.get("base_channels", 32))
+    compute_dtype = _resolve_dtype(mcfg.get("compute_dtype", "bf16"), fallback=jnp.float32)
+    param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
+    disc_compute_dtype = _resolve_dtype(mcfg.get("disc_dtype", mcfg.get("compute_dtype", "bf16")), fallback=jnp.float32)
     enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
     enc_down_strides = _tuple_cfg("enc_down_strides", (2, 4, 5, 1))
@@ -200,11 +223,12 @@ def train_model_from_pod5(
         enc_down_strides=enc_down_strides,
         latent_dim=latent_dim,
         codebook_size=int(mcfg.get("codebook_size", 16384)),
-        beta=float(mcfg.get("beta", 0.25)),
-        legacy_beta=bool(mcfg.get("legacy_beta", False)),
         dec_channel_schedule=dec_channels,
         dec_num_res_blocks=dec_num_res_blocks,
         dec_up_strides=dec_up_strides,
+        enc_dtype=compute_dtype,
+        dec_dtype=compute_dtype,
+        param_dtype=param_dtype,
         remat_encoder=bool(mcfg.get("remat_encoder", False)),
         remat_decoder=bool(mcfg.get("remat_decoder", False)),
         pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
@@ -213,6 +237,8 @@ def train_model_from_pod5(
         transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
         transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
         remat_transformer=bool(mcfg.get("remat_transformer", False)),
+        diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
+        search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
     )
     disc_cfg = dict(mcfg.get("discriminator", {}))
     disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
@@ -225,6 +251,8 @@ def train_model_from_pod5(
         strides=disc_strides,
         kernel_size=int(disc_cfg.get("kernel_size", 15)),
         resblock_layers=int(disc_cfg.get("resblock_layers", 2)),
+        dtype=disc_compute_dtype,
+        param_dtype=param_dtype,
     )
 
     # Probe shape using a single-worker iterator so we don't leave background threads running.
@@ -358,12 +386,16 @@ def train_model_from_pod5(
     if loss_weights is None:
         loss_weights = {
             "time_l1": 2.0,
-            "commit": 1.0,
+            "commit": 0.0,
             "gan": 0.03,
             "feature": 0.1,
         }
     else:
         loss_weights = dict(loss_weights)
+    if abs(float(loss_weights.get("commit", 0.0))) > 1e-12:
+        raise ValueError(
+            "DiVeQ mode removes VQ auxiliary losses; set loss_weights.commit to 0.0."
+        )
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
@@ -379,6 +411,9 @@ def train_model_from_pod5(
     total_step_cap = _safe_int(max_steps_total)
     epoch_step_cap = _safe_int(max_steps_per_epoch)
     log_every_steps_int = max(0, int(log_every_steps))
+    stats_every_steps_int = _safe_int(codebook_stats_every_steps)
+    if stats_every_steps_int is None:
+        stats_every_steps_int = max(1, log_every_steps_int if log_every_steps_int > 0 else 100)
     checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
     disc_start_step_int = max(0, int(disc_start_step))
     disc_warmup_steps_int = max(0, int(disc_warmup_steps))
@@ -412,6 +447,25 @@ def train_model_from_pod5(
                 apply_rngs,
                 loss_weights,
                 disc_mask,
+                collect_codebook_stats=False,
+            )
+            g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
+            d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
+            reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
+            return gen_state, disc_state, reduced_logs
+
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
+        def _p_train_step_with_stats(gen_state, disc_state, batch, apply_rngs, disc_mask):
+            g_grads, d_grads, logs, _ = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rngs,
+                loss_weights,
+                disc_mask,
+                collect_codebook_stats=True,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
             d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
@@ -425,8 +479,10 @@ def train_model_from_pod5(
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, disc_state, reduced_logs
         _jit_train_step = None
+        _jit_train_step_with_stats = None
     else:
         _p_train_step = None
+        _p_train_step_with_stats = None
 
         @jax.jit
         def _jit_train_step(gen_state, disc_state, batch, apply_rng, disc_mask):
@@ -437,6 +493,23 @@ def train_model_from_pod5(
                 apply_rng,
                 loss_weights,
                 disc_mask,
+                collect_codebook_stats=False,
+            )
+            disc_state = disc_state.apply_gradients(grads=d_grads)
+            gen_state = gen_state.replace(vq_vars=new_vq)
+            gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
+            return gen_state, disc_state, logs
+
+        @jax.jit
+        def _jit_train_step_with_stats(gen_state, disc_state, batch, apply_rng, disc_mask):
+            g_grads, d_grads, logs, new_vq = compute_grads(
+                gen_state,
+                disc_state,
+                batch,
+                apply_rng,
+                loss_weights,
+                disc_mask,
+                collect_codebook_stats=True,
             )
             disc_state = disc_state.apply_gradients(grads=d_grads)
             gen_state = gen_state.replace(vq_vars=new_vq)
@@ -457,16 +530,26 @@ def train_model_from_pod5(
 
     # Optional compile warmup on dummy batch to avoid long stalls on first real step.
     if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
-        _log("[warmup] Compiling training step on dummy batch; this may take a couple of minutes on first run.")
+        _log("[warmup] Compiling training step variants on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
         disc_mask_warm = jnp.asarray(_disc_mask_for_step(0), dtype=jnp.float32)
         if data_parallel:
             warm_rngs = jax.random.split(warm_rng, ndev)
             dummy_batch = jnp.zeros((ndev, per_device_batch, L), dtype=jnp.float32)
             _p_train_step(gen_state, disc_state, dummy_batch, warm_rngs, disc_mask_warm)
+            # Compile the infrequent codebook-stats path as well to avoid a runtime stall
+            # when the first stats step is reached (e.g., step 200).
+            _p_train_step_with_stats(gen_state, disc_state, dummy_batch, warm_rngs, disc_mask_warm)
         else:
             dummy_batch = jnp.zeros((B, L), dtype=jnp.float32)
             _jit_train_step(
+                gen_state,
+                disc_state,
+                dummy_batch,
+                warm_rng,
+                disc_mask_warm,
+            )
+            _jit_train_step_with_stats(
                 gen_state,
                 disc_state,
                 dummy_batch,
@@ -491,9 +574,11 @@ def train_model_from_pod5(
         nonlocal step_rng, gen_state, disc_state
         step_rng, apply_rng = jax.random.split(step_rng)
         disc_mask = _disc_mask_for_step(global_step_idx)
+        collect_codebook_stats = ((global_step_idx + 1) % stats_every_steps_int == 0)
         if data_parallel:
             apply_rngs = jax.random.split(apply_rng, ndev)
-            gen_state, disc_state, logs = _p_train_step(
+            train_step_fn = _p_train_step_with_stats if collect_codebook_stats else _p_train_step
+            gen_state, disc_state, logs = train_step_fn(
                 gen_state,
                 disc_state,
                 batch,
@@ -503,7 +588,8 @@ def train_model_from_pod5(
             logs = jax.tree_util.tree_map(lambda x: x[0], logs)
             logs = dict(logs)
         else:
-            gen_state, disc_state, logs = _jit_train_step(
+            train_step_fn = _jit_train_step_with_stats if collect_codebook_stats else _jit_train_step
+            gen_state, disc_state, logs = train_step_fn(
                 gen_state,
                 disc_state,
                 batch,
@@ -513,7 +599,7 @@ def train_model_from_pod5(
             logs = dict(logs)
         hist_counts = logs.pop("_code_hist_counts", None)
         hist_total = logs.pop("_code_hist_total", None)
-        if hist_counts is not None and hist_total is not None:
+        if collect_codebook_stats and hist_counts is not None and hist_total is not None:
             hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
             total_np = float(jax.device_get(hist_total))
             code_hist_window.add(hist_np, total_np)
