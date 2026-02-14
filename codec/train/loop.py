@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Iterator, Tuple
+from typing import Any, Dict, Iterator
 
-from collections import deque, defaultdict
+from collections import deque
 import os
 from functools import partial
 
@@ -16,36 +16,24 @@ from flax.training import checkpoints as flax_ckpt
 
 from .states import (
     GeneratorTrainState,
-    DiscriminatorTrainState,
     create_generator_state,
     create_discriminator_state,
 )
 from .step import compute_grads
-from .losses import compute_generator_losses, hinge_d_loss
 from ..data.prefetch import Prefetcher, make_device_prefetcher
 from ..data.pod5_dataset import NanoporeSignalDataset
-
-
-def _force_frozen(tree):
-    from flax.core import FrozenDict, freeze
-    from collections.abc import Mapping
-    if isinstance(tree, FrozenDict):
-        tree = dict(tree)
-    if isinstance(tree, Mapping):
-        return freeze({k: _force_frozen(v) for k, v in tree.items()})
-    return tree
 
 
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
     "reconstruct_loss": "reconstruct_loss",
-    "commit_loss": "commit_loss",
     "weighted_reconstruct_loss": "weighted_reconstruct_loss",
-    "weighted_commit_loss": "weighted_commit_loss",
     "gan_raw_loss": "gan_loss",
     "weighted_gan_loss": "weighted_gan_loss",
     "feature_loss": "feature_loss",
     "weighted_feature_loss": "weighted_feature_loss",
+    "q_z_dist": "q_z_dist",
+    "log_q_z_dist": "log_q_z_dist",
     "perplexity": "codebook_perplexity",
     "code_usage": "codebook_util",
     "disc_loss": "disc_loss",
@@ -153,7 +141,6 @@ def train_model_from_pod5(
     checkpoint_every_steps: int = 5000,
     wandb_logger: Any | None = None,
     # Optimization knobs
-    codebook_lr_mult: float = 0.0,
     freeze_W: bool = False,
     grad_clip: float = 1.0,
     disc_warmup_steps: int = 0,
@@ -314,7 +301,6 @@ def train_model_from_pod5(
         grad_clip=grad_clip,
         group_lrs={
             "default": 1.0,
-            "codebook": float(codebook_lr_mult),
             "W": 0.0 if bool(freeze_W) else 1.0,
         },
     )
@@ -386,15 +372,18 @@ def train_model_from_pod5(
     if loss_weights is None:
         loss_weights = {
             "time_l1": 2.0,
-            "commit": 0.0,
             "gan": 0.03,
             "feature": 0.1,
         }
     else:
         loss_weights = dict(loss_weights)
-    if abs(float(loss_weights.get("commit", 0.0))) > 1e-12:
+    if "commit" in loss_weights:
         raise ValueError(
-            "DiVeQ mode removes VQ auxiliary losses; set loss_weights.commit to 0.0."
+            "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
+        )
+    if "diveq" in loss_weights:
+        raise ValueError(
+            "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
         )
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
@@ -437,6 +426,14 @@ def train_model_from_pod5(
         _log(msg)
         _log_wandb(floats, step)
 
+    def _maybe_update_disc(state, grads, disc_mask):
+        return jax.lax.cond(
+            disc_mask > 0.0,
+            lambda s: s.apply_gradients(grads=grads),
+            lambda s: s,
+            state,
+        )
+
     if data_parallel:
         @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
         def _p_train_step(gen_state, disc_state, batch, apply_rngs, disc_mask):
@@ -452,7 +449,7 @@ def train_model_from_pod5(
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
             d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
             reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-            disc_state = disc_state.apply_gradients(grads=d_grads)
+            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, disc_state, reduced_logs
 
@@ -475,7 +472,7 @@ def train_model_from_pod5(
                     reduced_logs[k] = jax.lax.psum(v, "data")
                 else:
                     reduced_logs[k] = jax.lax.pmean(v, "data")
-            disc_state = disc_state.apply_gradients(grads=d_grads)
+            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, disc_state, reduced_logs
         _jit_train_step = None
@@ -495,7 +492,7 @@ def train_model_from_pod5(
                 disc_mask,
                 collect_codebook_stats=False,
             )
-            disc_state = disc_state.apply_gradients(grads=d_grads)
+            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.replace(vq_vars=new_vq)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, disc_state, logs
@@ -511,7 +508,7 @@ def train_model_from_pod5(
                 disc_mask,
                 collect_codebook_stats=True,
             )
-            disc_state = disc_state.apply_gradients(grads=d_grads)
+            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.replace(vq_vars=new_vq)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, disc_state, logs
@@ -525,7 +522,7 @@ def train_model_from_pod5(
                 disc_state = ckpt["disc"]
                 _ensure_replicated_states()
                 _log(f"[resume] Restored from {resume_from}")
-        except Exception as _:
+        except Exception:
             pass
 
     # Optional compile warmup on dummy batch to avoid long stalls on first real step.
@@ -662,7 +659,6 @@ def train_model_from_pod5(
         _log(
             f"[epoch {epoch_idx}/{epochs_limit}] completed {steps_this_epoch} steps (global={global_step}).{usage_log}"
         )
-        last_epoch_steps = steps_this_epoch
     if log_fp is not None:
         try:
             log_fp.close()
@@ -671,143 +667,4 @@ def train_model_from_pod5(
     if data_parallel:
         gen_state = flax_jax_utils.unreplicate(gen_state)
         disc_state = flax_jax_utils.unreplicate(disc_state)
-    return gen_state, disc_state
-
-
-def train_more(
-    gen_state: GeneratorTrainState,
-    disc_state: DiscriminatorTrainState,
-    generator,
-    *,
-    ds: NanoporeSignalDataset,
-    num_epochs: int,
-    loss_weights: Dict[str, float],
-    ckpt_dir: str | None,
-    save_every: int,
-    log_file: str | None = None,
-    disc_start: int = 6000,
-    disc_ramp: int = 4000,
-):
-    if num_epochs <= 0:
-        raise ValueError("num_epochs must be positive when continuing training.")
-    probe_iter = ds.batches(batch_size=1, drop_last=True, files_cycle=False)
-    probe = np.asarray(next(probe_iter))
-    if probe.ndim == 3 and probe.shape[1] == 1:
-        probe = probe[:, 0, :]
-    elif probe.ndim == 3 and probe.shape[-1] == 1:
-        probe = probe[..., 0]
-    B = probe.shape[0]
-    L = probe.shape[-1]
-
-    def _make_iter():
-        host = Prefetcher(ds.batches(batch_size=B, drop_last=True, files_cycle=False), prefetch_size=64)
-        dev_iter = iter(make_device_prefetcher(host, device_prefetch_size=16, shard_for_multigpu=False))
-        return host, dev_iter
-
-    step_rng = jax.random.PRNGKey(int(getattr(gen_state, "step", 0)))
-
-    # prepare log file
-    log_path = log_file or (os.path.join(ckpt_dir, "train_more.log") if ckpt_dir else None)
-    log_fp = None
-    if log_path is not None:
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        log_fp = open(log_path, "a", encoding="utf-8")
-
-    def _log(msg: str):
-        print(msg, flush=True)
-        if log_fp is not None:
-            try:
-                log_fp.write(msg + "\n")
-                log_fp.flush()
-            except Exception:
-                pass
-
-    code_hist_window = _CodebookStatsWindow(window_size=_CODEBOOK_STATS_WINDOW)
-
-    current_global = int(getattr(gen_state, "step", 0))
-
-    def _train_step(batch, apply_rng):
-        nonlocal gen_state, disc_state
-        current_step = int(getattr(gen_state, "step", 0))
-        if current_step < int(disc_start):
-            disc_mask = 0.0
-        elif disc_ramp <= 0:
-            disc_mask = 1.0
-        else:
-            progress = (current_step - int(disc_start)) / float(disc_ramp)
-            disc_mask = float(np.clip(progress, 0.0, 1.0))
-        logs = {}
-        new_vq = None
-        g_grads, d_grads, logs, new_vq = compute_grads(
-            gen_state,
-            disc_state,
-            batch,
-            apply_rng,
-            loss_weights,
-            disc_mask,
-        )
-        d_grads = _force_frozen(d_grads)
-        disc_state = disc_state.apply_gradients(grads=d_grads)
-        g_grads = _force_frozen(g_grads)
-        gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=new_vq)
-        logs = dict(logs)
-        hist_counts = logs.pop("_code_hist_counts", None)
-        hist_total = logs.pop("_code_hist_total", None)
-        if hist_counts is not None and hist_total is not None:
-            hist_np = np.asarray(jax.device_get(hist_counts), dtype=np.float64)
-            total_np = float(jax.device_get(hist_total))
-            code_hist_window.add(hist_np, total_np)
-        usage_ratio = (
-            float(jax.device_get(jnp.asarray(logs["code_usage"])))
-            if "code_usage" in logs
-            else 0.0
-        )
-        logs["code_usage"] = usage_ratio
-        agg = code_hist_window.metrics()
-        if agg is not None:
-            usage, perplexity = agg
-            logs["code_usage"] = usage
-            logs["perplexity"] = perplexity
-        formatted = _simvq_style_logs(logs, "train")
-        return _logs_to_float_dict(formatted)
-
-    for epoch_idx in range(1, num_epochs + 1):
-        host_iter, data_iter = _make_iter()
-        steps_this_epoch = 0
-        try:
-            while True:
-                try:
-                    batch = next(data_iter)
-                except StopIteration:
-                    break
-                step_rng, apply_rng = jax.random.split(step_rng)
-                float_logs = _train_step(batch, apply_rng)
-                steps_this_epoch += 1
-                current_global = int(getattr(gen_state, "step", 0))
-                if steps_this_epoch == 1 or (current_global % 200 == 0):
-                    _log(
-                        "step "
-                        + str(current_global)
-                        + ", "
-                        + ", ".join(f"{k}: {v:.4f}" for k, v in float_logs.items())
-                    )
-                if ckpt_dir and save_every > 0 and (current_global % save_every == 0):
-                    flax_ckpt.save_checkpoint(
-                        ckpt_dir,
-                        target={"gen": gen_state, "disc": disc_state},
-                        step=current_global,
-                        overwrite=True,
-                    )
-                    _log(f"[ckpt] saved step={current_global} to {ckpt_dir}")
-        finally:
-            host_iter.close()
-        if steps_this_epoch == 0:
-            raise ValueError(f"Epoch {epoch_idx} yielded no batches; check dataset configuration.")
-        _log(f"[train_more epoch {epoch_idx}/{num_epochs}] completed {steps_this_epoch} steps (global step={current_global}).")
-
-    if log_fp is not None:
-        try:
-            log_fp.close()
-        except Exception:
-            pass
     return gen_state, disc_state

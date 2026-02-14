@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import queue
-from typing import Iterable, Iterator, Optional
+from typing import Iterable, Optional
 
 import numpy as np
 import jax
@@ -81,7 +81,7 @@ class Prefetcher:
     def __enter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, tb):
+    def __exit__(self, _exc_type, _exc, _tb):
         self.close()
 
 

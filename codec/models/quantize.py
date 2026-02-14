@@ -165,8 +165,9 @@ class SimVQ1D(nn.Module):
             # Hard nearest-codeword quantization for inference.
             z_q = quant
 
-        # DiVeQ removes VQ auxiliary losses (commit/codebook); training relies on main task loss.
-        commit_loss = jnp.asarray(0.0, dtype=self.dtype)
+        # Quantization distortion metrics (useful for monitoring/auxiliary losses).
+        q_z_dist = jnp.mean(diff_norm_safe).astype(self.dtype)
+        log_q_z_dist = jnp.mean(jnp.log(diff_norm_safe)).astype(self.dtype)
 
         indices_bt = indices.reshape(B, T)
         counts = None
@@ -185,10 +186,11 @@ class SimVQ1D(nn.Module):
             usage_ratio = jnp.asarray(0.0, dtype=self.dtype)
 
         info = {
-            "commit_loss": commit_loss.astype(self.dtype),
             "perplexity": perplexity.astype(self.dtype),
             "avg_probs": (avg_probs.astype(self.dtype) if avg_probs is not None else None),
             "usage_ratio": usage_ratio,
+            "q_z_dist": q_z_dist,
+            "log_q_z_dist": log_q_z_dist,
             "token_counts": (counts.astype(self.dtype) if counts is not None else None),
             "total_tokens": (total_tokens.astype(self.dtype) if total_tokens is not None else None),
             "indices": indices_bt,

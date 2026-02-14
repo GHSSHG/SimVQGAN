@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable, List, Tuple
+from typing import Any, List, Tuple
 
 import jax.numpy as jnp
 from flax import linen as nn

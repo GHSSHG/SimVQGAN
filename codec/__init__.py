@@ -10,7 +10,6 @@ See scripts/train.py for a CLI entrypoint.
 __all__ = [
     "data",
     "jaxlayers",
-    "audio",
     "models",
     "train",
     "utils",

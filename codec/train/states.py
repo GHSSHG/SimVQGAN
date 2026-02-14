@@ -5,12 +5,11 @@ from typing import Any, Callable, Dict, Tuple
 import jax
 import jax.numpy as jnp
 from flax import struct
-from flax.core import FrozenDict, freeze, unfreeze
+from flax.core import FrozenDict
 from flax.training import train_state
 import optax
 
 from ..models.model import SimVQAudioModel
-from ..models.patchgan import PatchDiscriminator1D
 
 
 def _force_frozen(tree):
@@ -73,22 +72,20 @@ def create_generator_state(
     params = _force_frozen(variables["params"])
     vq_vars = _force_frozen(variables.get("vq", {}))
 
-    # Param-grouped optimizer: allow different LRs for codebook and W
-    # Keys in group_lrs: "default", "codebook", "W" (others fall back to "default")
+    # Param-grouped optimizer: keep explicit control for backbone and W.
     group_lrs = dict(group_lrs or {})
+    if "codebook" in group_lrs:
+        raise ValueError("SimVQ codebook lives in mutable vq vars and is not optimized via params.")
     lr_default = _scaled_lr(learning_rate, float(group_lrs.get("default", 1.0)))
-    lr_codebook = _scaled_lr(learning_rate, float(group_lrs.get("codebook", 0.0)))
     lr_W = _scaled_lr(learning_rate, float(group_lrs.get("W", 1.0)))
 
     # Build label tree for multi_transform
     flat = flatten_dict(params)
     labels = {}
-    for k, v in flat.items():
+    for k in flat:
         # k is a tuple path like ("encoder", "conv", "kernel")
         path = "/".join(k)
-        if path.endswith("/codebook") or path == "codebook":
-            labels[k] = "codebook"
-        elif path.endswith("/W") or path == "W":
+        if path.endswith("/W") or path == "W":
             labels[k] = "W"
         else:
             labels[k] = "default"
@@ -97,7 +94,6 @@ def create_generator_state(
     # Per-group transforms; lr=0.0 effectively freezes that group
     transforms = {
         "default": optax.adamw(lr_default),
-        "codebook": optax.adamw(lr_codebook),
         "W": optax.adamw(lr_W),
     }
     tx = optax.chain(

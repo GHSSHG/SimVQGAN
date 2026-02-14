@@ -5,7 +5,7 @@ import threading
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Union
 
 import numpy as np
 import pod5 as p5
@@ -295,7 +295,7 @@ class NanoporeSignalDataset:
         file_iter = self._FileIterator(valid_files, files_cycle)
         workers: list[threading.Thread] = []
 
-        def worker_main(worker_id: int) -> None:
+        def worker_main() -> None:
             try:
                 while not stop_event.is_set():
                     fp = file_iter.next()
@@ -310,8 +310,8 @@ class NanoporeSignalDataset:
             finally:
                 chunk_queue.put(sentinel)
 
-        for wid in range(worker_count):
-            t = threading.Thread(target=worker_main, args=(wid,), daemon=True)
+        for _ in range(worker_count):
+            t = threading.Thread(target=worker_main, daemon=True)
             t.start()
             workers.append(t)
 

@@ -37,7 +37,6 @@ def compute_generator_losses(
     fake_map: jnp.ndarray,
     real_feats: Sequence[jnp.ndarray],
     fake_feats: Sequence[jnp.ndarray],
-    commit_loss: jnp.ndarray,
     weights: Dict[str, float],
 ) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     l_time = l1_time_loss(y, y_hat)
@@ -49,20 +48,16 @@ def compute_generator_losses(
         return jnp.asarray(weights.get(name, default), dtype=dtype)
 
     w_recon = _weight("time_l1", 1.0)
-    w_commit = _weight("commit", 1.0)
     w_gan = _weight("gan", 0.1)
     w_feature = _weight("feature", 0.0)
     recon_term = w_recon * l_time
-    commit_term = w_commit * commit_loss
     gan_term = w_gan * l_g
     feature_term = w_feature * l_fm
-    total = recon_term + commit_term + gan_term + feature_term
+    total = recon_term + gan_term + feature_term
     logs = {
         "total_loss": total,
         "reconstruct_loss": l_time,
-        "commit_loss": commit_loss,
         "weighted_reconstruct_loss": recon_term,
-        "weighted_commit_loss": commit_term,
         "gan_raw_loss": l_g,
         "weighted_gan_loss": gan_term,
         "feature_loss": l_fm,

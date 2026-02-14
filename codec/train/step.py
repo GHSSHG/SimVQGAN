@@ -32,6 +32,7 @@ def compute_grads(
         )
         vq_vars = gen_state.vq_vars
         wave_hat = outs["wave_hat"]
+        log_q_z_dist = outs["enc"].get("log_q_z_dist", jnp.asarray(0.0, dtype=jnp.float32))
 
         def _gen_loss_with_disc(_):
             fake_map, fake_feats = disc_state.apply_fn(
@@ -55,7 +56,6 @@ def compute_grads(
                 fake_map=fake_map,
                 real_feats=real_feats,
                 fake_feats=fake_feats,
-                commit_loss=outs["enc"]["commit_loss"],
                 weights=weights,
             )
             loss_dtype = batch.dtype
@@ -66,19 +66,14 @@ def compute_grads(
         def _gen_loss_without_disc(_):
             l_time = l1_time_loss(batch, wave_hat)
             dtype = l_time.dtype
-            commit_loss = jnp.asarray(outs["enc"]["commit_loss"], dtype=dtype)
             w_recon = jnp.asarray(loss_weights.get("time_l1", 1.0), dtype=dtype)
-            w_commit = jnp.asarray(loss_weights.get("commit", 1.0), dtype=dtype)
             zero = jnp.asarray(0.0, dtype=dtype)
             recon_term = w_recon * l_time
-            commit_term = w_commit * commit_loss
-            total = recon_term + commit_term
+            total = recon_term
             logs = {
                 "total_loss": total,
                 "reconstruct_loss": l_time,
-                "commit_loss": commit_loss,
                 "weighted_reconstruct_loss": recon_term,
-                "weighted_commit_loss": commit_term,
                 "gan_raw_loss": zero,
                 "weighted_gan_loss": zero,
                 "feature_loss": zero,
@@ -94,6 +89,8 @@ def compute_grads(
         )
 
         logs = dict(logs)
+        logs["q_z_dist"] = outs["enc"].get("q_z_dist", jnp.asarray(0.0, dtype=jnp.float32))
+        logs["log_q_z_dist"] = log_q_z_dist
         if collect_codebook_stats:
             logs["perplexity"] = outs["enc"].get("perplexity", jnp.array(0.0))
             usage_ratio = outs["enc"].get("usage_ratio")

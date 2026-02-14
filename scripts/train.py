@@ -245,23 +245,29 @@ def main() -> None:
             device_prefetch_size = max(1, int(args.device_prefetch_size))
         # weights aligned with SimVQ losses
         lw = train_cfg.get("loss_weights", {})
+        if "commit" in lw:
+            raise ValueError(
+                "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
+            )
+        if "diveq" in lw:
+            raise ValueError(
+                "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
+            )
         loss_weights = {
             "time_l1": float(lw.get("time_l1", lw.get("recon", 2.0))),
-            "commit": float(lw.get("commit", 1.0)),
             "gan": float(lw.get("gan", 0.03)),
             "feature": float(lw.get("feature", 0.1)),
         }
-        if abs(float(loss_weights.get("commit", 0.0))) > 1e-12:
-            raise ValueError(
-                "DiVeQ removes VQ auxiliary losses. Set train.loss_weights.commit to 0.0."
-            )
 
         # adversarial scheduling (step-based)
         disc_start_step = int(train_cfg.get("disc_start_step", 0))
         disc_warmup_steps = int(train_cfg.get("disc_warmup_steps", 0))
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
-        codebook_lr_mult = float(optim_cfg.get("codebook_lr_mult", 0.0))
+        if "codebook_lr_mult" in optim_cfg:
+            raise ValueError(
+                "SimVQ codebook is not optimized via params; remove optim.codebook_lr_mult from the config."
+            )
         disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.1))
         freeze_W = bool(optim_cfg.get("freeze_W", False))
         model_kwargs = model_cfg
@@ -335,7 +341,6 @@ def main() -> None:
                 codebook_stats_every_steps=codebook_stats_every_steps,
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
-                codebook_lr_mult=codebook_lr_mult,
                 freeze_W=freeze_W,
                 disc_warmup_steps=disc_warmup_steps,
                 disc_lr_mult=disc_lr_mult,
@@ -414,7 +419,6 @@ def main() -> None:
         wandb_logger = init_wandb(args.wandb_project or "simvq-nanopore", run_name, wandb_payload, api_key=None)
     default_loss_weights = {
         "time_l1": 2.0,
-        "commit": 0.0,
         "gan": 0.03,
         "feature": 0.1,
     }
