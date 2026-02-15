@@ -65,7 +65,9 @@ def create_generator_state(
     grad_clip: float = 1.0,
     group_lrs: Dict[str, float] | None = None,
 ) -> Tuple[GeneratorTrainState, Dict[str, Any]]:
-    init_x = jnp.zeros(batch_shape, dtype=jnp.float32)
+    # Parameter shapes do not depend on batch size; using a tiny init batch avoids
+    # large one-off allocator growth on the default GPU before replication.
+    init_x = jnp.zeros((1, int(batch_shape[1])), dtype=jnp.float32)
     from flax.traverse_util import flatten_dict, unflatten_dict
 
     variables = model.init(rng, init_x, train=True, offset=0, rng=rng)
@@ -121,7 +123,7 @@ def create_discriminator_state(
     learning_rate: float | Callable[[int], float] = 3e-4,
     grad_clip: float = 1.0,
 ) -> Tuple[DiscriminatorTrainState, Dict[str, Any]]:
-    init_x = jnp.zeros(batch_shape, dtype=jnp.float32)
+    init_x = jnp.zeros((1, int(batch_shape[1])), dtype=jnp.float32)
     variables = discriminator.init(rng, init_x, train=True)
     params = _force_frozen(variables["params"])
     tx = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adamw(learning_rate))

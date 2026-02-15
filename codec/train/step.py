@@ -96,12 +96,6 @@ def compute_grads(
             usage_ratio = outs["enc"].get("usage_ratio")
             if usage_ratio is not None:
                 logs["code_usage"] = usage_ratio
-            token_counts = outs["enc"].get("token_counts")
-            if token_counts is not None:
-                logs["_code_hist_counts"] = token_counts
-            total_tokens = outs["enc"].get("total_tokens")
-            if total_tokens is not None:
-                logs["_code_hist_total"] = total_tokens
         aux = {"logs": logs, "wave_hat": wave_hat, "vq_vars": vq_vars}
         return total_loss, aux
 

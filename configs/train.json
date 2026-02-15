@@ -10,7 +10,10 @@
     "grad_clip": 1.0,
     "disc_start_step": 10000,
     "disc_warmup_steps": 20000,
-    "log_every_steps": 200,
+    "log_every_steps": 250,
+    "codebook_stats_every_steps": 1000,
+    "codebook_stats_until_step": 30000,
+    "scan_steps": 4,
     "loss_weights": {
       "time_l1": 5.0,
       "gan": 0.03,
@@ -91,8 +94,8 @@
       "FC02/pod5",
       "FC03/pod5"
     ],
-    "loader_workers": 24,
-    "loader_prefetch_chunks": 1024,
+    "loader_workers": 32,
+    "loader_prefetch_chunks": 4096,
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [

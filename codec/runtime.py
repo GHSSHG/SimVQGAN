@@ -60,7 +60,7 @@ def configure_runtime_env() -> None:
     gpu_available = _detect_cuda_available()
     if not gpu_available:
         raise RuntimeError("No CUDA GPU detected. SimVQGAN now requires an A100-class GPU for all runs.")
-    os.environ["JAX_PLATFORMS"] = "cuda"
+    os.environ.setdefault("JAX_PLATFORMS", "cuda,cpu")
     # Autotune hints to reduce slow_operation_alarm noise when compiling large convs.
     for flag in _XLA_FLAG_SNIPPETS:
         _ensure_flag(flag)

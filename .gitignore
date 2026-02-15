@@ -9,3 +9,4 @@ runs
 wandb
 AGENTS.md
 .*
+profiling/*

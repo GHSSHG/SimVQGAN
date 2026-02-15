@@ -50,6 +50,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--ckpt-dir", type=Path, default=None)
     p.add_argument("--log-every-steps", type=int, default=None, help="Override per-step logging interval")
+    p.add_argument(
+        "--codebook-stats-every-steps",
+        type=int,
+        default=None,
+        help="Override codebook statistics interval (set <=0 to disable periodic stats)",
+    )
+    p.add_argument(
+        "--codebook-stats-until-step",
+        type=int,
+        default=None,
+        help="Only collect codebook statistics up to this global step (inclusive)",
+    )
     p.add_argument("--checkpoints-per-epoch", type=int, default=None, help="Override number of checkpoints to emit each epoch")
     p.add_argument(
         "--loader-workers",
@@ -87,6 +99,12 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--max-steps", type=int, default=None, help="Optional cap on global training steps (for quick tests)")
     p.add_argument("--max-steps-per-epoch", type=int, default=None, help="Optional cap on steps per epoch (for quick tests)")
+    p.add_argument(
+        "--scan-steps",
+        type=int,
+        default=None,
+        help="Run N fused steps per JAX dispatch using lax.scan (default: config train.scan_steps or 1)",
+    )
     return p.parse_args()
 
 
@@ -233,6 +251,14 @@ def main() -> None:
         if args.log_every_steps is not None:
             log_every_steps = int(args.log_every_steps)
         codebook_stats_every_steps = train_cfg.get("codebook_stats_every_steps", None)
+        if args.codebook_stats_every_steps is not None:
+            codebook_stats_every_steps = args.codebook_stats_every_steps
+        codebook_stats_until_step = train_cfg.get("codebook_stats_until_step", None)
+        if args.codebook_stats_until_step is not None:
+            codebook_stats_until_step = args.codebook_stats_until_step
+        scan_steps = int(train_cfg.get("scan_steps", 1))
+        if args.scan_steps is not None:
+            scan_steps = max(1, int(args.scan_steps))
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
         if args.data_parallel is not None:
@@ -339,6 +365,7 @@ def main() -> None:
                 resume_from=resume_from,
                 log_every_steps=log_every_steps,
                 codebook_stats_every_steps=codebook_stats_every_steps,
+                codebook_stats_until_step=codebook_stats_until_step,
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
                 freeze_W=freeze_W,
@@ -350,6 +377,7 @@ def main() -> None:
                 use_data_parallel=(None if data_parallel is None else bool(data_parallel)),
                 max_steps_total=args.max_steps,
                 max_steps_per_epoch=args.max_steps_per_epoch,
+                scan_steps=scan_steps,
             )
         finally:
             if wandb_logger is not None:
@@ -406,6 +434,7 @@ def main() -> None:
     ckpt_dir = str(args.ckpt_dir) if args.ckpt_dir is not None else str(Path("checkpoints").resolve())
     legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
     legacy_log_every_steps = int(args.log_every_steps) if args.log_every_steps is not None else 100
+    legacy_scan_steps = max(1, int(args.scan_steps)) if args.scan_steps is not None else 1
     legacy_checkpoint_every_steps = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 5000
     wandb_logger = None
     if args.wandb:
@@ -439,6 +468,7 @@ def main() -> None:
             use_data_parallel=args.data_parallel,
             max_steps_total=args.max_steps,
             max_steps_per_epoch=args.max_steps_per_epoch,
+            scan_steps=legacy_scan_steps,
         )
     finally:
         if wandb_logger is not None:
