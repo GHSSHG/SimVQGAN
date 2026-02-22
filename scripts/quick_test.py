@@ -68,12 +68,15 @@ def _patch_config(
     if batch_size_override is not None:
         target_batch_size = max(1, int(batch_size_override))
     else:
-        # Keep quick-test memory bounded while preserving 8-GPU data-parallel execution.
+        # Keep quick-test memory bounded while preserving multi-GPU data-parallel execution.
         ndev = _local_device_count() if force_data_parallel else 1
         target_batch_size = min(current_batch_size, 32 * ndev)
         if force_data_parallel:
             target_batch_size = max(ndev, (target_batch_size // ndev) * ndev)
     train_cfg["batch_size"] = target_batch_size
+    # Quick test sets an explicit global batch; disable device-based rescaling.
+    train_cfg["per_device_batch_size"] = None
+    train_cfg["auto_scale_batch_by_device_count"] = False
     train_cfg["data_parallel"] = bool(force_data_parallel)
     cfg["train"] = train_cfg
     cfg.setdefault("data", {})

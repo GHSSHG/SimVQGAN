@@ -34,6 +34,8 @@ class SimVQAudioModel(nn.Module):
     transformer_heads: int = 4
     transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.0
+    transformer_ffn_activation: str = "gelu"
+    transformer_attention_backend: str = "jax_cudnn"
     remat_transformer: bool = False
     diveq_sigma2: float = 1e-3
     search_chunk_size: int = 2048
@@ -97,6 +99,8 @@ class SimVQAudioModel(nn.Module):
                 num_heads=self.transformer_heads,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
+                ffn_activation=self.transformer_ffn_activation,
+                attention_backend=self.transformer_attention_backend,
                 dtype=self.enc_dtype,
                 param_dtype=self.param_dtype,
                 name=f"pre_quant_tf_{i}",
@@ -109,6 +113,8 @@ class SimVQAudioModel(nn.Module):
                 num_heads=self.transformer_heads,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
+                ffn_activation=self.transformer_ffn_activation,
+                attention_backend=self.transformer_attention_backend,
                 dtype=self.dec_dtype,
                 param_dtype=self.param_dtype,
                 name=f"post_quant_tf_{i}",

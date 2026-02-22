@@ -202,6 +202,45 @@ def _prepare_split_dataset(
     return dataset, files
 
 
+def _positive_int(value: Any) -> int | None:
+    if value in (None, "", False):
+        return None
+    try:
+        intval = int(value)
+    except (TypeError, ValueError):
+        return None
+    return intval if intval > 0 else None
+
+
+def _detect_local_device_count() -> int:
+    try:
+        import jax  # type: ignore
+
+        return max(1, int(jax.local_device_count()))
+    except Exception:
+        visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if visible and visible != "-1":
+            return max(1, len([x for x in visible.split(",") if x.strip()]))
+        return 1
+
+
+def _scale_by_devices(
+    value: int,
+    *,
+    current_devices: int,
+    reference_devices: int,
+    minimum: int = 1,
+    align_to_devices: bool = False,
+) -> int:
+    cur = max(1, int(current_devices))
+    ref = max(1, int(reference_devices))
+    scaled = int(round(float(value) * float(cur) / float(ref)))
+    scaled = max(int(minimum), scaled)
+    if align_to_devices and cur > 1:
+        scaled = max(cur, (scaled // cur) * cur)
+    return scaled
+
+
 def main() -> None:
     args = parse_args()
     if args.config is not None:
@@ -217,6 +256,16 @@ def main() -> None:
         model_cfg = cfg.get("model", {})
         data_cfg = cfg.get("data", {})
         ckpt_cfg = cfg.get("checkpoint", {})
+        local_devices = _detect_local_device_count()
+        reference_devices = (
+            _positive_int(train_cfg.get("reference_device_count"))
+            or _positive_int(data_cfg.get("reference_device_count"))
+            or local_devices
+        )
+        data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
+        if args.data_parallel is not None:
+            data_parallel = bool(args.data_parallel)
+        scale_devices = local_devices if data_parallel is not False else 1
 
         beta_cfg = model_cfg.get("beta", None)
         legacy_beta_cfg = model_cfg.get("legacy_beta", None)
@@ -230,22 +279,41 @@ def main() -> None:
                 )
             print("[warn] model.beta and model.legacy_beta are deprecated in DiVeQ mode and ignored.")
 
-        def _positive_int(value: Any) -> int | None:
-            if value in (None, "", False):
-                return None
-            try:
-                intval = int(value)
-            except (TypeError, ValueError):
-                return None
-            return intval if intval > 0 else None
-
         epochs = _positive_int(train_cfg.get("epochs"))
         cli_epochs = _positive_int(args.epochs)
         if cli_epochs is not None:
             epochs = cli_epochs
         if epochs is None:
             raise ValueError("Epoch-based training requires 'train.epochs' in the config or --epochs override.")
-        batch_size = int(args.batch_size) if args.batch_size is not None else int(train_cfg.get("batch_size", 512))
+        cli_batch_size = _positive_int(args.batch_size)
+        if cli_batch_size is not None:
+            batch_size = cli_batch_size
+        else:
+            per_device_batch_size = _positive_int(train_cfg.get("per_device_batch_size"))
+            if per_device_batch_size is not None:
+                batch_size = max(1, per_device_batch_size) * scale_devices
+                print(
+                    "[setup] batch_size derived from train.per_device_batch_size="
+                    f"{per_device_batch_size} x effective_devices={scale_devices} -> {batch_size}"
+                )
+            else:
+                configured_batch_size = int(train_cfg.get("batch_size", 512))
+                auto_scale_batch = bool(train_cfg.get("auto_scale_batch_by_device_count", False))
+                if auto_scale_batch and reference_devices != scale_devices:
+                    batch_size = _scale_by_devices(
+                        configured_batch_size,
+                        current_devices=scale_devices,
+                        reference_devices=reference_devices,
+                        minimum=(scale_devices if scale_devices > 1 else 1),
+                        align_to_devices=True,
+                    )
+                    print(
+                        "[setup] auto-scaled batch_size from "
+                        f"{configured_batch_size} (@{reference_devices} GPUs) -> "
+                        f"{batch_size} (@{scale_devices} effective devices)"
+                    )
+                else:
+                    batch_size = configured_batch_size
         lr = float(train_cfg.get("learning_rate", 1e-4))
         log_every_steps = int(train_cfg.get("log_every_steps", 100))
         if args.log_every_steps is not None:
@@ -260,11 +328,22 @@ def main() -> None:
         if args.scan_steps is not None:
             scan_steps = max(1, int(args.scan_steps))
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
-        data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
-        if args.data_parallel is not None:
-            data_parallel = bool(args.data_parallel)
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
+        host_prefetch_per_device = _positive_int(train_cfg.get("host_prefetch_per_device"))
+        device_prefetch_per_device = _positive_int(train_cfg.get("device_prefetch_per_device"))
+        if args.host_prefetch_size is None and host_prefetch_per_device is not None:
+            host_prefetch_size = max(1, host_prefetch_per_device) * scale_devices
+            print(
+                "[setup] host_prefetch_size derived from train.host_prefetch_per_device="
+                f"{host_prefetch_per_device} -> {host_prefetch_size}"
+            )
+        if args.device_prefetch_size is None and device_prefetch_per_device is not None:
+            device_prefetch_size = max(1, device_prefetch_per_device) * scale_devices
+            print(
+                "[setup] device_prefetch_size derived from train.device_prefetch_per_device="
+                f"{device_prefetch_per_device} -> {device_prefetch_size}"
+            )
         if args.host_prefetch_size is not None:
             host_prefetch_size = max(1, int(args.host_prefetch_size))
         if args.device_prefetch_size is not None:
@@ -300,6 +379,48 @@ def main() -> None:
 
         default_loader_workers = int(data_cfg.get("loader_workers", 8))
         default_loader_prefetch = int(data_cfg.get("loader_prefetch_chunks", data_cfg.get("loader_prefetch") or 512))
+        loader_workers_per_device = _positive_int(data_cfg.get("loader_workers_per_device"))
+        loader_prefetch_per_device = _positive_int(data_cfg.get("loader_prefetch_chunks_per_device"))
+        auto_scale_loader = bool(data_cfg.get("auto_scale_loader_by_device_count", False))
+        cpu_limit = max(1, (os.cpu_count() or 8) - 2)
+        if args.loader_workers is None:
+            if loader_workers_per_device is not None:
+                default_loader_workers = min(cpu_limit, max(1, loader_workers_per_device * scale_devices))
+                print(
+                    "[setup] loader_workers derived from data.loader_workers_per_device="
+                    f"{loader_workers_per_device} -> {default_loader_workers}"
+                )
+            elif auto_scale_loader and reference_devices != scale_devices:
+                default_loader_workers = _scale_by_devices(
+                    default_loader_workers,
+                    current_devices=scale_devices,
+                    reference_devices=reference_devices,
+                    minimum=1,
+                )
+                default_loader_workers = min(cpu_limit, max(1, default_loader_workers))
+                print(
+                    "[setup] auto-scaled loader_workers using reference_device_count="
+                    f"{reference_devices} -> {default_loader_workers}"
+                )
+        if args.loader_prefetch is None:
+            if loader_prefetch_per_device is not None:
+                default_loader_prefetch = max(1, loader_prefetch_per_device) * scale_devices
+                print(
+                    "[setup] loader_prefetch_chunks derived from "
+                    "data.loader_prefetch_chunks_per_device="
+                    f"{loader_prefetch_per_device} -> {default_loader_prefetch}"
+                )
+            elif auto_scale_loader and reference_devices != scale_devices:
+                default_loader_prefetch = _scale_by_devices(
+                    default_loader_prefetch,
+                    current_devices=scale_devices,
+                    reference_devices=reference_devices,
+                    minimum=1,
+                )
+                print(
+                    "[setup] auto-scaled loader_prefetch_chunks using reference_device_count="
+                    f"{reference_devices} -> {default_loader_prefetch}"
+                )
         base_root = _resolve_data_path(data_cfg.get("root", "./nanopore"), cfg_dir)
         base_data_cfg: Dict[str, Any] = {
             "type": data_cfg.get("type", "pod5"),
@@ -315,6 +436,16 @@ def main() -> None:
             base_data_cfg["loader_workers"] = max(1, int(args.loader_workers))
         if args.loader_prefetch is not None:
             base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
+        print(
+            "[setup] devices="
+            f"{local_devices} (reference={reference_devices}), "
+            f"effective_devices={scale_devices}, "
+            f"batch_size={batch_size}, "
+            f"loader_workers={base_data_cfg['loader_workers']}, "
+            f"loader_prefetch_chunks={base_data_cfg['loader_prefetch_chunks']}, "
+            f"host_prefetch_size={host_prefetch_size}, "
+            f"device_prefetch_size={device_prefetch_size}"
+        )
         train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         ds, _ = _prepare_split_dataset(split_cfg=train_spec)

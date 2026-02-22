@@ -268,6 +268,8 @@ def train_model_from_pod5(
         transformer_heads=int(mcfg.get("transformer_heads", 4)),
         transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
         transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
+        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
+        transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
         remat_transformer=bool(mcfg.get("remat_transformer", False)),
         diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
         search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
