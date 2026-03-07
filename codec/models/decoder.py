@@ -81,12 +81,11 @@ class DecoderStage1D(nn.Module):
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channel_schedule: Sequence[int] = (128, 64, 32, 32)
+    channel_schedule: Sequence[int] = (128, 64, 64, 32, 32)
     num_res_blocks: int = 2
-    up_strides: Sequence[int] = (1, 4, 4)
+    up_strides: Sequence[int] = (1, 2, 2, 2)
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
-    tanh_dtype: Any = jnp.float32
 
     def setup(self) -> None:
         if len(self.channel_schedule) != len(self.up_strides) + 1:
@@ -125,13 +124,13 @@ class SimVQDecoder1D(nn.Module):
                 )
             )
         self.stages = tuple(stages)
-        self.norm_out = GroupNorm1D(self.channel_schedule[-1], dtype=self.dtype, param_dtype=self.param_dtype)
+        self.norm_out = GroupNorm1D(self.channel_schedule[-1], dtype=jnp.float32, param_dtype=self.param_dtype)
         self.conv_out = Conv1d(
             self.out_channels,
             kernel=3,
             padding="SAME",
             use_bias=True,
-            dtype=self.dtype,
+            dtype=jnp.float32,
             param_dtype=self.param_dtype,
             name="to_signal",
         )
@@ -142,10 +141,9 @@ class SimVQDecoder1D(nn.Module):
             h = block(h, train=train)
         for stage in self.stages:
             h = stage(h, train=train)
+        h = h.astype(jnp.float32)
         h = self.norm_out(h)
         h = _swish(h)
         wave = self.conv_out(h)
-        if wave.dtype != self.tanh_dtype:
-            wave = wave.astype(self.tanh_dtype)
         wave = jnp.tanh(wave)
         return wave, {}

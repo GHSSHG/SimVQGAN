@@ -20,6 +20,51 @@ def _dropout(x: jnp.ndarray, *, rate: float, train: bool, rng: jax.Array | None)
     return jnp.where(keep_mask, x / keep_prob, 0.0)
 
 
+def _rotate_half(x: jnp.ndarray) -> jnp.ndarray:
+    x_even = x[..., ::2]
+    x_odd = x[..., 1::2]
+    rotated = jnp.stack((-x_odd, x_even), axis=-1)
+    return rotated.reshape(x.shape)
+
+
+def _apply_rope(x: jnp.ndarray, *, base: float) -> jnp.ndarray:
+    head_dim = int(x.shape[-1])
+    if head_dim % 2 != 0:
+        raise ValueError(f"RoPE requires an even head dimension, got {head_dim}")
+    seq_len = int(x.shape[-3])
+    rope_dtype = jnp.float32
+    positions = jnp.arange(seq_len, dtype=rope_dtype)
+    inv_freq = 1.0 / (float(base) ** (jnp.arange(0, head_dim, 2, dtype=rope_dtype) / float(head_dim)))
+    angles = positions[:, None] * inv_freq[None, :]
+    sin = jnp.repeat(jnp.sin(angles), 2, axis=-1)[None, :, None, :]
+    cos = jnp.repeat(jnp.cos(angles), 2, axis=-1)[None, :, None, :]
+    x_fp32 = x.astype(rope_dtype)
+    x_rot = (x_fp32 * cos) + (_rotate_half(x_fp32) * sin)
+    return x_rot.astype(x.dtype)
+
+
+def _wrap_attention_fn_with_rope(
+    attention_fn: Callable[..., jnp.ndarray],
+    *,
+    use_rope: bool,
+    rope_base: float,
+) -> Callable[..., jnp.ndarray]:
+    if not use_rope:
+        return attention_fn
+
+    def _attention_with_rope(
+        query: jnp.ndarray,
+        key: jnp.ndarray,
+        value: jnp.ndarray,
+        **kwargs,
+    ) -> jnp.ndarray:
+        query = _apply_rope(query, base=rope_base)
+        key = _apply_rope(key, base=rope_base)
+        return attention_fn(query, key, value, **kwargs)
+
+    return _attention_with_rope
+
+
 def _jax_attention_fn(
     query: jnp.ndarray,
     key: jnp.ndarray,
@@ -101,6 +146,8 @@ class TransformerBlock1D(nn.Module):
     dropout: float = 0.0
     ffn_activation: str = "gelu"
     attention_backend: str = "jax_cudnn"
+    use_rope: bool = False
+    rope_base: float = 10000.0
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -110,6 +157,10 @@ class TransformerBlock1D(nn.Module):
         hidden_dim = int(round(self.dim * float(self.mlp_ratio)))
         if hidden_dim <= 0:
             raise ValueError(f"mlp hidden dim must be positive, got {hidden_dim}")
+        if self.use_rope and (self.dim // self.num_heads) % 2 != 0:
+            raise ValueError(
+                f"RoPE requires an even per-head dim, got dim={self.dim}, num_heads={self.num_heads}"
+            )
         activation = str(self.ffn_activation).strip().lower()
         if activation not in {"gelu", "swiglu"}:
             raise ValueError(f"Unsupported ffn_activation={self.ffn_activation!r}; use 'gelu' or 'swiglu'.")
@@ -125,6 +176,11 @@ class TransformerBlock1D(nn.Module):
             attention_fn = _flax_dot_product_attention
         else:
             attention_fn = functools.partial(_jax_attention_fn, implementation="cudnn")
+        attention_fn = _wrap_attention_fn_with_rope(
+            attention_fn,
+            use_rope=bool(self.use_rope),
+            rope_base=float(self.rope_base),
+        )
 
         self.norm1 = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, name="norm1")
         self.attn = nn.SelfAttention(

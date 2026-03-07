@@ -30,12 +30,20 @@ from ..data.pod5_dataset import NanoporeSignalDataset
 
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
+    "reconstruct_loss_raw": "reconstruct_loss_raw",
     "reconstruct_loss": "reconstruct_loss",
-    "weighted_reconstruct_loss": "weighted_reconstruct_loss",
-    "gan_raw_loss": "gan_loss",
-    "weighted_gan_loss": "weighted_gan_loss",
+    "time_l1_loss_raw": "time_l1_loss_raw",
+    "time_l1_loss": "time_l1_loss",
+    "diff1_loss_raw": "diff1_loss_raw",
+    "diff1_loss": "diff1_loss",
+    "diff2_loss_raw": "diff2_loss_raw",
+    "diff2_loss": "diff2_loss",
+    "stft_logmag_loss_raw": "stft_logmag_loss_raw",
+    "stft_logmag_loss": "stft_logmag_loss",
+    "gan_loss_raw": "gan_loss_raw",
+    "gan_loss": "gan_loss",
+    "feature_loss_raw": "feature_loss_raw",
     "feature_loss": "feature_loss",
-    "weighted_feature_loss": "weighted_feature_loss",
     "q_z_dist": "q_z_dist",
     "log_q_z_dist": "log_q_z_dist",
     "perplexity": "codebook_perplexity",
@@ -44,6 +52,8 @@ _SIMVQ_KEY_MAPPING = {
     "disc_loss_raw": "disc_loss_raw",
     "disc_mask": "disc_mask",
 }
+
+_SPARSE_STEP_LOG_KEYS = frozenset({"perplexity", "code_usage"})
 
 def _value_to_float(val):
     if val is None:
@@ -118,9 +128,9 @@ def _maybe_log_gpu_memory(log_fn, phase: str) -> None:
         return
 
 
-def _resolve_dtype(dtype_value: Any) -> Any:
+def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
     if dtype_value is None:
-        raise ValueError("dtype config value cannot be None.")
+        return fallback
     if isinstance(dtype_value, str):
         key = dtype_value.strip().lower()
         mapping = {
@@ -140,33 +150,31 @@ def _resolve_dtype(dtype_value: Any) -> Any:
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
-    num_epochs: int,
-    learning_rate: float,
-    seed: int,
+    num_epochs: int | None = None,
+    learning_rate: float = 1e-4,
+    seed: int = 0,
     ckpt_dir: str | None = None,
-    loss_weights: Dict[str, float],
-    disc_start_step: int,
-    model_cfg: dict,
+    loss_weights: Dict[str, float] | None = None,
+    stft_loss_cfg: Dict[str, int] | None = None,
+    disc_start_step: int = 0,
+    model_cfg: dict | None = None,
     log_file: str | None = None,
-    batch_size: int,
-    expected_input_length: int,
+    batch_size: int | None = None,
     resume_from: str | None = None,
-    log_every_steps: int,
-    checkpoint_every_steps: int,
+    log_every_steps: int = 100,
+    checkpoint_every_steps: int = 5000,
     wandb_logger: Any | None = None,
     # Optimization knobs
-    freeze_W: bool,
-    grad_clip: float,
-    disc_warmup_steps: int,
-    disc_every_steps: int,
-    host_prefetch_size: int,
-    device_prefetch_size: int,
-    disc_lr_mult: float,
+    freeze_W: bool = False,
+    grad_clip: float = 1.0,
+    disc_warmup_steps: int = 0,
+    host_prefetch_size: int = 64,
+    device_prefetch_size: int = 16,
+    disc_lr_mult: float = 0.1,
     use_data_parallel: bool | None = None,
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
     codebook_stats_every_steps: int | None = None,
-    codebook_stats_until_step: int | None = None,
     scan_steps: int = 1,
 ):
     import jax
@@ -231,37 +239,24 @@ def train_model_from_pod5(
 
     rng = jax.random.PRNGKey(seed)
     rng, gen_init_rng, disc_init_rng, _ = jax.random.split(rng, 4)
-    if not isinstance(model_cfg, dict):
-        raise ValueError("model_cfg must be a dict loaded from config.")
-    mcfg = dict(model_cfg)
+    mcfg = dict(model_cfg or {})
 
-    def _require_model_key(key: str):
-        if key not in mcfg:
-            raise ValueError(f"Missing required model config key: model.{key}")
-        return mcfg[key]
-
-    def _require_tuple_cfg(key: str):
-        val = _require_model_key(key)
-        if not isinstance(val, (list, tuple)) or len(val) == 0:
-            raise ValueError(f"model.{key} must be a non-empty list/tuple")
+    def _tuple_cfg(key, default):
+        val = mcfg.get(key, default)
         return tuple(int(v) for v in val)
 
-    latent_dim = int(_require_model_key("latent_dim"))
-    base_channels = int(_require_model_key("base_channels"))
-    backbone_compute_dtype = _resolve_dtype(_require_model_key("backbone_compute_dtype"))
-    backbone_param_dtype = _resolve_dtype(_require_model_key("backbone_param_dtype"))
-    quant_compute_dtype = _resolve_dtype(_require_model_key("quant_compute_dtype"))
-    quant_param_dtype = _resolve_dtype(_require_model_key("quant_param_dtype"))
-    decoder_tanh_dtype = _resolve_dtype(_require_model_key("decoder_tanh_dtype"))
-    disc_compute_dtype = _resolve_dtype(_require_model_key("disc_compute_dtype"))
-    disc_param_dtype = _resolve_dtype(_require_model_key("disc_param_dtype"))
-    enc_channels = _require_tuple_cfg("enc_channels")
+    latent_dim = int(mcfg.get("latent_dim", 128))
+    base_channels = int(mcfg.get("base_channels", 32))
+    compute_dtype = _resolve_dtype(mcfg.get("compute_dtype", "bf16"), fallback=jnp.float32)
+    param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
+    disc_compute_dtype = _resolve_dtype(mcfg.get("disc_dtype", mcfg.get("compute_dtype", "bf16")), fallback=jnp.float32)
+    enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _require_tuple_cfg("enc_down_strides")
-    enc_num_res_blocks = int(_require_model_key("enc_num_res_blocks"))
-    dec_channels = _require_tuple_cfg("dec_channels")
-    dec_up_strides = _require_tuple_cfg("dec_up_strides")
-    dec_num_res_blocks = int(_require_model_key("dec_num_res_blocks"))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2, 2, 1))
+    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
+    dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 2, 2, 2))
+    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     generator = SimVQAudioModel(
         in_channels=1,
         base_channels=base_channels,
@@ -269,48 +264,35 @@ def train_model_from_pod5(
         enc_num_res_blocks=enc_num_res_blocks,
         enc_down_strides=enc_down_strides,
         latent_dim=latent_dim,
-        codebook_size=int(_require_model_key("codebook_size")),
+        codebook_size=int(mcfg.get("codebook_size", 16384)),
         dec_channel_schedule=dec_channels,
         dec_num_res_blocks=dec_num_res_blocks,
         dec_up_strides=dec_up_strides,
-        enc_dtype=backbone_compute_dtype,
-        dec_dtype=backbone_compute_dtype,
-        param_dtype=backbone_param_dtype,
-        quant_dtype=quant_compute_dtype,
-        quant_param_dtype=quant_param_dtype,
-        dec_tanh_dtype=decoder_tanh_dtype,
-        remat_encoder=bool(_require_model_key("remat_encoder")),
-        remat_decoder=bool(_require_model_key("remat_decoder")),
-        pre_quant_transformer_layers=int(_require_model_key("pre_quant_transformer_layers")),
-        post_quant_transformer_layers=int(_require_model_key("post_quant_transformer_layers")),
-        transformer_heads=int(_require_model_key("transformer_heads")),
-        transformer_mlp_ratio=float(_require_model_key("transformer_mlp_ratio")),
-        transformer_dropout=float(_require_model_key("transformer_dropout")),
-        transformer_ffn_activation=str(_require_model_key("transformer_ffn_activation")),
-        transformer_attention_backend=str(_require_model_key("transformer_attention_backend")),
-        remat_transformer=bool(_require_model_key("remat_transformer")),
-        diveq_sigma2=float(_require_model_key("diveq_sigma2")),
-        search_chunk_size=int(_require_model_key("search_chunk_size")),
+        enc_dtype=compute_dtype,
+        dec_dtype=compute_dtype,
+        param_dtype=param_dtype,
+        pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
+        post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
+        transformer_heads=int(mcfg.get("transformer_heads", 4)),
+        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 2.0)),
+        transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
+        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
+        transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
+        transformer_use_rope=bool(mcfg.get("transformer_use_rope", False)),
+        transformer_rope_base=float(mcfg.get("transformer_rope_base", 10000.0)),
+        diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
+        search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
     )
-    disc_raw = _require_model_key("discriminator")
-    if not isinstance(disc_raw, dict):
-        raise ValueError("model.discriminator must be a dict")
-    disc_cfg = dict(disc_raw)
-    for key in ("channels", "strides", "kernel_size", "resblock_layers", "remat"):
-        if key not in disc_cfg:
-            raise ValueError(f"Missing required model.discriminator.{key} in config.")
-    disc_channels = tuple(int(v) for v in disc_cfg["channels"])
-    disc_strides = tuple(int(v) for v in disc_cfg["strides"])
-    disc_cls = PatchDiscriminator1D
-    if bool(disc_cfg["remat"]):
-        disc_cls = nn.remat(disc_cls)
-    discriminator = disc_cls(
+    disc_cfg = dict(mcfg.get("discriminator", {}))
+    disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
+    disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
+    discriminator = PatchDiscriminator1D(
         channels=disc_channels,
         strides=disc_strides,
-        kernel_size=int(disc_cfg["kernel_size"]),
-        resblock_layers=int(disc_cfg["resblock_layers"]),
+        kernel_size=int(disc_cfg.get("kernel_size", 15)),
+        resblock_layers=int(disc_cfg.get("resblock_layers", 2)),
         dtype=disc_compute_dtype,
-        param_dtype=disc_param_dtype,
+        param_dtype=param_dtype,
     )
 
     # Probe shape using a single-worker iterator so we don't leave background threads running.
@@ -335,13 +317,7 @@ def train_model_from_pod5(
     elif init_batch.ndim == 3 and init_batch.shape[-1] == 1:
         init_batch = init_batch[..., 0]
     _, L = init_batch.shape
-    if int(expected_input_length) != int(L):
-        raise ValueError(
-            f"Input length mismatch: config expects {expected_input_length}, but dataset produced {L}."
-        )
-    B = int(batch_size)
-    if B <= 0:
-        raise ValueError(f"batch_size must be positive, got {B}")
+    B = int(batch_size) if batch_size and batch_size > 0 else 1
     ndev = max(1, int(jax.local_device_count()))
     scan_steps_int = max(1, int(scan_steps))
     data_parallel = (ndev > 1) if use_data_parallel is None else (bool(use_data_parallel) and ndev > 1)
@@ -362,6 +338,8 @@ def train_model_from_pod5(
     host_prefetch_size = max(1, int(host_prefetch_size))
     device_prefetch_size = max(1, int(device_prefetch_size))
 
+    if num_epochs is None:
+        raise ValueError("Epoch-based training requires num_epochs > 0.")
     try:
         epochs_limit = int(num_epochs)
     except (TypeError, ValueError) as exc:
@@ -475,10 +453,17 @@ def train_model_from_pod5(
             )
         )
         return host_iter, data_iter
-    loss_weights = dict(loss_weights)
-    for required_key in ("time_l1", "gan", "feature"):
-        if required_key not in loss_weights:
-            raise ValueError(f"Missing required loss_weights.{required_key} in config.")
+    if loss_weights is None:
+        loss_weights = {
+            "time_l1": 1.0,
+            "diff1_l1": 0.1,
+            "diff2_l1": 0.05,
+            "stft_logmag_l1": 0.05,
+            "gan": 0.03,
+            "feature": 0.1,
+        }
+    else:
+        loss_weights = dict(loss_weights)
     if "commit" in loss_weights:
         raise ValueError(
             "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
@@ -487,6 +472,11 @@ def train_model_from_pod5(
         raise ValueError(
             "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
         )
+    stft_cfg = dict(stft_loss_cfg or {})
+    stft_n_fft = max(1, int(stft_cfg.get("n_fft", 256)))
+    stft_win_length = max(1, int(stft_cfg.get("win_length", stft_n_fft)))
+    stft_win_length = min(stft_win_length, stft_n_fft)
+    stft_hop_length = max(1, int(stft_cfg.get("hop_length", max(1, stft_win_length // 4))))
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
@@ -504,17 +494,13 @@ def train_model_from_pod5(
     log_every_steps_int = max(0, int(log_every_steps))
     stats_every_steps_int = _safe_int(codebook_stats_every_steps)
     if stats_every_steps_int is None:
-        raise ValueError("codebook_stats_every_steps must be explicitly set in config.")
-    stats_until_step_int = _safe_int(codebook_stats_until_step)
+        stats_every_steps_int = max(1, log_every_steps_int if log_every_steps_int > 0 else 100)
     checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
     disc_start_step_int = max(0, int(disc_start_step))
     disc_warmup_steps_int = max(0, int(disc_warmup_steps))
-    disc_every_steps_int = max(1, int(disc_every_steps))
 
     def _disc_mask_for_step(step_idx: int) -> float:
         if step_idx < disc_start_step_int:
-            return 0.0
-        if ((step_idx - disc_start_step_int) % disc_every_steps_int) != 0:
             return 0.0
         if disc_warmup_steps_int <= 0:
             return 1.0
@@ -527,6 +513,8 @@ def train_model_from_pod5(
         "train_step_ms": 0.0,
         "host_sync_ms": 0.0,
     }
+    log_window_sums: Dict[str, float] = {}
+    log_window_counts: Dict[str, float] = {}
 
     def _add_perf_sample(
         *,
@@ -540,6 +528,18 @@ def train_model_from_pod5(
         perf_accum["data_wait_ms"] += float(data_wait_ms) * w
         perf_accum["train_step_ms"] += float(train_step_ms) * w
         perf_accum["host_sync_ms"] += float(host_sync_ms) * w
+
+    def _add_log_window_sample(logs: Dict[str, Any] | None) -> None:
+        if not logs:
+            return
+        for key, value in logs.items():
+            if key in _SPARSE_STEP_LOG_KEYS:
+                continue
+            fv = _value_to_float(value)
+            if fv is None:
+                continue
+            log_window_sums[key] = log_window_sums.get(key, 0.0) + fv
+            log_window_counts[key] = log_window_counts.get(key, 0.0) + 1.0
 
     def _drain_perf_window() -> Dict[str, float] | None:
         count = int(perf_accum["count"])
@@ -561,6 +561,22 @@ def train_model_from_pod5(
         for key in perf_accum:
             perf_accum[key] = 0.0
         return perf
+
+    def _drain_log_window(last_logs: Dict[str, Any] | None = None) -> Dict[str, float] | None:
+        averaged: Dict[str, float] = {}
+        for key, count in log_window_counts.items():
+            if count > 0:
+                averaged[key] = log_window_sums[key] / count
+        log_window_sums.clear()
+        log_window_counts.clear()
+        if last_logs:
+            for key in _SPARSE_STEP_LOG_KEYS:
+                if key not in last_logs:
+                    continue
+                fv = _value_to_float(last_logs[key])
+                if fv is not None:
+                    averaged[key] = fv
+        return averaged or None
 
     def _log_step(step: int, logs: Dict[str, Any] | None, perf: Dict[str, float] | None = None) -> None:
         formatted = _simvq_style_logs(logs or {}, "train")
@@ -606,6 +622,9 @@ def train_model_from_pod5(
                 apply_rngs,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=False,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -624,6 +643,9 @@ def train_model_from_pod5(
                 apply_rngs,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=True,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -645,6 +667,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=False,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -673,6 +698,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=True,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -708,6 +736,9 @@ def train_model_from_pod5(
                 apply_rng,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=False,
             )
             disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
@@ -727,6 +758,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=False,
                 )
                 disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
@@ -753,6 +787,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=True,
                 )
                 disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
@@ -776,6 +813,9 @@ def train_model_from_pod5(
                 apply_rng,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=True,
             )
             disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
@@ -885,26 +925,11 @@ def train_model_from_pod5(
         if checkpoint_every_steps_int > 0
         else None
     )
-    stats_cutoff_announced = False
     mem_probe_steps = {10, 50, 200}
     mem_probe_done: set[int] = set()
 
     def _should_collect_codebook_stats(step_idx: int) -> bool:
-        nonlocal stats_cutoff_announced
-        collect = ((step_idx + 1) % stats_every_steps_int == 0)
-        if (
-            stats_until_step_int is not None
-            and (step_idx + 1) > stats_until_step_int
-            and collect
-        ):
-            collect = False
-            if not stats_cutoff_announced:
-                _log(
-                    f"[stats] Disabled codebook stats after step {stats_until_step_int} "
-                    f"(current step={step_idx + 1})."
-                )
-                stats_cutoff_announced = True
-        return collect
+        return ((step_idx + 1) % stats_every_steps_int == 0)
 
     def _strip_codebook_metrics(logs: Dict[str, Any]) -> Dict[str, Any]:
         if "perplexity" in logs:
@@ -1090,6 +1115,7 @@ def train_model_from_pod5(
                     for logs in logs_seq:
                         steps_this_epoch += 1
                         global_step += 1
+                        _add_log_window_sample(logs)
 
                         if global_step in mem_probe_steps and global_step not in mem_probe_done:
                             _maybe_log_gpu_memory(_log, f"step{global_step}")
@@ -1097,7 +1123,8 @@ def train_model_from_pod5(
 
                         if log_every_steps_int > 0 and global_step % log_every_steps_int == 0:
                             perf = _drain_perf_window()
-                            _log_step(global_step, logs, perf=perf)
+                            averaged_logs = _drain_log_window(logs)
+                            _log_step(global_step, averaged_logs, perf=perf)
 
                         if (
                             ckpt_dir

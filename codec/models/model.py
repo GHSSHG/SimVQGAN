@@ -10,55 +10,37 @@ from .encoder import SimVQEncoder1D
 from .decoder import SimVQDecoder1D
 from .quantize import SimVQ1D
 from .transformer import TransformerBlock1D
+from ..jaxlayers import Conv1d
 
 
 class SimVQAudioModel(nn.Module):
     in_channels: int = 1
     base_channels: int = 32
-    enc_channel_multipliers: Tuple[int, ...] = (1, 1, 2, 4)
+    enc_channel_multipliers: Tuple[int, ...] = (1, 1, 2, 2, 4)
     enc_num_res_blocks: int = 2
-    enc_down_strides: Tuple[int, ...] = (4, 4, 1)
+    enc_down_strides: Tuple[int, ...] = (2, 2, 2, 1)
     latent_dim: int = 128
     codebook_size: int = 16384
-    dec_channel_schedule: Tuple[int, ...] = (128, 64, 32, 32)
+    dec_channel_schedule: Tuple[int, ...] = (128, 64, 64, 32, 32)
     dec_num_res_blocks: int = 2
-    dec_up_strides: Tuple[int, ...] = (1, 4, 4)
+    dec_up_strides: Tuple[int, ...] = (1, 2, 2, 2)
     enc_dtype: Any = jnp.float32
     dec_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
-    quant_dtype: Any = jnp.float32
-    quant_param_dtype: Any = jnp.float32
-    dec_tanh_dtype: Any = jnp.float32
-    remat_encoder: bool = False
-    remat_decoder: bool = False
     pre_quant_transformer_layers: int = 0
     post_quant_transformer_layers: int = 0
     transformer_heads: int = 4
-    transformer_mlp_ratio: float = 4.0
+    transformer_mlp_ratio: float = 2.0
     transformer_dropout: float = 0.0
     transformer_ffn_activation: str = "gelu"
     transformer_attention_backend: str = "jax_cudnn"
-    remat_transformer: bool = False
+    transformer_use_rope: bool = False
+    transformer_rope_base: float = 10000.0
     diveq_sigma2: float = 1e-3
     search_chunk_size: int = 2048
 
     def setup(self):
-        enc_out_channels = self.base_channels * int(self.enc_channel_multipliers[-1])
-        if int(self.latent_dim) != int(enc_out_channels):
-            raise ValueError(
-                "No latent projection is enabled in SimVQAudioModel. "
-                f"latent_dim must equal encoder output channels ({enc_out_channels}), got {self.latent_dim}."
-            )
-        if int(self.dec_channel_schedule[0]) != int(self.latent_dim):
-            raise ValueError(
-                "No post-quant projection is enabled in SimVQAudioModel. "
-                f"dec_channel_schedule[0] must equal latent_dim ({self.latent_dim}), "
-                f"got {self.dec_channel_schedule[0]}."
-            )
-        encoder_cls = SimVQEncoder1D
-        if self.remat_encoder:
-            encoder_cls = nn.remat(encoder_cls)
-        self.encoder = encoder_cls(
+        self.encoder = SimVQEncoder1D(
             in_channels=self.in_channels,
             base_channels=self.base_channels,
             channel_multipliers=self.enc_channel_multipliers,
@@ -68,37 +50,50 @@ class SimVQAudioModel(nn.Module):
             dtype=self.enc_dtype,
             param_dtype=self.param_dtype,
         )
-        decoder_cls = SimVQDecoder1D
-        if self.remat_decoder:
-            decoder_cls = nn.remat(decoder_cls)
-        self.decoder = decoder_cls(
+        self.decoder = SimVQDecoder1D(
             out_channels=self.in_channels,
             channel_schedule=self.dec_channel_schedule,
             num_res_blocks=self.dec_num_res_blocks,
             up_strides=self.dec_up_strides,
             dtype=self.dec_dtype,
             param_dtype=self.param_dtype,
-            tanh_dtype=self.dec_tanh_dtype,
+        )
+        quant_path_dtype = jnp.float32
+        self.quant_conv = Conv1d(
+            self.latent_dim,
+            kernel=1,
+            use_bias=False,
+            dtype=quant_path_dtype,
+            param_dtype=quant_path_dtype,
+            name="quant_conv",
+        )
+        self.post_quant_conv = Conv1d(
+            self.dec_channel_schedule[0],
+            kernel=1,
+            use_bias=False,
+            dtype=quant_path_dtype,
+            param_dtype=quant_path_dtype,
+            name="post_quant_conv",
         )
         self.quantizer = SimVQ1D(
             codebook_size=self.codebook_size,
             code_dim=self.latent_dim,
             diveq_sigma2=self.diveq_sigma2,
             search_chunk_size=max(1, int(self.search_chunk_size)),
-            dtype=self.quant_dtype,
-            param_dtype=self.quant_param_dtype,
+            # Keep quantizer/codebook statistics in fp32 even when model compute is bf16.
+            dtype=quant_path_dtype,
+            param_dtype=quant_path_dtype,
         )
-        tf_block_cls = TransformerBlock1D
-        if self.remat_transformer:
-            tf_block_cls = nn.remat(tf_block_cls)
         self.pre_quant_blocks = tuple(
-            tf_block_cls(
+            TransformerBlock1D(
                 dim=self.latent_dim,
                 num_heads=self.transformer_heads,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
                 ffn_activation=self.transformer_ffn_activation,
                 attention_backend=self.transformer_attention_backend,
+                use_rope=self.transformer_use_rope,
+                rope_base=self.transformer_rope_base,
                 dtype=self.enc_dtype,
                 param_dtype=self.param_dtype,
                 name=f"pre_quant_tf_{i}",
@@ -106,13 +101,15 @@ class SimVQAudioModel(nn.Module):
             for i in range(max(0, int(self.pre_quant_transformer_layers)))
         )
         self.post_quant_blocks = tuple(
-            tf_block_cls(
-                dim=self.latent_dim,
+            TransformerBlock1D(
+                dim=self.dec_channel_schedule[0],
                 num_heads=self.transformer_heads,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
                 ffn_activation=self.transformer_ffn_activation,
                 attention_backend=self.transformer_attention_backend,
+                use_rope=self.transformer_use_rope,
+                rope_base=self.transformer_rope_base,
                 dtype=self.dec_dtype,
                 param_dtype=self.param_dtype,
                 name=f"post_quant_tf_{i}",
@@ -130,14 +127,14 @@ class SimVQAudioModel(nn.Module):
         collect_codebook_stats: bool = True,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
         h_e = self.encoder(x, train=train, offset=offset)
-        h_qin = h_e
         if self.pre_quant_blocks:
             split_rngs = jax.random.split(rng, len(self.pre_quant_blocks) + 1)
             for block, block_rng in zip(self.pre_quant_blocks, split_rngs[:-1]):
-                h_qin = block(h_qin, train=train, rng=block_rng)
+                h_e = block(h_e, train=train, rng=block_rng)
             quant_rng = split_rngs[-1]
         else:
             _, quant_rng = jax.random.split(rng)
+        h_qin = self.quant_conv(h_e)
         z_q, info = self.quantizer(
             h_qin,
             rng=quant_rng,
@@ -147,15 +144,14 @@ class SimVQAudioModel(nn.Module):
         return h_qin, z_q, info
 
     def decode(self, z_q: jnp.ndarray, *, train: bool = False, rng: jax.random.KeyArray | None = None):
-        if z_q.dtype != self.dec_dtype:
-            z_q = z_q.astype(self.dec_dtype)
+        z_dec = self.post_quant_conv(z_q)
         if self.post_quant_blocks:
             block_rngs = [None] * len(self.post_quant_blocks)
             if rng is not None:
                 block_rngs = jax.random.split(rng, len(self.post_quant_blocks))
             for block, block_rng in zip(self.post_quant_blocks, block_rngs):
-                z_q = block(z_q, train=train, rng=block_rng)
-        wave, aux = self.decoder(z_q, train=train)
+                z_dec = block(z_dec, train=train, rng=block_rng)
+        wave, aux = self.decoder(z_dec, train=train)
         # decoder returns (B,T,1) – squeeze to (B,T)
         if wave.ndim == 3 and wave.shape[-1] == 1:
             wave = jnp.squeeze(wave, axis=-1)

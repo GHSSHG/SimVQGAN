@@ -10,8 +10,7 @@ from typing import Any, Dict
 from argparse import BooleanOptionalAction
 
 import sys
-
-# Ensure project root is importable when running as "python scripts/train.py".
+# 确保以 "python scripts/train.py" 运行时可导入项目根下的 `codec` 包
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
@@ -20,10 +19,9 @@ from codec.runtime import configure_runtime_env, enable_jax_compilation_cache
 
 configure_runtime_env()
 
-# Enable TF32 matmul precision on Ampere+.
+# 启用 TF32（"high"）提升 A100 张量核吞吐
 try:
     from jax import config as _jax_config  # type: ignore
-
     _jax_config.update("jax_default_matmul_precision", "high")
 except Exception:
     pass
@@ -32,148 +30,81 @@ enable_jax_compilation_cache()
 
 from codec.data import NanoporeSignalDataset
 from codec.train import train_model_from_pod5
-from codec.utils import discover_pod5_files, init_wandb
-
-DEFAULT_CONFIG_PATH = _ROOT / "configs" / "train.json"
+from codec.utils import (
+    discover_pod5_files,
+    new_epoch_seed,
+    init_wandb,
+)
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Train 1D codec (JAX/Flax) from config")
-    p.add_argument(
-        "--config",
-        type=Path,
-        default=DEFAULT_CONFIG_PATH,
-        help="Path to training config JSON (default: configs/train.json)",
-    )
-    p.add_argument("--seed", type=int, default=None, help="Override config seed")
-    p.add_argument("--epochs", type=int, default=None, help="Override train.epochs")
-    p.add_argument("--batch-size", type=int, default=None, help="Override global batch size")
-    p.add_argument("--lr", type=float, default=None, help="Override train.learning_rate")
-    p.add_argument("--ckpt-dir", type=Path, default=None, help="Override checkpoint.dir")
-    p.add_argument("--log-every-steps", type=int, default=None, help="Override train.log_every_steps")
+    p = argparse.ArgumentParser(description="Train 1D codec (JAX/Flax) from config or CLI")
+    p.add_argument("--config", type=Path, default=None, help="Path to training config JSON (recommended: configs/train.json)")
+    # Legacy CLI (kept for compatibility; ignored when --config is provided)
+    p.add_argument("root", type=Path, nargs="?", help="Root directory containing POD5 files or subfolders")
+    p.add_argument("--subdirs", nargs="*", default=None, help="Optional subdirectories under root to search")
+    p.add_argument("--segment-sec", type=float, default=1.0, help="Segment length in seconds for each training window (default 1.0 → L=5000 for sr=5000)")
+    p.add_argument("--sample-rate", type=float, default=5000.0, help="Sample rate if not found in POD5 reads")
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--ckpt-dir", type=Path, default=None)
+    p.add_argument("--log-every-steps", type=int, default=None, help="Override per-step logging interval")
     p.add_argument(
         "--codebook-stats-every-steps",
         type=int,
         default=None,
-        help="Override train.codebook_stats_every_steps",
+        help="Override codebook statistics interval (set <=0 to disable periodic stats)",
     )
-    p.add_argument(
-        "--codebook-stats-until-step",
-        type=int,
-        default=None,
-        help="Override train.codebook_stats_until_step",
-    )
-    p.add_argument(
-        "--checkpoints-per-epoch",
-        type=int,
-        default=None,
-        help="Override checkpoint.every_steps",
-    )
+    p.add_argument("--checkpoints-per-epoch", type=int, default=None, help="Override number of checkpoints to emit each epoch")
     p.add_argument(
         "--loader-workers",
         type=int,
         default=None,
-        help="Override data.loader_workers",
+        help="Override data.loader_workers when streaming from POD5 (default: config value)",
     )
     p.add_argument(
         "--loader-prefetch",
         type=int,
         default=None,
-        help="Override data.loader_prefetch_chunks",
+        help="Override data.loader_prefetch_chunks for threaded POD5 loader",
     )
     p.add_argument(
         "--host-prefetch-size",
         type=int,
         default=None,
-        help="Override train.host_prefetch_size",
+        help="Override host-side Prefetcher queue length (default: config or 64)",
     )
     p.add_argument(
         "--device-prefetch-size",
         type=int,
         default=None,
-        help="Override train.device_prefetch_size",
+        help="Override device prefetch depth (default: config or 16)",
     )
-    p.add_argument(
-        "--wandb",
-        action=BooleanOptionalAction,
-        default=None,
-        help="Override logging.wandb.enabled",
-    )
-    p.add_argument("--wandb-project", type=str, default=None, help="Override logging.wandb.project")
-    p.add_argument("--wandb-run", type=str, default=None, help="Override logging.wandb.run_name")
+    p.add_argument("--seed", type=int, default=None, help="Optional seed; if omitted, derive a new epoch seed")
+    p.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging")
+    p.add_argument("--wandb-project", type=str, default=None, help="WandB project name")
+    p.add_argument("--wandb-run", type=str, default=None, help="WandB run name override")
     p.add_argument(
         "--data-parallel",
         action=BooleanOptionalAction,
         default=None,
-        help="Override train.data_parallel",
+        help="Enable/disable multi-GPU data parallel training (default: auto from config and device count)",
     )
-    p.add_argument("--max-steps", type=int, default=None, help="Optional cap on total training steps")
-    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="Optional cap on steps per epoch")
+    p.add_argument("--max-steps", type=int, default=None, help="Optional cap on global training steps (for quick tests)")
+    p.add_argument("--max-steps-per-epoch", type=int, default=None, help="Optional cap on steps per epoch (for quick tests)")
     p.add_argument(
         "--scan-steps",
         type=int,
         default=None,
-        help="Override train.scan_steps",
+        help="Run N fused steps per JAX dispatch using lax.scan (default: config train.scan_steps or 1)",
     )
     return p.parse_args()
 
 
-def _require_key(mapping: Dict[str, Any], key: str, path: str) -> Any:
-    if key not in mapping:
-        raise ValueError(f"Missing required config key: {path}.{key}")
-    return mapping[key]
-
-
-def _require_dict(mapping: Dict[str, Any], key: str, path: str) -> Dict[str, Any]:
-    value = _require_key(mapping, key, path)
-    if not isinstance(value, dict):
-        raise ValueError(f"Config key {path}.{key} must be an object/dict")
-    return value
-
-
-def _as_int(value: Any, path: str, *, minimum: int | None = None) -> int:
-    try:
-        out = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Config key {path} must be an integer, got {value!r}") from exc
-    if minimum is not None and out < minimum:
-        raise ValueError(f"Config key {path} must be >= {minimum}, got {out}")
-    return out
-
-
-def _as_optional_int(value: Any, path: str, *, minimum: int | None = None) -> int | None:
-    if value is None:
-        return None
-    return _as_int(value, path, minimum=minimum)
-
-
-def _as_float(value: Any, path: str) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"Config key {path} must be numeric, got {value!r}") from exc
-
-
-def _as_bool(value: Any, path: str) -> bool:
-    if isinstance(value, bool):
-        return value
-    raise ValueError(f"Config key {path} must be boolean, got {value!r}")
-
-
-def _as_subdirs(value: Any, path: str) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if not isinstance(value, list) or not value:
-        raise ValueError(f"Config key {path} must be a non-empty list of strings")
-    out: list[str] = []
-    for idx, item in enumerate(value):
-        if not isinstance(item, str) or not item:
-            raise ValueError(f"Config key {path}[{idx}] must be a non-empty string")
-        out.append(item)
-    return out
-
-
-def _resolve_data_path(path_value: str | os.PathLike[str], cfg_dir: Path) -> str:
+def _resolve_data_path(path_value: str | os.PathLike[str] | None, cfg_dir: Path) -> str:
+    if path_value is None:
+        return str(cfg_dir)
     candidate = Path(path_value).expanduser()
     if not candidate.is_absolute():
         candidate = (cfg_dir / candidate).resolve()
@@ -182,26 +113,31 @@ def _resolve_data_path(path_value: str | os.PathLike[str], cfg_dir: Path) -> str
     return str(candidate)
 
 
-def _merge_split_cfg(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+def _merge_split_cfg(base: Dict[str, Any], override: Dict[str, Any] | None) -> Dict[str, Any]:
     merged = dict(base)
-    merged.update(override)
-    merged["subdirs"] = _as_subdirs(_require_key(merged, "subdirs", "data.train"), "data.train.subdirs")
+    if override:
+        merged.update(override)
+    if isinstance(merged.get("subdirs"), str):
+        merged["subdirs"] = [merged["subdirs"]]
+    merged.setdefault("subdirs", ["."])
     return merged
 
 
-def _collect_files_for_spec(*, split_cfg: Dict[str, Any]) -> list[Path]:
+def _collect_files_for_spec(
+    *,
+    split_cfg: Dict[str, Any],
+) -> list[Path]:
     explicit = split_cfg.get("files")
     if explicit:
-        if not isinstance(explicit, list):
-            raise ValueError("data.train.files must be a list when provided")
         files = [Path(f).expanduser().resolve() for f in explicit]
     else:
-        data_type = str(_require_key(split_cfg, "type", "data.train"))
-        root = Path(_require_key(split_cfg, "root", "data.train")).expanduser().resolve()
-        subdirs = _as_subdirs(_require_key(split_cfg, "subdirs", "data.train"), "data.train.subdirs")
-        if data_type != "pod5":
+        data_type = split_cfg.get("type", "pod5")
+        root = Path(split_cfg.get("root", ".")).expanduser().resolve()
+        subdirs = split_cfg.get("subdirs", ["."])
+        if data_type == "pod5":
+            files = discover_pod5_files(root, subdirs)
+        else:
             raise ValueError(f"Unknown data.type={data_type}")
-        files = discover_pod5_files(root, subdirs)
     if not files:
         raise FileNotFoundError(f"No files found for split under {split_cfg.get('root')}")
     return files
@@ -212,14 +148,13 @@ def _build_dataset(
     files: list[Path],
     window_ms: int,
     sample_rate: float,
-    window_samples: int,
-    split_cfg: Dict[str, Any],
+    window_samples: int | None,
+    split_cfg: Dict[str, Any] | None = None,
 ) -> NanoporeSignalDataset:
-    loader_workers = _as_int(_require_key(split_cfg, "loader_workers", "data.train"), "data.train.loader_workers", minimum=1)
-    loader_prefetch = _as_int(
-        _require_key(split_cfg, "loader_prefetch_chunks", "data.train"),
-        "data.train.loader_prefetch_chunks",
-        minimum=1,
+    cfg = split_cfg or {}
+    loader_workers = int(cfg.get("loader_workers", 1) or 1)
+    loader_prefetch = int(
+        cfg.get("loader_prefetch_chunks", cfg.get("loader_prefetch") or 128)
     )
     return NanoporeSignalDataset.from_paths(
         files,
@@ -231,16 +166,23 @@ def _build_dataset(
     )
 
 
-def _prepare_split_dataset(*, split_cfg: Dict[str, Any]) -> tuple[NanoporeSignalDataset, list[Path]]:
-    segment_sec = _as_float(_require_key(split_cfg, "segment_sec", "data.train"), "data.train.segment_sec")
-    sample_rate = _as_float(_require_key(split_cfg, "sample_rate", "data.train"), "data.train.sample_rate")
-    window_ms = int(round(segment_sec * 1000.0))
-    window_samples = _as_int(
-        _require_key(split_cfg, "segment_samples", "data.train"),
-        "data.train.segment_samples",
-        minimum=1,
-    )
-    data_type = str(_require_key(split_cfg, "type", "data.train"))
+def _prepare_split_dataset(
+    *,
+    split_cfg: Dict[str, Any],
+) -> tuple[NanoporeSignalDataset, list[Path]]:
+    segment_sec = float(split_cfg.get("segment_sec", 1.0))
+    sample_rate = float(split_cfg.get("sample_rate", 5000.0))
+    window_ms = int(round(segment_sec * 1000))
+    segment_samples_raw = split_cfg.get("segment_samples")
+    window_samples = None
+    if segment_samples_raw not in (None, ""):
+        try:
+            window_samples = int(segment_samples_raw)
+        except (TypeError, ValueError):
+            window_samples = None
+    if window_samples is not None and window_samples <= 0:
+        window_samples = None
+    data_type = split_cfg.get("type", "pod5")
     if data_type != "pod5":
         raise ValueError(f"Unsupported data type {data_type}")
     files = _collect_files_for_spec(split_cfg=split_cfg)
@@ -252,6 +194,16 @@ def _prepare_split_dataset(*, split_cfg: Dict[str, Any]) -> tuple[NanoporeSignal
         split_cfg=split_cfg,
     )
     return dataset, files
+
+
+def _positive_int(value: Any) -> int | None:
+    if value in (None, "", False):
+        return None
+    try:
+        intval = int(value)
+    except (TypeError, ValueError):
+        return None
+    return intval if intval > 0 else None
 
 
 def _detect_local_device_count() -> int:
@@ -285,347 +237,369 @@ def _scale_by_devices(
 
 def main() -> None:
     args = parse_args()
+    if args.config is not None:
+        # 兼容：若传入相对路径，则相对项目根目录解析；优先绝对路径
+        cfg_path = Path(args.config)
+        if not cfg_path.is_absolute():
+            root_guess = Path(__file__).resolve().parent.parent / cfg_path
+            cfg_path = root_guess.resolve()
+        cfg = json.loads(cfg_path.read_text())
+        cfg_dir = cfg_path.parent
+        seed = int(cfg.get("seed", new_epoch_seed()))
+        train_cfg = cfg.get("train", {})
+        model_cfg = cfg.get("model", {})
+        data_cfg = cfg.get("data", {})
+        ckpt_cfg = cfg.get("checkpoint", {})
+        local_devices = _detect_local_device_count()
+        reference_devices = (
+            _positive_int(train_cfg.get("reference_device_count"))
+            or _positive_int(data_cfg.get("reference_device_count"))
+            or local_devices
+        )
+        data_parallel = train_cfg.get("data_parallel", train_cfg.get("use_multi_gpu", None))
+        if args.data_parallel is not None:
+            data_parallel = bool(args.data_parallel)
+        scale_devices = local_devices if data_parallel is not False else 1
 
-    cfg_path = Path(args.config)
-    if not cfg_path.is_absolute():
-        cfg_path = (_ROOT / cfg_path).resolve()
-    cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-    if not isinstance(cfg, dict):
-        raise ValueError("Top-level config must be a JSON object")
+        beta_cfg = model_cfg.get("beta", None)
+        legacy_beta_cfg = model_cfg.get("legacy_beta", None)
+        if beta_cfg is not None or legacy_beta_cfg is not None:
+            beta_value = float(model_cfg.get("beta", 0.25))
+            legacy_beta_value = bool(model_cfg.get("legacy_beta", False))
+            if beta_value != 0.25 or legacy_beta_value:
+                raise ValueError(
+                    "DiVeQ mode does not use model.beta / model.legacy_beta. "
+                    "Please remove legacy VQ-VAE auxiliary-loss settings from the model config."
+                )
+            print("[warn] model.beta and model.legacy_beta are deprecated in DiVeQ mode and ignored.")
 
-    cfg_dir = cfg_path.parent
-    train_cfg = _require_dict(cfg, "train", "config")
-    model_cfg = _require_dict(cfg, "model", "config")
-    data_cfg = _require_dict(cfg, "data", "config")
-    ckpt_cfg = _require_dict(cfg, "checkpoint", "config")
-    logging_cfg = _require_dict(cfg, "logging", "config")
-    wandb_cfg = _require_dict(logging_cfg, "wandb", "logging")
-    optim_cfg = _require_dict(cfg, "optim", "config")
+        epochs = _positive_int(train_cfg.get("epochs"))
+        cli_epochs = _positive_int(args.epochs)
+        if cli_epochs is not None:
+            epochs = cli_epochs
+        if epochs is None:
+            raise ValueError("Epoch-based training requires 'train.epochs' in the config or --epochs override.")
+        cli_batch_size = _positive_int(args.batch_size)
+        if cli_batch_size is not None:
+            batch_size = cli_batch_size
+        else:
+            per_device_batch_size = _positive_int(train_cfg.get("per_device_batch_size"))
+            if per_device_batch_size is not None:
+                batch_size = max(1, per_device_batch_size) * scale_devices
+                print(
+                    "[setup] batch_size derived from train.per_device_batch_size="
+                    f"{per_device_batch_size} x effective_devices={scale_devices} -> {batch_size}"
+                )
+            else:
+                configured_batch_size = int(train_cfg.get("batch_size", 512))
+                auto_scale_batch = bool(train_cfg.get("auto_scale_batch_by_device_count", False))
+                if auto_scale_batch and reference_devices != scale_devices:
+                    batch_size = _scale_by_devices(
+                        configured_batch_size,
+                        current_devices=scale_devices,
+                        reference_devices=reference_devices,
+                        minimum=(scale_devices if scale_devices > 1 else 1),
+                        align_to_devices=True,
+                    )
+                    print(
+                        "[setup] auto-scaled batch_size from "
+                        f"{configured_batch_size} (@{reference_devices} GPUs) -> "
+                        f"{batch_size} (@{scale_devices} effective devices)"
+                    )
+                else:
+                    batch_size = configured_batch_size
+        lr = float(train_cfg.get("learning_rate", 1e-4))
+        log_every_steps = int(train_cfg.get("log_every_steps", 100))
+        if args.log_every_steps is not None:
+            log_every_steps = int(args.log_every_steps)
+        codebook_stats_every_steps = train_cfg.get("codebook_stats_every_steps", None)
+        if args.codebook_stats_every_steps is not None:
+            codebook_stats_every_steps = args.codebook_stats_every_steps
+        scan_steps = int(train_cfg.get("scan_steps", 1))
+        if args.scan_steps is not None:
+            scan_steps = max(1, int(args.scan_steps))
+        grad_clip = float(train_cfg.get("grad_clip", 1.0))
+        host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
+        device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
+        host_prefetch_per_device = _positive_int(train_cfg.get("host_prefetch_per_device"))
+        device_prefetch_per_device = _positive_int(train_cfg.get("device_prefetch_per_device"))
+        if args.host_prefetch_size is None and host_prefetch_per_device is not None:
+            host_prefetch_size = max(1, host_prefetch_per_device) * scale_devices
+            print(
+                "[setup] host_prefetch_size derived from train.host_prefetch_per_device="
+                f"{host_prefetch_per_device} -> {host_prefetch_size}"
+            )
+        if args.device_prefetch_size is None and device_prefetch_per_device is not None:
+            device_prefetch_size = max(1, device_prefetch_per_device) * scale_devices
+            print(
+                "[setup] device_prefetch_size derived from train.device_prefetch_per_device="
+                f"{device_prefetch_per_device} -> {device_prefetch_size}"
+            )
+        if args.host_prefetch_size is not None:
+            host_prefetch_size = max(1, int(args.host_prefetch_size))
+        if args.device_prefetch_size is not None:
+            device_prefetch_size = max(1, int(args.device_prefetch_size))
+        # weights aligned with SimVQ losses
+        lw = train_cfg.get("loss_weights", {})
+        if "commit" in lw:
+            raise ValueError(
+                "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
+            )
+        if "diveq" in lw:
+            raise ValueError(
+                "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
+            )
+        loss_weights = {
+            "time_l1": float(lw.get("time_l1", lw.get("recon", 1.0))),
+            "diff1_l1": float(lw.get("diff1_l1", 0.1)),
+            "diff2_l1": float(lw.get("diff2_l1", 0.05)),
+            "stft_logmag_l1": float(lw.get("stft_logmag_l1", 0.05)),
+            "gan": float(lw.get("gan", 0.03)),
+            "feature": float(lw.get("feature", 0.1)),
+        }
+        stft_cfg_raw = dict(train_cfg.get("stft_loss") or {})
+        stft_loss_cfg = {
+            "n_fft": int(stft_cfg_raw.get("n_fft", 256)),
+            "win_length": int(stft_cfg_raw.get("win_length", stft_cfg_raw.get("n_fft", 256))),
+            "hop_length": int(stft_cfg_raw.get("hop_length", 64)),
+        }
 
-    seed = _as_int(_require_key(cfg, "seed", "config"), "seed")
-    if args.seed is not None:
-        seed = _as_int(args.seed, "cli.seed")
+        # adversarial scheduling (step-based)
+        disc_start_step = int(train_cfg.get("disc_start_step", 0))
+        disc_warmup_steps = int(train_cfg.get("disc_warmup_steps", 0))
+        # Optimization group overrides (optional)
+        optim_cfg = cfg.get("optim", {})
+        if "codebook_lr_mult" in optim_cfg:
+            raise ValueError(
+                "SimVQ codebook is not optimized via params; remove optim.codebook_lr_mult from the config."
+            )
+        disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.1))
+        freeze_W = bool(optim_cfg.get("freeze_W", False))
+        model_kwargs = model_cfg
 
-    local_devices = _detect_local_device_count()
-    reference_devices = _as_int(
-        _require_key(train_cfg, "reference_device_count", "train"),
-        "train.reference_device_count",
-        minimum=1,
-    )
-
-    data_parallel = _as_bool(_require_key(train_cfg, "data_parallel", "train"), "train.data_parallel")
-    if args.data_parallel is not None:
-        data_parallel = bool(args.data_parallel)
-    scale_devices = local_devices if data_parallel else 1
-
-    epochs = _as_int(_require_key(train_cfg, "epochs", "train"), "train.epochs", minimum=1)
-    if args.epochs is not None:
-        epochs = _as_int(args.epochs, "cli.epochs", minimum=1)
-
-    configured_batch_size = _as_int(_require_key(train_cfg, "batch_size", "train"), "train.batch_size", minimum=1)
-    per_device_batch_size = _as_optional_int(
-        _require_key(train_cfg, "per_device_batch_size", "train"),
-        "train.per_device_batch_size",
-        minimum=1,
-    )
-    auto_scale_batch = _as_bool(
-        _require_key(train_cfg, "auto_scale_batch_by_device_count", "train"),
-        "train.auto_scale_batch_by_device_count",
-    )
-    if args.batch_size is not None:
-        batch_size = _as_int(args.batch_size, "cli.batch_size", minimum=1)
-    elif per_device_batch_size is not None:
-        batch_size = per_device_batch_size * scale_devices
+        default_loader_workers = int(data_cfg.get("loader_workers", 8))
+        default_loader_prefetch = int(data_cfg.get("loader_prefetch_chunks", data_cfg.get("loader_prefetch") or 512))
+        loader_workers_per_device = _positive_int(data_cfg.get("loader_workers_per_device"))
+        loader_prefetch_per_device = _positive_int(data_cfg.get("loader_prefetch_chunks_per_device"))
+        auto_scale_loader = bool(data_cfg.get("auto_scale_loader_by_device_count", False))
+        cpu_limit = max(1, (os.cpu_count() or 8) - 2)
+        if args.loader_workers is None:
+            if loader_workers_per_device is not None:
+                default_loader_workers = min(cpu_limit, max(1, loader_workers_per_device * scale_devices))
+                print(
+                    "[setup] loader_workers derived from data.loader_workers_per_device="
+                    f"{loader_workers_per_device} -> {default_loader_workers}"
+                )
+            elif auto_scale_loader and reference_devices != scale_devices:
+                default_loader_workers = _scale_by_devices(
+                    default_loader_workers,
+                    current_devices=scale_devices,
+                    reference_devices=reference_devices,
+                    minimum=1,
+                )
+                default_loader_workers = min(cpu_limit, max(1, default_loader_workers))
+                print(
+                    "[setup] auto-scaled loader_workers using reference_device_count="
+                    f"{reference_devices} -> {default_loader_workers}"
+                )
+        if args.loader_prefetch is None:
+            if loader_prefetch_per_device is not None:
+                default_loader_prefetch = max(1, loader_prefetch_per_device) * scale_devices
+                print(
+                    "[setup] loader_prefetch_chunks derived from "
+                    "data.loader_prefetch_chunks_per_device="
+                    f"{loader_prefetch_per_device} -> {default_loader_prefetch}"
+                )
+            elif auto_scale_loader and reference_devices != scale_devices:
+                default_loader_prefetch = _scale_by_devices(
+                    default_loader_prefetch,
+                    current_devices=scale_devices,
+                    reference_devices=reference_devices,
+                    minimum=1,
+                )
+                print(
+                    "[setup] auto-scaled loader_prefetch_chunks using reference_device_count="
+                    f"{reference_devices} -> {default_loader_prefetch}"
+                )
+        base_root = _resolve_data_path(data_cfg.get("root", "./nanopore"), cfg_dir)
+        base_data_cfg: Dict[str, Any] = {
+            "type": data_cfg.get("type", "pod5"),
+            "root": base_root,
+            "subdirs": data_cfg.get("subdirs", ["."]),
+            "segment_sec": float(data_cfg.get("segment_sec", 1.0)),
+            "segment_samples": data_cfg.get("segment_samples"),
+            "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
+            "loader_workers": max(1, default_loader_workers),
+            "loader_prefetch_chunks": max(1, default_loader_prefetch),
+        }
+        if args.loader_workers is not None:
+            base_data_cfg["loader_workers"] = max(1, int(args.loader_workers))
+        if args.loader_prefetch is not None:
+            base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
         print(
-            "[setup] batch_size derived from train.per_device_batch_size="
-            f"{per_device_batch_size} x effective_devices={scale_devices} -> {batch_size}"
+            "[setup] devices="
+            f"{local_devices} (reference={reference_devices}), "
+            f"effective_devices={scale_devices}, "
+            f"batch_size={batch_size}, "
+            f"loader_workers={base_data_cfg['loader_workers']}, "
+            f"loader_prefetch_chunks={base_data_cfg['loader_prefetch_chunks']}, "
+            f"host_prefetch_size={host_prefetch_size}, "
+            f"device_prefetch_size={device_prefetch_size}"
         )
-    elif auto_scale_batch and reference_devices != scale_devices:
-        batch_size = _scale_by_devices(
-            configured_batch_size,
-            current_devices=scale_devices,
-            reference_devices=reference_devices,
-            minimum=(scale_devices if scale_devices > 1 else 1),
-            align_to_devices=True,
-        )
-        print(
-            "[setup] auto-scaled batch_size from "
-            f"{configured_batch_size} (@{reference_devices} GPUs) -> "
-            f"{batch_size} (@{scale_devices} effective devices)"
-        )
-    else:
-        batch_size = configured_batch_size
+        train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
+        train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
+        ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-    lr = _as_float(_require_key(train_cfg, "learning_rate", "train"), "train.learning_rate")
-    if args.lr is not None:
-        lr = _as_float(args.lr, "cli.lr")
+        ckpt_dir_raw = args.ckpt_dir or ckpt_cfg.get("dir") or "checkpoints"
+        ckpt_dir = str(Path(ckpt_dir_raw).expanduser().resolve())
+        resume_from_cfg = ckpt_cfg.get("resume_from")
+        checkpoint_every_steps = int(ckpt_cfg.get("every_steps", 5000))
+        if args.checkpoints_per_epoch is not None:
+            checkpoint_every_steps = max(1, int(args.checkpoints_per_epoch))
+        resume_from = None
+        if resume_from_cfg:
+            resume_path = Path(resume_from_cfg)
+            if not resume_path.is_absolute():
+                resume_from = str((cfg_dir / resume_path).resolve())
+            else:
+                resume_from = str(resume_path.resolve())
 
-    log_every_steps = _as_int(_require_key(train_cfg, "log_every_steps", "train"), "train.log_every_steps", minimum=1)
-    if args.log_every_steps is not None:
-        log_every_steps = _as_int(args.log_every_steps, "cli.log_every_steps", minimum=1)
+        logging_cfg = cfg.get("logging", {})
+        wandb_cfg = logging_cfg.get("wandb", {})
+        wandb_enabled = bool(wandb_cfg.get("enabled", False) or args.wandb)
+        wandb_project = wandb_cfg.get("project") or args.wandb_project or "simvq-nanopore"
+        wandb_run_name = wandb_cfg.get("run_name") or args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        wandb_entity = wandb_cfg.get("entity")
+        wandb_api_key = wandb_cfg.get("api_key")
+        wandb_logger = None
+        if wandb_enabled:
+            wandb_logger = init_wandb(
+                wandb_project,
+                wandb_run_name,
+                cfg,
+                api_key=wandb_api_key,
+                entity=wandb_entity,
+            )
 
-    codebook_stats_every_steps = _as_optional_int(
-        _require_key(train_cfg, "codebook_stats_every_steps", "train"),
-        "train.codebook_stats_every_steps",
-        minimum=1,
+        try:
+            train_model_from_pod5(
+                ds,
+                num_epochs=epochs,
+                learning_rate=lr,
+                seed=int(seed),
+                ckpt_dir=ckpt_dir,
+                loss_weights=loss_weights,
+                stft_loss_cfg=stft_loss_cfg,
+                disc_start_step=disc_start_step,
+                model_cfg=model_kwargs,
+                log_file=str(Path(ckpt_dir) / "train.log"),
+                batch_size=batch_size,
+                resume_from=resume_from,
+                log_every_steps=log_every_steps,
+                codebook_stats_every_steps=codebook_stats_every_steps,
+                checkpoint_every_steps=checkpoint_every_steps,
+                wandb_logger=wandb_logger,
+                freeze_W=freeze_W,
+                disc_warmup_steps=disc_warmup_steps,
+                disc_lr_mult=disc_lr_mult,
+                host_prefetch_size=host_prefetch_size,
+                device_prefetch_size=device_prefetch_size,
+                grad_clip=grad_clip,
+                use_data_parallel=(None if data_parallel is None else bool(data_parallel)),
+                max_steps_total=args.max_steps,
+                max_steps_per_epoch=args.max_steps_per_epoch,
+                scan_steps=scan_steps,
+            )
+        finally:
+            if wandb_logger is not None:
+                wandb_logger.finish()
+        return
+
+    # Legacy CLI path (no --config)
+    if args.root is None:
+        raise SystemExit("Please provide --config or legacy positional ROOT.")
+    root: Path = args.root
+    subdirs = args.subdirs
+    files = discover_pod5_files(root, subdirs)
+    if not files:
+        raise FileNotFoundError(f"No .pod5 under {root} (subdirs={subdirs})")
+    seed = args.seed if args.seed is not None else new_epoch_seed()
+    legacy_loader_workers = (
+        max(1, int(args.loader_workers))
+        if args.loader_workers is not None
+        else 8
     )
-    if args.codebook_stats_every_steps is not None:
-        codebook_stats_every_steps = _as_optional_int(
-            args.codebook_stats_every_steps,
-            "cli.codebook_stats_every_steps",
-            minimum=1,
-        )
-
-    codebook_stats_until_step = _as_optional_int(
-        _require_key(train_cfg, "codebook_stats_until_step", "train"),
-        "train.codebook_stats_until_step",
-        minimum=1,
+    legacy_loader_prefetch = (
+        max(1, int(args.loader_prefetch)) if args.loader_prefetch is not None else 512
     )
-    if args.codebook_stats_until_step is not None:
-        codebook_stats_until_step = _as_optional_int(
-            args.codebook_stats_until_step,
-            "cli.codebook_stats_until_step",
-            minimum=1,
-        )
-
-    scan_steps = _as_int(_require_key(train_cfg, "scan_steps", "train"), "train.scan_steps", minimum=1)
-    if args.scan_steps is not None:
-        scan_steps = _as_int(args.scan_steps, "cli.scan_steps", minimum=1)
-
-    grad_clip = _as_float(_require_key(train_cfg, "grad_clip", "train"), "train.grad_clip")
-
-    host_prefetch_size = _as_int(
-        _require_key(train_cfg, "host_prefetch_size", "train"),
-        "train.host_prefetch_size",
-        minimum=1,
+    legacy_host_prefetch = (
+        max(1, int(args.host_prefetch_size)) if args.host_prefetch_size is not None else 64
     )
-    host_prefetch_per_device = _as_optional_int(
-        _require_key(train_cfg, "host_prefetch_per_device", "train"),
-        "train.host_prefetch_per_device",
-        minimum=1,
+    legacy_device_prefetch = (
+        max(1, int(args.device_prefetch_size)) if args.device_prefetch_size is not None else 16
     )
-    if args.host_prefetch_size is None and host_prefetch_per_device is not None:
-        host_prefetch_size = host_prefetch_per_device * scale_devices
-        print(
-            "[setup] host_prefetch_size derived from train.host_prefetch_per_device="
-            f"{host_prefetch_per_device} -> {host_prefetch_size}"
-        )
-    if args.host_prefetch_size is not None:
-        host_prefetch_size = _as_int(args.host_prefetch_size, "cli.host_prefetch_size", minimum=1)
+    def _legacy_positive(value: Any) -> int | None:
+        if value in (None, "", False):
+            return None
+        try:
+            intval = int(value)
+        except (TypeError, ValueError):
+            return None
+        return intval if intval > 0 else None
 
-    device_prefetch_size = _as_int(
-        _require_key(train_cfg, "device_prefetch_size", "train"),
-        "train.device_prefetch_size",
-        minimum=1,
-    )
-    device_prefetch_per_device = _as_optional_int(
-        _require_key(train_cfg, "device_prefetch_per_device", "train"),
-        "train.device_prefetch_per_device",
-        minimum=1,
-    )
-    if args.device_prefetch_size is None and device_prefetch_per_device is not None:
-        device_prefetch_size = device_prefetch_per_device * scale_devices
-        print(
-            "[setup] device_prefetch_size derived from train.device_prefetch_per_device="
-            f"{device_prefetch_per_device} -> {device_prefetch_size}"
-        )
-    if args.device_prefetch_size is not None:
-        device_prefetch_size = _as_int(args.device_prefetch_size, "cli.device_prefetch_size", minimum=1)
+    legacy_epochs = _legacy_positive(args.epochs)
+    if legacy_epochs is None:
+        legacy_epochs = 2
 
-    lw = _require_dict(train_cfg, "loss_weights", "train")
-    for banned in ("commit", "diveq"):
-        if banned in lw:
-            raise ValueError(f"Pure DiVeQ training does not use loss_weights.{banned}; remove it from config.")
-    loss_weights = {
-        "time_l1": _as_float(_require_key(lw, "time_l1", "train.loss_weights"), "train.loss_weights.time_l1"),
-        "gan": _as_float(_require_key(lw, "gan", "train.loss_weights"), "train.loss_weights.gan"),
-        "feature": _as_float(_require_key(lw, "feature", "train.loss_weights"), "train.loss_weights.feature"),
+    train_spec = {
+        "type": "pod5",
+        "root": str(root),
+        "subdirs": subdirs or ["."],
+        "segment_sec": float(args.segment_sec),
+        "sample_rate": float(args.sample_rate),
+        "loader_workers": legacy_loader_workers,
+        "loader_prefetch_chunks": legacy_loader_prefetch,
     }
-
-    disc_start_step = _as_int(_require_key(train_cfg, "disc_start_step", "train"), "train.disc_start_step", minimum=0)
-    disc_warmup_steps = _as_int(
-        _require_key(train_cfg, "disc_warmup_steps", "train"),
-        "train.disc_warmup_steps",
-        minimum=0,
-    )
-    disc_every_steps = _as_int(
-        _require_key(train_cfg, "disc_every_steps", "train"),
-        "train.disc_every_steps",
-        minimum=1,
-    )
-
-    if "codebook_lr_mult" in optim_cfg:
-        raise ValueError("SimVQ codebook is not optimized via params; remove optim.codebook_lr_mult from config.")
-    disc_lr_mult = _as_float(_require_key(optim_cfg, "disc_lr_mult", "optim"), "optim.disc_lr_mult")
-    freeze_W = _as_bool(_require_key(optim_cfg, "freeze_W", "optim"), "optim.freeze_W")
-
-    model_kwargs = dict(model_cfg)
-
-    default_loader_workers = _as_int(_require_key(data_cfg, "loader_workers", "data"), "data.loader_workers", minimum=1)
-    default_loader_prefetch = _as_int(
-        _require_key(data_cfg, "loader_prefetch_chunks", "data"),
-        "data.loader_prefetch_chunks",
-        minimum=1,
-    )
-    loader_workers_per_device = _as_optional_int(
-        _require_key(data_cfg, "loader_workers_per_device", "data"),
-        "data.loader_workers_per_device",
-        minimum=1,
-    )
-    loader_prefetch_per_device = _as_optional_int(
-        _require_key(data_cfg, "loader_prefetch_chunks_per_device", "data"),
-        "data.loader_prefetch_chunks_per_device",
-        minimum=1,
-    )
-    auto_scale_loader = _as_bool(
-        _require_key(data_cfg, "auto_scale_loader_by_device_count", "data"),
-        "data.auto_scale_loader_by_device_count",
-    )
-
-    cpu_limit = max(1, (os.cpu_count() or 8) - 2)
-    if args.loader_workers is None:
-        if loader_workers_per_device is not None:
-            default_loader_workers = min(cpu_limit, max(1, loader_workers_per_device * scale_devices))
-            print(
-                "[setup] loader_workers derived from data.loader_workers_per_device="
-                f"{loader_workers_per_device} -> {default_loader_workers}"
-            )
-        elif auto_scale_loader and reference_devices != scale_devices:
-            default_loader_workers = _scale_by_devices(
-                default_loader_workers,
-                current_devices=scale_devices,
-                reference_devices=reference_devices,
-                minimum=1,
-            )
-            default_loader_workers = min(cpu_limit, max(1, default_loader_workers))
-            print(
-                "[setup] auto-scaled loader_workers using reference_device_count="
-                f"{reference_devices} -> {default_loader_workers}"
-            )
-    if args.loader_prefetch is None:
-        if loader_prefetch_per_device is not None:
-            default_loader_prefetch = loader_prefetch_per_device * scale_devices
-            print(
-                "[setup] loader_prefetch_chunks derived from data.loader_prefetch_chunks_per_device="
-                f"{loader_prefetch_per_device} -> {default_loader_prefetch}"
-            )
-        elif auto_scale_loader and reference_devices != scale_devices:
-            default_loader_prefetch = _scale_by_devices(
-                default_loader_prefetch,
-                current_devices=scale_devices,
-                reference_devices=reference_devices,
-                minimum=1,
-            )
-            print(
-                "[setup] auto-scaled loader_prefetch_chunks using reference_device_count="
-                f"{reference_devices} -> {default_loader_prefetch}"
-            )
-
-    base_root = _resolve_data_path(str(_require_key(data_cfg, "root", "data")), cfg_dir)
-    base_data_cfg: Dict[str, Any] = {
-        "type": str(_require_key(data_cfg, "type", "data")),
-        "root": base_root,
-        "subdirs": _as_subdirs(_require_key(data_cfg, "subdirs", "data"), "data.subdirs"),
-        "segment_sec": _as_float(_require_key(data_cfg, "segment_sec", "data"), "data.segment_sec"),
-        "segment_samples": _as_int(_require_key(data_cfg, "segment_samples", "data"), "data.segment_samples", minimum=1),
-        "sample_rate": _as_float(_require_key(data_cfg, "sample_rate", "data"), "data.sample_rate"),
-        "loader_workers": max(1, default_loader_workers),
-        "loader_prefetch_chunks": max(1, default_loader_prefetch),
-    }
-    if args.loader_workers is not None:
-        base_data_cfg["loader_workers"] = _as_int(args.loader_workers, "cli.loader_workers", minimum=1)
-    if args.loader_prefetch is not None:
-        base_data_cfg["loader_prefetch_chunks"] = _as_int(args.loader_prefetch, "cli.loader_prefetch", minimum=1)
-
-    print(
-        "[setup] devices="
-        f"{local_devices} (reference={reference_devices}), "
-        f"effective_devices={scale_devices}, "
-        f"batch_size={batch_size}, "
-        f"loader_workers={base_data_cfg['loader_workers']}, "
-        f"loader_prefetch_chunks={base_data_cfg['loader_prefetch_chunks']}, "
-        f"host_prefetch_size={host_prefetch_size}, "
-        f"device_prefetch_size={device_prefetch_size}"
-    )
-
-    train_split_cfg = _require_dict(data_cfg, "train", "data")
-    train_spec = _merge_split_cfg(base_data_cfg, train_split_cfg)
-    train_spec["root"] = _resolve_data_path(str(_require_key(train_spec, "root", "data.train")), cfg_dir)
     ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-    ckpt_dir_raw = args.ckpt_dir or Path(_require_key(ckpt_cfg, "dir", "checkpoint"))
-    ckpt_dir = str(Path(ckpt_dir_raw).expanduser().resolve())
-    resume_from_cfg = _require_key(ckpt_cfg, "resume_from", "checkpoint")
-    checkpoint_every_steps = _as_int(
-        _require_key(ckpt_cfg, "every_steps", "checkpoint"),
-        "checkpoint.every_steps",
-        minimum=0,
-    )
-    if args.checkpoints_per_epoch is not None:
-        checkpoint_every_steps = _as_int(args.checkpoints_per_epoch, "cli.checkpoints_per_epoch", minimum=1)
-
-    resume_from = None
-    if resume_from_cfg:
-        resume_path = Path(str(resume_from_cfg)).expanduser()
-        if not resume_path.is_absolute():
-            resume_from = str((cfg_dir / resume_path).resolve())
-        else:
-            resume_from = str(resume_path.resolve())
-
-    wandb_enabled = _as_bool(_require_key(wandb_cfg, "enabled", "logging.wandb"), "logging.wandb.enabled")
-    if args.wandb is not None:
-        wandb_enabled = bool(args.wandb)
-    wandb_project = str(_require_key(wandb_cfg, "project", "logging.wandb"))
-    if args.wandb_project is not None:
-        wandb_project = str(args.wandb_project)
-    wandb_run_name = str(_require_key(wandb_cfg, "run_name", "logging.wandb"))
-    if args.wandb_run is not None:
-        wandb_run_name = str(args.wandb_run)
-    elif not wandb_run_name:
-        wandb_run_name = f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-    wandb_entity = _require_key(wandb_cfg, "entity", "logging.wandb")
-    wandb_api_key = _require_key(wandb_cfg, "api_key", "logging.wandb")
-
+    ckpt_dir = str(args.ckpt_dir) if args.ckpt_dir is not None else str(Path("checkpoints").resolve())
+    legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
+    legacy_log_every_steps = int(args.log_every_steps) if args.log_every_steps is not None else 100
+    legacy_scan_steps = max(1, int(args.scan_steps)) if args.scan_steps is not None else 1
+    legacy_checkpoint_every_steps = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 5000
     wandb_logger = None
-    if wandb_enabled:
-        wandb_logger = init_wandb(
-            wandb_project,
-            wandb_run_name,
-            cfg,
-            api_key=wandb_api_key,
-            entity=wandb_entity,
-        )
-
+    if args.wandb:
+        run_name = args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        wandb_payload: Dict[str, Any] = {
+            "mode": "cli",
+            "batch_size": legacy_batch_size,
+        }
+        if legacy_epochs is not None:
+            wandb_payload["epochs"] = int(legacy_epochs)
+        wandb_logger = init_wandb(args.wandb_project or "simvq-nanopore", run_name, wandb_payload, api_key=None)
+    default_loss_weights = {
+        "time_l1": 2.0,
+        "gan": 0.03,
+        "feature": 0.1,
+    }
     try:
         train_model_from_pod5(
             ds,
-            num_epochs=epochs,
-            learning_rate=lr,
+            num_epochs=int(legacy_epochs),
+            learning_rate=float(args.lr),
             seed=int(seed),
             ckpt_dir=ckpt_dir,
-            loss_weights=loss_weights,
-            disc_start_step=disc_start_step,
-            model_cfg=model_kwargs,
-            log_file=str(Path(ckpt_dir) / "train.log"),
-            batch_size=batch_size,
-            expected_input_length=int(train_spec["segment_samples"]),
-            resume_from=resume_from,
-            log_every_steps=log_every_steps,
-            codebook_stats_every_steps=codebook_stats_every_steps,
-            codebook_stats_until_step=codebook_stats_until_step,
-            checkpoint_every_steps=checkpoint_every_steps,
+            loss_weights=default_loss_weights,
+            batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
-            freeze_W=freeze_W,
-            disc_warmup_steps=disc_warmup_steps,
-            disc_every_steps=disc_every_steps,
-            disc_lr_mult=disc_lr_mult,
-            host_prefetch_size=host_prefetch_size,
-            device_prefetch_size=device_prefetch_size,
-            grad_clip=grad_clip,
-            use_data_parallel=data_parallel,
+            log_every_steps=legacy_log_every_steps,
+            checkpoint_every_steps=legacy_checkpoint_every_steps,
+            host_prefetch_size=legacy_host_prefetch,
+            device_prefetch_size=legacy_device_prefetch,
+            use_data_parallel=args.data_parallel,
             max_steps_total=args.max_steps,
             max_steps_per_epoch=args.max_steps_per_epoch,
-            scan_steps=scan_steps,
+            scan_steps=legacy_scan_steps,
         )
     finally:
         if wandb_logger is not None:

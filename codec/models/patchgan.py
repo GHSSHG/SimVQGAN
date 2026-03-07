@@ -11,10 +11,10 @@ from .encoder import SimVQResBlock1D
 class PatchDiscriminator1D(nn.Module):
     """SimVQ-inspired PatchGAN discriminator with residual refinement."""
 
-    channels: Tuple[int, ...] = (32, 64, 128)
-    strides: Tuple[int, ...] = (2, 2, 2)
-    kernel_size: int = 11
-    resblock_layers: int = 1
+    channels: Tuple[int, ...] = (32, 64, 128, 256)
+    strides: Tuple[int, ...] = (2, 2, 2, 2)
+    kernel_size: int = 15
+    resblock_layers: int = 2
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -27,8 +27,6 @@ class PatchDiscriminator1D(nn.Module):
             h = x
         else:
             raise ValueError("PatchDiscriminator1D expects (B,T) or (B,T,1)")
-        if h.dtype != self.dtype:
-            h = h.astype(self.dtype)
         feats: List[jnp.ndarray] = []
         chs = tuple(self.channels)
         strides = tuple(self.strides)
