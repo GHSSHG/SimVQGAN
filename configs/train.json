@@ -7,7 +7,7 @@
     "per_device_batch_size": 256,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 0.0002,
+    "learning_rate": 1e-4,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
@@ -91,12 +91,21 @@
     "wandb": {
       "enabled": true,
       "project": "simvq-local",
-      "run_name": "v2.0",
+      "run_name": "v4.0",
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },
   "optim": {
-    "disc_lr_mult": 0.15,
-    "freeze_W": false
+    "lr_multipliers": {
+      "encoder": 0.8,
+      "decoder": 1.0,
+      "quant_conv": 0.8,
+      "post_quant_conv": 1.0,
+      "pre_quant_tf": 0.8,
+      "post_quant_tf": 1.0,
+      "quantizer_W": 0.4,
+      "quantizer_proj_bias": 0.4,
+      "discriminator": 0.15
+    }
   }
 }

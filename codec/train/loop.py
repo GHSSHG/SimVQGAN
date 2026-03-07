@@ -165,7 +165,7 @@ def train_model_from_pod5(
     checkpoint_every_steps: int = 5000,
     wandb_logger: Any | None = None,
     # Optimization knobs
-    freeze_W: bool = False,
+    generator_lr_multipliers: Dict[str, float] | None = None,
     grad_clip: float = 1.0,
     disc_warmup_steps: int = 0,
     host_prefetch_size: int = 64,
@@ -358,10 +358,7 @@ def train_model_from_pod5(
                 (per_device_batch, L),
                 lr_value,
                 grad_clip=grad_clip,
-                group_lrs={
-                    "default": 1.0,
-                    "W": 0.0 if bool(freeze_W) else 1.0,
-                },
+                group_lrs=generator_lr_multipliers,
             )
             disc_state, _ = create_discriminator_state(
                 disc_init_rng,
@@ -377,10 +374,7 @@ def train_model_from_pod5(
             (per_device_batch, L),
             lr_value,
             grad_clip=grad_clip,
-            group_lrs={
-                "default": 1.0,
-                "W": 0.0 if bool(freeze_W) else 1.0,
-            },
+            group_lrs=generator_lr_multipliers,
         )
         disc_state, _ = create_discriminator_state(
             disc_init_rng,

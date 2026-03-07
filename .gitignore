@@ -1,12 +1,7 @@
 __pycache__
-*.fastq
-*.png
-hereditary_cancer_data
 checkpoints
-runs
-.local_cache
-.cache
 wandb
 AGENTS.md
 .*
-profiling
+statistic
+valid

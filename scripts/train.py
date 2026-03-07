@@ -373,8 +373,27 @@ def main() -> None:
             raise ValueError(
                 "SimVQ codebook is not optimized via params; remove optim.codebook_lr_mult from the config."
             )
-        disc_lr_mult = float(optim_cfg.get("disc_lr_mult", 0.1))
-        freeze_W = bool(optim_cfg.get("freeze_W", False))
+        if "freeze_W" in optim_cfg:
+            raise ValueError(
+                "Quantizer W is always trainable in the current training path; remove optim.freeze_W from the config."
+            )
+        raw_lr_mults = optim_cfg.get("lr_multipliers") or {}
+        if not isinstance(raw_lr_mults, dict):
+            raise ValueError("optim.lr_multipliers must be a JSON object mapping module names to LR multipliers.")
+        lr_multipliers = {str(k): float(v) for k, v in raw_lr_mults.items()}
+        negative_lr_mults = {k: v for k, v in lr_multipliers.items() if v < 0.0}
+        if negative_lr_mults:
+            raise ValueError(f"LR multipliers must be non-negative, got: {negative_lr_mults}")
+        if "codebook" in lr_multipliers:
+            raise ValueError(
+                "SimVQ codebook is not optimized via params; remove optim.lr_multipliers.codebook from the config."
+            )
+        disc_lr_mult = float(lr_multipliers.get("discriminator", optim_cfg.get("disc_lr_mult", 0.1)))
+        generator_lr_multipliers = {
+            key: value
+            for key, value in lr_multipliers.items()
+            if key != "discriminator"
+        }
         model_kwargs = model_cfg
 
         default_loader_workers = int(data_cfg.get("loader_workers", 8))
@@ -499,7 +518,7 @@ def main() -> None:
                 codebook_stats_every_steps=codebook_stats_every_steps,
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
-                freeze_W=freeze_W,
+                generator_lr_multipliers=generator_lr_multipliers,
                 disc_warmup_steps=disc_warmup_steps,
                 disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,

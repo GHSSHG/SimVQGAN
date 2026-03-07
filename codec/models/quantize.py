@@ -38,7 +38,7 @@ class SimVQ1D(nn.Module):
 
     def setup(self) -> None:
         embed_init = nn.initializers.normal(stddev=self.code_dim**-0.5)
-        # SimVQ keeps the base embeddings fixed and only trains W to adapt latents.
+        # SimVQ keeps the base embeddings fixed and trains projection params to adapt latents.
         self.codebook_var = self.variable(
             "vq",
             "codebook",

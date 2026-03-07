@@ -12,6 +12,21 @@ import optax
 from ..models.model import SimVQAudioModel
 
 
+_GENERATOR_LR_GROUPS = frozenset(
+    {
+        "default",
+        "encoder",
+        "decoder",
+        "quant_conv",
+        "post_quant_conv",
+        "pre_quant_tf",
+        "post_quant_tf",
+        "quantizer_W",
+        "quantizer_proj_bias",
+    }
+)
+
+
 def _force_frozen(tree):
     from flax.core import FrozenDict, freeze
     from collections.abc import Mapping
@@ -57,6 +72,26 @@ def _scaled_lr(learning_rate: float | Callable[[int], float], scale: float):
     return scale * float(learning_rate)
 
 
+def _generator_lr_group_for_path(path: str) -> str:
+    if path.startswith("encoder/"):
+        return "encoder"
+    if path.startswith("decoder/"):
+        return "decoder"
+    if path.startswith("quant_conv/"):
+        return "quant_conv"
+    if path.startswith("post_quant_conv/"):
+        return "post_quant_conv"
+    if path.startswith("pre_quant_tf_"):
+        return "pre_quant_tf"
+    if path.startswith("post_quant_tf_"):
+        return "post_quant_tf"
+    if path == "quantizer/W" or path.startswith("quantizer/W/"):
+        return "quantizer_W"
+    if path == "quantizer/proj_bias" or path.startswith("quantizer/proj_bias/"):
+        return "quantizer_proj_bias"
+    return "default"
+
+
 def create_generator_state(
     rng: jax.random.KeyArray,
     model: SimVQAudioModel,
@@ -74,12 +109,16 @@ def create_generator_state(
     params = _force_frozen(variables["params"])
     vq_vars = _force_frozen(variables.get("vq", {}))
 
-    # Param-grouped optimizer: keep explicit control for backbone and W.
+    # Param-grouped optimizer: keep explicit control for generator submodules.
     group_lrs = dict(group_lrs or {})
+    unknown_groups = sorted(set(group_lrs) - _GENERATOR_LR_GROUPS)
+    if unknown_groups:
+        raise ValueError(f"Unknown generator lr groups: {unknown_groups}")
     if "codebook" in group_lrs:
         raise ValueError("SimVQ codebook lives in mutable vq vars and is not optimized via params.")
-    lr_default = _scaled_lr(learning_rate, float(group_lrs.get("default", 1.0)))
-    lr_W = _scaled_lr(learning_rate, float(group_lrs.get("W", 1.0)))
+
+    def _group_scale(group_name: str) -> float:
+        return float(group_lrs.get(group_name, group_lrs.get("default", 1.0)))
 
     # Build label tree for multi_transform
     flat = flatten_dict(params)
@@ -87,16 +126,14 @@ def create_generator_state(
     for k in flat:
         # k is a tuple path like ("encoder", "conv", "kernel")
         path = "/".join(k)
-        if path.endswith("/W") or path == "W":
-            labels[k] = "W"
-        else:
-            labels[k] = "default"
+        labels[k] = _generator_lr_group_for_path(path)
     label_tree = _force_frozen(unflatten_dict(labels))
 
     # Per-group transforms; lr=0.0 effectively freezes that group
+    groups_in_use = sorted(set(labels.values()))
     transforms = {
-        "default": optax.adamw(lr_default),
-        "W": optax.adamw(lr_W),
+        group_name: optax.adamw(_scaled_lr(learning_rate, _group_scale(group_name)))
+        for group_name in groups_in_use
     }
     tx = optax.chain(
         optax.clip_by_global_norm(grad_clip),
