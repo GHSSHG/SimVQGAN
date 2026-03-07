@@ -10,23 +10,25 @@ from .encoder import SimVQEncoder1D
 from .decoder import SimVQDecoder1D
 from .quantize import SimVQ1D
 from .transformer import TransformerBlock1D
-from ..jaxlayers import Conv1d
 
 
 class SimVQAudioModel(nn.Module):
     in_channels: int = 1
     base_channels: int = 32
-    enc_channel_multipliers: Tuple[int, ...] = (1, 1, 2, 2, 4)
+    enc_channel_multipliers: Tuple[int, ...] = (1, 1, 2, 4)
     enc_num_res_blocks: int = 2
-    enc_down_strides: Tuple[int, ...] = (2, 4, 5, 1)
+    enc_down_strides: Tuple[int, ...] = (4, 4, 1)
     latent_dim: int = 128
     codebook_size: int = 16384
-    dec_channel_schedule: Tuple[int, ...] = (128, 64, 64, 32, 32)
+    dec_channel_schedule: Tuple[int, ...] = (128, 64, 32, 32)
     dec_num_res_blocks: int = 2
-    dec_up_strides: Tuple[int, ...] = (1, 5, 4, 2)
+    dec_up_strides: Tuple[int, ...] = (1, 4, 4)
     enc_dtype: Any = jnp.float32
     dec_dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
+    quant_dtype: Any = jnp.float32
+    quant_param_dtype: Any = jnp.float32
+    dec_tanh_dtype: Any = jnp.float32
     remat_encoder: bool = False
     remat_decoder: bool = False
     pre_quant_transformer_layers: int = 0
@@ -41,6 +43,18 @@ class SimVQAudioModel(nn.Module):
     search_chunk_size: int = 2048
 
     def setup(self):
+        enc_out_channels = self.base_channels * int(self.enc_channel_multipliers[-1])
+        if int(self.latent_dim) != int(enc_out_channels):
+            raise ValueError(
+                "No latent projection is enabled in SimVQAudioModel. "
+                f"latent_dim must equal encoder output channels ({enc_out_channels}), got {self.latent_dim}."
+            )
+        if int(self.dec_channel_schedule[0]) != int(self.latent_dim):
+            raise ValueError(
+                "No post-quant projection is enabled in SimVQAudioModel. "
+                f"dec_channel_schedule[0] must equal latent_dim ({self.latent_dim}), "
+                f"got {self.dec_channel_schedule[0]}."
+            )
         encoder_cls = SimVQEncoder1D
         if self.remat_encoder:
             encoder_cls = nn.remat(encoder_cls)
@@ -64,31 +78,15 @@ class SimVQAudioModel(nn.Module):
             up_strides=self.dec_up_strides,
             dtype=self.dec_dtype,
             param_dtype=self.param_dtype,
-        )
-        self.quant_conv = Conv1d(
-            self.latent_dim,
-            kernel=1,
-            use_bias=False,
-            dtype=self.enc_dtype,
-            param_dtype=self.param_dtype,
-            name="quant_conv",
-        )
-        self.post_quant_conv = Conv1d(
-            self.dec_channel_schedule[0],
-            kernel=1,
-            use_bias=False,
-            dtype=self.dec_dtype,
-            param_dtype=self.param_dtype,
-            name="post_quant_conv",
+            tanh_dtype=self.dec_tanh_dtype,
         )
         self.quantizer = SimVQ1D(
             codebook_size=self.codebook_size,
             code_dim=self.latent_dim,
             diveq_sigma2=self.diveq_sigma2,
             search_chunk_size=max(1, int(self.search_chunk_size)),
-            # Keep quantizer/codebook statistics in fp32 even when model compute is bf16.
-            dtype=self.param_dtype,
-            param_dtype=self.param_dtype,
+            dtype=self.quant_dtype,
+            param_dtype=self.quant_param_dtype,
         )
         tf_block_cls = TransformerBlock1D
         if self.remat_transformer:
@@ -132,7 +130,7 @@ class SimVQAudioModel(nn.Module):
         collect_codebook_stats: bool = True,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
         h_e = self.encoder(x, train=train, offset=offset)
-        h_qin = self.quant_conv(h_e)
+        h_qin = h_e
         if self.pre_quant_blocks:
             split_rngs = jax.random.split(rng, len(self.pre_quant_blocks) + 1)
             for block, block_rng in zip(self.pre_quant_blocks, split_rngs[:-1]):
@@ -149,15 +147,15 @@ class SimVQAudioModel(nn.Module):
         return h_qin, z_q, info
 
     def decode(self, z_q: jnp.ndarray, *, train: bool = False, rng: jax.random.KeyArray | None = None):
+        if z_q.dtype != self.dec_dtype:
+            z_q = z_q.astype(self.dec_dtype)
         if self.post_quant_blocks:
             block_rngs = [None] * len(self.post_quant_blocks)
             if rng is not None:
                 block_rngs = jax.random.split(rng, len(self.post_quant_blocks))
             for block, block_rng in zip(self.post_quant_blocks, block_rngs):
                 z_q = block(z_q, train=train, rng=block_rng)
-        # map back to decoder channel dim
-        z_dec = self.post_quant_conv(z_q)
-        wave, aux = self.decoder(z_dec, train=train)
+        wave, aux = self.decoder(z_q, train=train)
         # decoder returns (B,T,1) – squeeze to (B,T)
         if wave.ndim == 3 and wave.shape[-1] == 1:
             wave = jnp.squeeze(wave, axis=-1)

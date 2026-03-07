@@ -81,11 +81,12 @@ class DecoderStage1D(nn.Module):
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channel_schedule: Sequence[int] = (128, 64, 64, 32, 32)
+    channel_schedule: Sequence[int] = (128, 64, 32, 32)
     num_res_blocks: int = 2
-    up_strides: Sequence[int] = (1, 5, 4, 2)
+    up_strides: Sequence[int] = (1, 4, 4)
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
+    tanh_dtype: Any = jnp.float32
 
     def setup(self) -> None:
         if len(self.channel_schedule) != len(self.up_strides) + 1:
@@ -144,5 +145,7 @@ class SimVQDecoder1D(nn.Module):
         h = self.norm_out(h)
         h = _swish(h)
         wave = self.conv_out(h)
+        if wave.dtype != self.tanh_dtype:
+            wave = wave.astype(self.tanh_dtype)
         wave = jnp.tanh(wave)
         return wave, {}

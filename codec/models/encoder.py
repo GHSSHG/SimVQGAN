@@ -161,9 +161,9 @@ class EncoderStage1D(nn.Module):
 class SimVQEncoder1D(nn.Module):
     in_channels: int = 1
     base_channels: int = 32
-    channel_multipliers: Sequence[int] = (1, 1, 2, 2, 4)
+    channel_multipliers: Sequence[int] = (1, 1, 2, 4)
     num_res_blocks: int = 2
-    down_strides: Sequence[int] = (2, 4, 5, 1)
+    down_strides: Sequence[int] = (4, 4, 1)
     latent_dim: int = 128
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
@@ -208,15 +208,11 @@ class SimVQEncoder1D(nn.Module):
             for i in range(self.num_res_blocks)
         )
         self.norm_out = GroupNorm1D(channels[-1], dtype=self.dtype, param_dtype=self.param_dtype)
-        self.conv_out = Conv1d(
-            self.latent_dim,
-            kernel=1,
-            padding="SAME",
-            use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="to_latent",
-        )
+        if int(self.latent_dim) != int(channels[-1]):
+            raise ValueError(
+                "No latent 1x1 projection is used. latent_dim must equal the final encoder channel size; "
+                f"got latent_dim={self.latent_dim}, final_channels={channels[-1]}."
+            )
 
     def _normalize_input(self, x: jnp.ndarray) -> jnp.ndarray:
         if x.ndim == 2:
@@ -239,5 +235,4 @@ class SimVQEncoder1D(nn.Module):
             h = block(h, train=train)
         h = self.norm_out(h)
         h = _swish(h)
-        h = self.conv_out(h)
         return h

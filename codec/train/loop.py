@@ -118,9 +118,9 @@ def _maybe_log_gpu_memory(log_fn, phase: str) -> None:
         return
 
 
-def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
+def _resolve_dtype(dtype_value: Any) -> Any:
     if dtype_value is None:
-        return fallback
+        raise ValueError("dtype config value cannot be None.")
     if isinstance(dtype_value, str):
         key = dtype_value.strip().lower()
         mapping = {
@@ -140,26 +140,28 @@ def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
-    num_epochs: int | None = None,
-    learning_rate: float = 1e-4,
-    seed: int = 0,
+    num_epochs: int,
+    learning_rate: float,
+    seed: int,
     ckpt_dir: str | None = None,
-    loss_weights: Dict[str, float] | None = None,
-    disc_start_step: int = 0,
-    model_cfg: dict | None = None,
+    loss_weights: Dict[str, float],
+    disc_start_step: int,
+    model_cfg: dict,
     log_file: str | None = None,
-    batch_size: int | None = None,
+    batch_size: int,
+    expected_input_length: int,
     resume_from: str | None = None,
-    log_every_steps: int = 100,
-    checkpoint_every_steps: int = 5000,
+    log_every_steps: int,
+    checkpoint_every_steps: int,
     wandb_logger: Any | None = None,
     # Optimization knobs
-    freeze_W: bool = False,
-    grad_clip: float = 1.0,
-    disc_warmup_steps: int = 0,
-    host_prefetch_size: int = 64,
-    device_prefetch_size: int = 16,
-    disc_lr_mult: float = 0.1,
+    freeze_W: bool,
+    grad_clip: float,
+    disc_warmup_steps: int,
+    disc_every_steps: int,
+    host_prefetch_size: int,
+    device_prefetch_size: int,
+    disc_lr_mult: float,
     use_data_parallel: bool | None = None,
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
@@ -229,24 +231,37 @@ def train_model_from_pod5(
 
     rng = jax.random.PRNGKey(seed)
     rng, gen_init_rng, disc_init_rng, _ = jax.random.split(rng, 4)
-    mcfg = dict(model_cfg or {})
+    if not isinstance(model_cfg, dict):
+        raise ValueError("model_cfg must be a dict loaded from config.")
+    mcfg = dict(model_cfg)
 
-    def _tuple_cfg(key, default):
-        val = mcfg.get(key, default)
+    def _require_model_key(key: str):
+        if key not in mcfg:
+            raise ValueError(f"Missing required model config key: model.{key}")
+        return mcfg[key]
+
+    def _require_tuple_cfg(key: str):
+        val = _require_model_key(key)
+        if not isinstance(val, (list, tuple)) or len(val) == 0:
+            raise ValueError(f"model.{key} must be a non-empty list/tuple")
         return tuple(int(v) for v in val)
 
-    latent_dim = int(mcfg.get("latent_dim", 128))
-    base_channels = int(mcfg.get("base_channels", 32))
-    compute_dtype = _resolve_dtype(mcfg.get("compute_dtype", "bf16"), fallback=jnp.float32)
-    param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
-    disc_compute_dtype = _resolve_dtype(mcfg.get("disc_dtype", mcfg.get("compute_dtype", "bf16")), fallback=jnp.float32)
-    enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
+    latent_dim = int(_require_model_key("latent_dim"))
+    base_channels = int(_require_model_key("base_channels"))
+    backbone_compute_dtype = _resolve_dtype(_require_model_key("backbone_compute_dtype"))
+    backbone_param_dtype = _resolve_dtype(_require_model_key("backbone_param_dtype"))
+    quant_compute_dtype = _resolve_dtype(_require_model_key("quant_compute_dtype"))
+    quant_param_dtype = _resolve_dtype(_require_model_key("quant_param_dtype"))
+    decoder_tanh_dtype = _resolve_dtype(_require_model_key("decoder_tanh_dtype"))
+    disc_compute_dtype = _resolve_dtype(_require_model_key("disc_compute_dtype"))
+    disc_param_dtype = _resolve_dtype(_require_model_key("disc_param_dtype"))
+    enc_channels = _require_tuple_cfg("enc_channels")
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 4, 5, 1))
-    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
-    dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 5, 4, 2))
-    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
+    enc_down_strides = _require_tuple_cfg("enc_down_strides")
+    enc_num_res_blocks = int(_require_model_key("enc_num_res_blocks"))
+    dec_channels = _require_tuple_cfg("dec_channels")
+    dec_up_strides = _require_tuple_cfg("dec_up_strides")
+    dec_num_res_blocks = int(_require_model_key("dec_num_res_blocks"))
     generator = SimVQAudioModel(
         in_channels=1,
         base_channels=base_channels,
@@ -254,39 +269,48 @@ def train_model_from_pod5(
         enc_num_res_blocks=enc_num_res_blocks,
         enc_down_strides=enc_down_strides,
         latent_dim=latent_dim,
-        codebook_size=int(mcfg.get("codebook_size", 16384)),
+        codebook_size=int(_require_model_key("codebook_size")),
         dec_channel_schedule=dec_channels,
         dec_num_res_blocks=dec_num_res_blocks,
         dec_up_strides=dec_up_strides,
-        enc_dtype=compute_dtype,
-        dec_dtype=compute_dtype,
-        param_dtype=param_dtype,
-        remat_encoder=bool(mcfg.get("remat_encoder", False)),
-        remat_decoder=bool(mcfg.get("remat_decoder", False)),
-        pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
-        post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
-        transformer_heads=int(mcfg.get("transformer_heads", 4)),
-        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
-        transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
-        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
-        transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
-        remat_transformer=bool(mcfg.get("remat_transformer", False)),
-        diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
-        search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
+        enc_dtype=backbone_compute_dtype,
+        dec_dtype=backbone_compute_dtype,
+        param_dtype=backbone_param_dtype,
+        quant_dtype=quant_compute_dtype,
+        quant_param_dtype=quant_param_dtype,
+        dec_tanh_dtype=decoder_tanh_dtype,
+        remat_encoder=bool(_require_model_key("remat_encoder")),
+        remat_decoder=bool(_require_model_key("remat_decoder")),
+        pre_quant_transformer_layers=int(_require_model_key("pre_quant_transformer_layers")),
+        post_quant_transformer_layers=int(_require_model_key("post_quant_transformer_layers")),
+        transformer_heads=int(_require_model_key("transformer_heads")),
+        transformer_mlp_ratio=float(_require_model_key("transformer_mlp_ratio")),
+        transformer_dropout=float(_require_model_key("transformer_dropout")),
+        transformer_ffn_activation=str(_require_model_key("transformer_ffn_activation")),
+        transformer_attention_backend=str(_require_model_key("transformer_attention_backend")),
+        remat_transformer=bool(_require_model_key("remat_transformer")),
+        diveq_sigma2=float(_require_model_key("diveq_sigma2")),
+        search_chunk_size=int(_require_model_key("search_chunk_size")),
     )
-    disc_cfg = dict(mcfg.get("discriminator", {}))
-    disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
-    disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
+    disc_raw = _require_model_key("discriminator")
+    if not isinstance(disc_raw, dict):
+        raise ValueError("model.discriminator must be a dict")
+    disc_cfg = dict(disc_raw)
+    for key in ("channels", "strides", "kernel_size", "resblock_layers", "remat"):
+        if key not in disc_cfg:
+            raise ValueError(f"Missing required model.discriminator.{key} in config.")
+    disc_channels = tuple(int(v) for v in disc_cfg["channels"])
+    disc_strides = tuple(int(v) for v in disc_cfg["strides"])
     disc_cls = PatchDiscriminator1D
-    if bool(disc_cfg.get("remat", False)):
+    if bool(disc_cfg["remat"]):
         disc_cls = nn.remat(disc_cls)
     discriminator = disc_cls(
         channels=disc_channels,
         strides=disc_strides,
-        kernel_size=int(disc_cfg.get("kernel_size", 15)),
-        resblock_layers=int(disc_cfg.get("resblock_layers", 2)),
+        kernel_size=int(disc_cfg["kernel_size"]),
+        resblock_layers=int(disc_cfg["resblock_layers"]),
         dtype=disc_compute_dtype,
-        param_dtype=param_dtype,
+        param_dtype=disc_param_dtype,
     )
 
     # Probe shape using a single-worker iterator so we don't leave background threads running.
@@ -311,7 +335,13 @@ def train_model_from_pod5(
     elif init_batch.ndim == 3 and init_batch.shape[-1] == 1:
         init_batch = init_batch[..., 0]
     _, L = init_batch.shape
-    B = int(batch_size) if batch_size and batch_size > 0 else 1
+    if int(expected_input_length) != int(L):
+        raise ValueError(
+            f"Input length mismatch: config expects {expected_input_length}, but dataset produced {L}."
+        )
+    B = int(batch_size)
+    if B <= 0:
+        raise ValueError(f"batch_size must be positive, got {B}")
     ndev = max(1, int(jax.local_device_count()))
     scan_steps_int = max(1, int(scan_steps))
     data_parallel = (ndev > 1) if use_data_parallel is None else (bool(use_data_parallel) and ndev > 1)
@@ -332,8 +362,6 @@ def train_model_from_pod5(
     host_prefetch_size = max(1, int(host_prefetch_size))
     device_prefetch_size = max(1, int(device_prefetch_size))
 
-    if num_epochs is None:
-        raise ValueError("Epoch-based training requires num_epochs > 0.")
     try:
         epochs_limit = int(num_epochs)
     except (TypeError, ValueError) as exc:
@@ -447,14 +475,10 @@ def train_model_from_pod5(
             )
         )
         return host_iter, data_iter
-    if loss_weights is None:
-        loss_weights = {
-            "time_l1": 2.0,
-            "gan": 0.03,
-            "feature": 0.1,
-        }
-    else:
-        loss_weights = dict(loss_weights)
+    loss_weights = dict(loss_weights)
+    for required_key in ("time_l1", "gan", "feature"):
+        if required_key not in loss_weights:
+            raise ValueError(f"Missing required loss_weights.{required_key} in config.")
     if "commit" in loss_weights:
         raise ValueError(
             "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
@@ -480,14 +504,17 @@ def train_model_from_pod5(
     log_every_steps_int = max(0, int(log_every_steps))
     stats_every_steps_int = _safe_int(codebook_stats_every_steps)
     if stats_every_steps_int is None:
-        stats_every_steps_int = max(1, log_every_steps_int if log_every_steps_int > 0 else 100)
+        raise ValueError("codebook_stats_every_steps must be explicitly set in config.")
     stats_until_step_int = _safe_int(codebook_stats_until_step)
     checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
     disc_start_step_int = max(0, int(disc_start_step))
     disc_warmup_steps_int = max(0, int(disc_warmup_steps))
+    disc_every_steps_int = max(1, int(disc_every_steps))
 
     def _disc_mask_for_step(step_idx: int) -> float:
         if step_idx < disc_start_step_int:
+            return 0.0
+        if ((step_idx - disc_start_step_int) % disc_every_steps_int) != 0:
             return 0.0
         if disc_warmup_steps_int <= 0:
             return 1.0

@@ -1,60 +1,57 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 3,
-    "batch_size": 2048,
+    "epochs": 2,
+    "batch_size": 8192,
     "reference_device_count": 8,
-    "per_device_batch_size": 256,
+    "per_device_batch_size": 1024,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 0.0002,
-    "host_prefetch_size": 64,
-    "host_prefetch_per_device": 8,
-    "device_prefetch_size": 16,
-    "device_prefetch_per_device": 2,
+    "learning_rate": 0.0003,
+    "host_prefetch_size": 128,
+    "host_prefetch_per_device": 16,
+    "device_prefetch_size": 32,
+    "device_prefetch_per_device": 4,
     "grad_clip": 1.0,
-    "disc_start_step": 10000,
-    "disc_warmup_steps": 20000,
+    "disc_start_step": 0,
+    "disc_warmup_steps": 25000,
+    "disc_every_steps": 2,
     "log_every_steps": 250,
     "codebook_stats_every_steps": 1000,
-    "codebook_stats_until_step": 30000,
+    "codebook_stats_until_step": 300000,
     "scan_steps": 16,
     "loss_weights": {
       "time_l1": 5.0,
-      "gan": 0.03,
+      "gan": 0.05,
       "feature": 0.1
     }
   },
   "model": {
     "base_channels": 32,
     "enc_channels": [
+      32,
+      32,
       64,
-      64,
-      128,
-      128,
-      256
+      128
     ],
     "enc_down_strides": [
-      2,
       4,
-      5,
+      4,
       1
     ],
     "enc_num_res_blocks": 2,
-    "latent_dim": 256,
+    "latent_dim": 128,
     "codebook_size": 65536,
     "dec_channels": [
-      256,
-      128,
       128,
       64,
-      64
+      32,
+      32
     ],
     "dec_up_strides": [
       1,
-      5,
       4,
-      2
+      4
     ],
     "dec_num_res_blocks": 2,
     "remat_encoder": false,
@@ -63,38 +60,40 @@
       "channels": [
         32,
         64,
-        128,
-        256
+        128
       ],
       "strides": [
         2,
         2,
-        2,
         2
       ],
-      "kernel_size": 15,
-      "resblock_layers": 2,
+      "kernel_size": 11,
+      "resblock_layers": 1,
       "remat": false
     },
-    "pre_quant_transformer_layers": 2,
-    "post_quant_transformer_layers": 2,
-    "transformer_heads": 8,
-    "transformer_mlp_ratio": 2.6666666667,
+    "pre_quant_transformer_layers": 3,
+    "post_quant_transformer_layers": 3,
+    "transformer_heads": 4,
+    "transformer_mlp_ratio": 4.0,
     "transformer_dropout": 0.1,
     "transformer_ffn_activation": "swiglu",
     "transformer_attention_backend": "jax_cudnn",
     "remat_transformer": false,
-    "compute_dtype": "bf16",
-    "disc_dtype": "bf16",
-    "param_dtype": "fp32",
+    "backbone_compute_dtype": "bf16",
+    "backbone_param_dtype": "bf16",
+    "quant_compute_dtype": "fp32",
+    "quant_param_dtype": "fp32",
+    "decoder_tanh_dtype": "fp32",
+    "disc_compute_dtype": "bf16",
+    "disc_param_dtype": "bf16",
     "diveq_sigma2": 0.001,
     "search_chunk_size": 2048
   },
   "data": {
     "type": "pod5",
     "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-    "segment_sec": 1.0,
-    "segment_samples": 5000,
+    "segment_sec": 0.4096,
+    "segment_samples": 2048,
     "sample_rate": 5000,
     "reference_device_count": 8,
     "subdirs": [
@@ -102,10 +101,10 @@
       "FC02/pod5",
       "FC03/pod5"
     ],
-    "loader_workers": 32,
-    "loader_workers_per_device": 4,
-    "loader_prefetch_chunks": 4096,
-    "loader_prefetch_chunks_per_device": 512,
+    "loader_workers": 80,
+    "loader_workers_per_device": 10,
+    "loader_prefetch_chunks": 8192,
+    "loader_prefetch_chunks_per_device": 1024,
     "auto_scale_loader_by_device_count": true,
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
@@ -114,7 +113,7 @@
         "FC02/pod5",
         "FC03/pod5"
       ],
-      "segment_samples": 5000
+      "segment_samples": 2048
     }
   },
   "checkpoint": {
@@ -127,6 +126,7 @@
       "enabled": true,
       "project": "simvq-local",
       "run_name": "v2.0",
+      "entity": null,
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },

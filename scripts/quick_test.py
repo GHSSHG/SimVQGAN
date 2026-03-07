@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a 10-step smoke test against a single POD5 file."""
+"""Run a smoke test against a single POD5 file."""
 from __future__ import annotations
 
 import argparse
@@ -16,25 +16,6 @@ from argparse import BooleanOptionalAction
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CONFIG = REPO_ROOT / "configs" / "train.json"
-DEFAULT_DATA_ROOT = Path("/data/nanopore/hereditary_cancer_2025.09/raw")
-DEFAULT_DATA_SUBDIRS = (
-    "FC01/pod5",
-    "FC02/pod5",
-    "FC03/pod5",
-)
-
-
-def _default_pod5() -> Path:
-    for subdir in DEFAULT_DATA_SUBDIRS:
-        base = DEFAULT_DATA_ROOT / subdir
-        if not base.exists():
-            continue
-        for candidate in sorted(base.rglob("*.pod5")):
-            return candidate
-    return DEFAULT_DATA_ROOT / "FC01" / "pod5" / "sample.pod5"
-
-
-DEFAULT_POD5 = _default_pod5()
 SEED_STATE = REPO_ROOT / ".last_epoch_seed.txt"
 
 
@@ -56,46 +37,84 @@ def _patch_config(
     pod5_file: Path,
     ckpt_dir: Path,
     *,
-    force_data_parallel: bool,
+    force_data_parallel: bool | None,
     batch_size_override: int | None,
 ) -> dict:
     cfg = json.loads(base.read_text())
-    cfg.setdefault("train", {})
-    train_cfg = cfg["train"]
-    train_cfg["epochs"] = max(1, int(train_cfg.get("epochs", 1)))
+
+    def _require_key(mapping: dict, key: str, path: str):
+        if key not in mapping:
+            raise ValueError(f"Missing required config key: {path}.{key}")
+        return mapping[key]
+
+    train_cfg = _require_key(cfg, "train", "config")
+    if not isinstance(train_cfg, dict):
+        raise ValueError("config.train must be an object/dict")
+    train_cfg["epochs"] = max(1, int(_require_key(train_cfg, "epochs", "train")))
     train_cfg["log_every_steps"] = 1
-    current_batch_size = int(train_cfg.get("batch_size", 4) or 4)
+    current_batch_size = int(_require_key(train_cfg, "batch_size", "train"))
     if batch_size_override is not None:
         target_batch_size = max(1, int(batch_size_override))
     else:
         # Keep quick-test memory bounded while preserving multi-GPU data-parallel execution.
-        ndev = _local_device_count() if force_data_parallel else 1
+        configured_data_parallel = bool(_require_key(train_cfg, "data_parallel", "train"))
+        effective_data_parallel = configured_data_parallel if force_data_parallel is None else bool(force_data_parallel)
+        ndev = _local_device_count() if effective_data_parallel else 1
         target_batch_size = min(current_batch_size, 32 * ndev)
-        if force_data_parallel:
+        if effective_data_parallel:
             target_batch_size = max(ndev, (target_batch_size // ndev) * ndev)
     train_cfg["batch_size"] = target_batch_size
     # Quick test sets an explicit global batch; disable device-based rescaling.
+    _require_key(train_cfg, "per_device_batch_size", "train")
+    _require_key(train_cfg, "auto_scale_batch_by_device_count", "train")
     train_cfg["per_device_batch_size"] = None
     train_cfg["auto_scale_batch_by_device_count"] = False
-    train_cfg["data_parallel"] = bool(force_data_parallel)
+    train_cfg["data_parallel"] = (
+        bool(_require_key(train_cfg, "data_parallel", "train"))
+        if force_data_parallel is None
+        else bool(force_data_parallel)
+    )
     cfg["train"] = train_cfg
-    cfg.setdefault("data", {})
-    base_data = cfg["data"]
-    train_split = dict(base_data.get("train") or {})
+
+    base_data = _require_key(cfg, "data", "config")
+    if not isinstance(base_data, dict):
+        raise ValueError("config.data must be an object/dict")
+    train_split_raw = _require_key(base_data, "train", "data")
+    if not isinstance(train_split_raw, dict):
+        raise ValueError("data.train must be an object/dict")
+    train_split = dict(train_split_raw)
     train_split["files"] = [str(pod5_file.resolve())]
-    train_split.setdefault("segment_sec", base_data.get("segment_sec", 1.0))
-    train_split.setdefault("segment_samples", base_data.get("segment_samples", 5000))
-    train_split.setdefault("sample_rate", base_data.get("sample_rate", 5000.0))
+    if "segment_sec" not in train_split:
+        train_split["segment_sec"] = _require_key(base_data, "segment_sec", "data")
+    if "segment_samples" not in train_split:
+        train_split["segment_samples"] = _require_key(base_data, "segment_samples", "data")
+    if "sample_rate" not in train_split:
+        train_split["sample_rate"] = _require_key(base_data, "sample_rate", "data")
     base_data["train"] = train_split
     base_data["root"] = str(pod5_file.resolve().parent)
     cfg["data"] = base_data
-    ckpt = dict(cfg.get("checkpoint") or {})
+
+    ckpt_raw = _require_key(cfg, "checkpoint", "config")
+    if not isinstance(ckpt_raw, dict):
+        raise ValueError("config.checkpoint must be an object/dict")
+    ckpt = dict(ckpt_raw)
+    _require_key(ckpt, "dir", "checkpoint")
+    _require_key(ckpt, "resume_from", "checkpoint")
+    _require_key(ckpt, "every_steps", "checkpoint")
     ckpt["dir"] = str(ckpt_dir.resolve())
     ckpt["resume_from"] = None
     ckpt["every_steps"] = 0
     cfg["checkpoint"] = ckpt
-    logging_cfg = dict(cfg.get("logging") or {})
-    wandb_cfg = dict(logging_cfg.get("wandb") or {})
+
+    logging_raw = _require_key(cfg, "logging", "config")
+    if not isinstance(logging_raw, dict):
+        raise ValueError("config.logging must be an object/dict")
+    logging_cfg = dict(logging_raw)
+    wandb_raw = _require_key(logging_cfg, "wandb", "logging")
+    if not isinstance(wandb_raw, dict):
+        raise ValueError("logging.wandb must be an object/dict")
+    wandb_cfg = dict(wandb_raw)
+    _require_key(wandb_cfg, "enabled", "logging.wandb")
     wandb_cfg["enabled"] = False
     if "api_key" in wandb_cfg:
         wandb_cfg["api_key"] = None
@@ -137,7 +156,7 @@ def run_quick_test(
     steps: int,
     python: str,
     *,
-    force_data_parallel: bool,
+    force_data_parallel: bool | None,
     batch_size_override: int | None,
 ) -> int:
     seed_snapshot = _snapshot_seed_state()
@@ -152,7 +171,7 @@ def run_quick_test(
                 force_data_parallel=force_data_parallel,
                 batch_size_override=batch_size_override,
             )
-            train_cfg = cfg.get("train", {})
+            train_cfg = cfg["train"]
             tmp_cfg = Path(tmpdir) / "quick_config.json"
             tmp_cfg.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
             cmd = [
@@ -171,8 +190,8 @@ def run_quick_test(
             env.setdefault("VQGAN_WARMUP_COMPILE", "0")
             print(
                 "[quick_test] patched train config:",
-                f"batch_size={train_cfg.get('batch_size')},",
-                f"data_parallel={train_cfg.get('data_parallel')}",
+                f"batch_size={train_cfg['batch_size']},",
+                f"data_parallel={train_cfg['data_parallel']}",
             )
             print("[quick_test] running:", " ".join(cmd))
             # Stream stdout so we can stop after N steps.
@@ -207,16 +226,16 @@ def run_quick_test(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="SimVQGAN quick 10-step smoke test (supports multi-GPU data parallel)")
+    parser = argparse.ArgumentParser(description="SimVQGAN quick smoke test (supports multi-GPU data parallel)")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Base training config")
-    parser.add_argument("--pod5", type=Path, default=DEFAULT_POD5, help="POD5 file to stream")
-    parser.add_argument("--steps", type=int, default=10, help="Number of steps to run")
+    parser.add_argument("--pod5", type=Path, required=True, help="POD5 file to stream")
+    parser.add_argument("--steps", type=int, required=True, help="Number of steps to run")
     parser.add_argument("--python", type=str, default=sys.executable, help="Python executable to run train script")
     parser.add_argument(
         "--data-parallel",
         action=BooleanOptionalAction,
-        default=True,
-        help="Force data parallel mode in quick test (default: true)",
+        default=None,
+        help="Override train.data_parallel in quick test",
     )
     parser.add_argument(
         "--batch-size",
@@ -230,7 +249,7 @@ def main() -> None:
         args.pod5,
         max(1, args.steps),
         args.python,
-        force_data_parallel=bool(args.data_parallel),
+        force_data_parallel=args.data_parallel,
         batch_size_override=args.batch_size,
     )
     if ret != 0:
