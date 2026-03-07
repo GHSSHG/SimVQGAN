@@ -17,73 +17,46 @@
     "disc_warmup_steps": 20000,
     "log_every_steps": 250,
     "codebook_stats_every_steps": 1000,
-    "codebook_stats_until_step": 30000,
     "scan_steps": 16,
     "loss_weights": {
-      "time_l1": 5.0,
+      "time_l1": 1.0,
+      "diff1_l1": 0.1,
+      "diff2_l1": 0.05,
+      "stft_logmag_l1": 0.05,
       "gan": 0.03,
       "feature": 0.1
+    },
+    "stft_loss": {
+      "n_fft": 64,
+      "win_length": 64,
+      "hop_length": 16
     }
   },
   "model": {
     "base_channels": 32,
-    "enc_channels": [
-      64,
-      64,
-      128,
-      128,
-      256
-    ],
-    "enc_down_strides": [
-      2,
-      4,
-      5,
-      1
-    ],
+    "enc_channels": [64, 64, 128, 128, 256],
+    "enc_down_strides": [2, 2, 2, 1],
     "enc_num_res_blocks": 2,
     "latent_dim": 256,
     "codebook_size": 65536,
-    "dec_channels": [
-      256,
-      128,
-      128,
-      64,
-      64
-    ],
-    "dec_up_strides": [
-      1,
-      5,
-      4,
-      2
-    ],
+    "dec_channels": [256, 128, 128, 64, 64],
+    "dec_up_strides": [1, 2, 2, 2],
     "dec_num_res_blocks": 2,
-    "remat_encoder": false,
-    "remat_decoder": false,
     "discriminator": {
-      "channels": [
-        32,
-        64,
-        128,
-        256
-      ],
-      "strides": [
-        2,
-        2,
-        2,
-        2
-      ],
+      "channels": [32, 64, 128, 256],
+      "strides": [2, 2, 2, 2],
       "kernel_size": 15,
-      "resblock_layers": 2,
-      "remat": false
+      "resblock_layers": 2
     },
     "pre_quant_transformer_layers": 2,
     "post_quant_transformer_layers": 2,
     "transformer_heads": 8,
-    "transformer_mlp_ratio": 2.6666666667,
+    "transformer_mlp_ratio": 2.0,
     "transformer_dropout": 0.1,
     "transformer_ffn_activation": "swiglu",
     "transformer_attention_backend": "jax_cudnn",
-    "remat_transformer": false,
+    "transformer_use_rope": false,
+    "transformer_rope_base": 10000.0,
     "compute_dtype": "bf16",
     "disc_dtype": "bf16",
     "param_dtype": "fp32",
@@ -93,15 +66,11 @@
   "data": {
     "type": "pod5",
     "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-    "segment_sec": 1.0,
-    "segment_samples": 5000,
+    "segment_sec": 0.4096,
+    "segment_samples": 2048,
     "sample_rate": 5000,
     "reference_device_count": 8,
-    "subdirs": [
-      "FC01/pod5",
-      "FC02/pod5",
-      "FC03/pod5"
-    ],
+    "subdirs": ["FC01/pod5", "FC02/pod5", "FC03/pod5"],
     "loader_workers": 32,
     "loader_workers_per_device": 4,
     "loader_prefetch_chunks": 4096,
@@ -109,12 +78,8 @@
     "auto_scale_loader_by_device_count": true,
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-      "subdirs": [
-        "FC01/pod5",
-        "FC02/pod5",
-        "FC03/pod5"
-      ],
-      "segment_samples": 5000
+      "subdirs": ["FC01/pod5", "FC02/pod5", "FC03/pod5"],
+      "segment_samples": 2048
     }
   },
   "checkpoint": {

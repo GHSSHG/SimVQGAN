@@ -30,12 +30,20 @@ from ..data.pod5_dataset import NanoporeSignalDataset
 
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
+    "reconstruct_loss_raw": "reconstruct_loss_raw",
     "reconstruct_loss": "reconstruct_loss",
-    "weighted_reconstruct_loss": "weighted_reconstruct_loss",
-    "gan_raw_loss": "gan_loss",
-    "weighted_gan_loss": "weighted_gan_loss",
+    "time_l1_loss_raw": "time_l1_loss_raw",
+    "time_l1_loss": "time_l1_loss",
+    "diff1_loss_raw": "diff1_loss_raw",
+    "diff1_loss": "diff1_loss",
+    "diff2_loss_raw": "diff2_loss_raw",
+    "diff2_loss": "diff2_loss",
+    "stft_logmag_loss_raw": "stft_logmag_loss_raw",
+    "stft_logmag_loss": "stft_logmag_loss",
+    "gan_loss_raw": "gan_loss_raw",
+    "gan_loss": "gan_loss",
+    "feature_loss_raw": "feature_loss_raw",
     "feature_loss": "feature_loss",
-    "weighted_feature_loss": "weighted_feature_loss",
     "q_z_dist": "q_z_dist",
     "log_q_z_dist": "log_q_z_dist",
     "perplexity": "codebook_perplexity",
@@ -44,6 +52,8 @@ _SIMVQ_KEY_MAPPING = {
     "disc_loss_raw": "disc_loss_raw",
     "disc_mask": "disc_mask",
 }
+
+_SPARSE_STEP_LOG_KEYS = frozenset({"perplexity", "code_usage"})
 
 def _value_to_float(val):
     if val is None:
@@ -145,6 +155,7 @@ def train_model_from_pod5(
     seed: int = 0,
     ckpt_dir: str | None = None,
     loss_weights: Dict[str, float] | None = None,
+    stft_loss_cfg: Dict[str, int] | None = None,
     disc_start_step: int = 0,
     model_cfg: dict | None = None,
     log_file: str | None = None,
@@ -164,7 +175,6 @@ def train_model_from_pod5(
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
     codebook_stats_every_steps: int | None = None,
-    codebook_stats_until_step: int | None = None,
     scan_steps: int = 1,
 ):
     import jax
@@ -242,10 +252,10 @@ def train_model_from_pod5(
     disc_compute_dtype = _resolve_dtype(mcfg.get("disc_dtype", mcfg.get("compute_dtype", "bf16")), fallback=jnp.float32)
     enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
     enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 4, 5, 1))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2, 2, 1))
     enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 5, 4, 2))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 2, 2, 2))
     dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
     generator = SimVQAudioModel(
         in_channels=1,
@@ -261,26 +271,22 @@ def train_model_from_pod5(
         enc_dtype=compute_dtype,
         dec_dtype=compute_dtype,
         param_dtype=param_dtype,
-        remat_encoder=bool(mcfg.get("remat_encoder", False)),
-        remat_decoder=bool(mcfg.get("remat_decoder", False)),
         pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
         post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
         transformer_heads=int(mcfg.get("transformer_heads", 4)),
-        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
+        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 2.0)),
         transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
         transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
         transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
-        remat_transformer=bool(mcfg.get("remat_transformer", False)),
+        transformer_use_rope=bool(mcfg.get("transformer_use_rope", False)),
+        transformer_rope_base=float(mcfg.get("transformer_rope_base", 10000.0)),
         diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
         search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
     )
     disc_cfg = dict(mcfg.get("discriminator", {}))
     disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
     disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
-    disc_cls = PatchDiscriminator1D
-    if bool(disc_cfg.get("remat", False)):
-        disc_cls = nn.remat(disc_cls)
-    discriminator = disc_cls(
+    discriminator = PatchDiscriminator1D(
         channels=disc_channels,
         strides=disc_strides,
         kernel_size=int(disc_cfg.get("kernel_size", 15)),
@@ -449,7 +455,10 @@ def train_model_from_pod5(
         return host_iter, data_iter
     if loss_weights is None:
         loss_weights = {
-            "time_l1": 2.0,
+            "time_l1": 1.0,
+            "diff1_l1": 0.1,
+            "diff2_l1": 0.05,
+            "stft_logmag_l1": 0.05,
             "gan": 0.03,
             "feature": 0.1,
         }
@@ -463,6 +472,11 @@ def train_model_from_pod5(
         raise ValueError(
             "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
         )
+    stft_cfg = dict(stft_loss_cfg or {})
+    stft_n_fft = max(1, int(stft_cfg.get("n_fft", 256)))
+    stft_win_length = max(1, int(stft_cfg.get("win_length", stft_n_fft)))
+    stft_win_length = min(stft_win_length, stft_n_fft)
+    stft_hop_length = max(1, int(stft_cfg.get("hop_length", max(1, stft_win_length // 4))))
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
@@ -481,7 +495,6 @@ def train_model_from_pod5(
     stats_every_steps_int = _safe_int(codebook_stats_every_steps)
     if stats_every_steps_int is None:
         stats_every_steps_int = max(1, log_every_steps_int if log_every_steps_int > 0 else 100)
-    stats_until_step_int = _safe_int(codebook_stats_until_step)
     checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
     disc_start_step_int = max(0, int(disc_start_step))
     disc_warmup_steps_int = max(0, int(disc_warmup_steps))
@@ -500,6 +513,8 @@ def train_model_from_pod5(
         "train_step_ms": 0.0,
         "host_sync_ms": 0.0,
     }
+    log_window_sums: Dict[str, float] = {}
+    log_window_counts: Dict[str, float] = {}
 
     def _add_perf_sample(
         *,
@@ -513,6 +528,18 @@ def train_model_from_pod5(
         perf_accum["data_wait_ms"] += float(data_wait_ms) * w
         perf_accum["train_step_ms"] += float(train_step_ms) * w
         perf_accum["host_sync_ms"] += float(host_sync_ms) * w
+
+    def _add_log_window_sample(logs: Dict[str, Any] | None) -> None:
+        if not logs:
+            return
+        for key, value in logs.items():
+            if key in _SPARSE_STEP_LOG_KEYS:
+                continue
+            fv = _value_to_float(value)
+            if fv is None:
+                continue
+            log_window_sums[key] = log_window_sums.get(key, 0.0) + fv
+            log_window_counts[key] = log_window_counts.get(key, 0.0) + 1.0
 
     def _drain_perf_window() -> Dict[str, float] | None:
         count = int(perf_accum["count"])
@@ -534,6 +561,22 @@ def train_model_from_pod5(
         for key in perf_accum:
             perf_accum[key] = 0.0
         return perf
+
+    def _drain_log_window(last_logs: Dict[str, Any] | None = None) -> Dict[str, float] | None:
+        averaged: Dict[str, float] = {}
+        for key, count in log_window_counts.items():
+            if count > 0:
+                averaged[key] = log_window_sums[key] / count
+        log_window_sums.clear()
+        log_window_counts.clear()
+        if last_logs:
+            for key in _SPARSE_STEP_LOG_KEYS:
+                if key not in last_logs:
+                    continue
+                fv = _value_to_float(last_logs[key])
+                if fv is not None:
+                    averaged[key] = fv
+        return averaged or None
 
     def _log_step(step: int, logs: Dict[str, Any] | None, perf: Dict[str, float] | None = None) -> None:
         formatted = _simvq_style_logs(logs or {}, "train")
@@ -579,6 +622,9 @@ def train_model_from_pod5(
                 apply_rngs,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=False,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -597,6 +643,9 @@ def train_model_from_pod5(
                 apply_rngs,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=True,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -618,6 +667,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=False,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -646,6 +698,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=True,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
@@ -681,6 +736,9 @@ def train_model_from_pod5(
                 apply_rng,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=False,
             )
             disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
@@ -700,6 +758,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=False,
                 )
                 disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
@@ -726,6 +787,9 @@ def train_model_from_pod5(
                     rng_i,
                     loss_weights,
                     disc_mask_i,
+                    stft_n_fft=stft_n_fft,
+                    stft_hop_length=stft_hop_length,
+                    stft_win_length=stft_win_length,
                     collect_codebook_stats=True,
                 )
                 disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
@@ -749,6 +813,9 @@ def train_model_from_pod5(
                 apply_rng,
                 loss_weights,
                 disc_mask,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
                 collect_codebook_stats=True,
             )
             disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
@@ -858,26 +925,11 @@ def train_model_from_pod5(
         if checkpoint_every_steps_int > 0
         else None
     )
-    stats_cutoff_announced = False
     mem_probe_steps = {10, 50, 200}
     mem_probe_done: set[int] = set()
 
     def _should_collect_codebook_stats(step_idx: int) -> bool:
-        nonlocal stats_cutoff_announced
-        collect = ((step_idx + 1) % stats_every_steps_int == 0)
-        if (
-            stats_until_step_int is not None
-            and (step_idx + 1) > stats_until_step_int
-            and collect
-        ):
-            collect = False
-            if not stats_cutoff_announced:
-                _log(
-                    f"[stats] Disabled codebook stats after step {stats_until_step_int} "
-                    f"(current step={step_idx + 1})."
-                )
-                stats_cutoff_announced = True
-        return collect
+        return ((step_idx + 1) % stats_every_steps_int == 0)
 
     def _strip_codebook_metrics(logs: Dict[str, Any]) -> Dict[str, Any]:
         if "perplexity" in logs:
@@ -1063,6 +1115,7 @@ def train_model_from_pod5(
                     for logs in logs_seq:
                         steps_this_epoch += 1
                         global_step += 1
+                        _add_log_window_sample(logs)
 
                         if global_step in mem_probe_steps and global_step not in mem_probe_done:
                             _maybe_log_gpu_memory(_log, f"step{global_step}")
@@ -1070,7 +1123,8 @@ def train_model_from_pod5(
 
                         if log_every_steps_int > 0 and global_step % log_every_steps_int == 0:
                             perf = _drain_perf_window()
-                            _log_step(global_step, logs, perf=perf)
+                            averaged_logs = _drain_log_window(logs)
+                            _log_step(global_step, averaged_logs, perf=perf)
 
                         if (
                             ckpt_dir

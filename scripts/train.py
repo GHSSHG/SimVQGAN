@@ -56,12 +56,6 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Override codebook statistics interval (set <=0 to disable periodic stats)",
     )
-    p.add_argument(
-        "--codebook-stats-until-step",
-        type=int,
-        default=None,
-        help="Only collect codebook statistics up to this global step (inclusive)",
-    )
     p.add_argument("--checkpoints-per-epoch", type=int, default=None, help="Override number of checkpoints to emit each epoch")
     p.add_argument(
         "--loader-workers",
@@ -321,9 +315,6 @@ def main() -> None:
         codebook_stats_every_steps = train_cfg.get("codebook_stats_every_steps", None)
         if args.codebook_stats_every_steps is not None:
             codebook_stats_every_steps = args.codebook_stats_every_steps
-        codebook_stats_until_step = train_cfg.get("codebook_stats_until_step", None)
-        if args.codebook_stats_until_step is not None:
-            codebook_stats_until_step = args.codebook_stats_until_step
         scan_steps = int(train_cfg.get("scan_steps", 1))
         if args.scan_steps is not None:
             scan_steps = max(1, int(args.scan_steps))
@@ -359,9 +350,18 @@ def main() -> None:
                 "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
             )
         loss_weights = {
-            "time_l1": float(lw.get("time_l1", lw.get("recon", 2.0))),
+            "time_l1": float(lw.get("time_l1", lw.get("recon", 1.0))),
+            "diff1_l1": float(lw.get("diff1_l1", 0.1)),
+            "diff2_l1": float(lw.get("diff2_l1", 0.05)),
+            "stft_logmag_l1": float(lw.get("stft_logmag_l1", 0.05)),
             "gan": float(lw.get("gan", 0.03)),
             "feature": float(lw.get("feature", 0.1)),
+        }
+        stft_cfg_raw = dict(train_cfg.get("stft_loss") or {})
+        stft_loss_cfg = {
+            "n_fft": int(stft_cfg_raw.get("n_fft", 256)),
+            "win_length": int(stft_cfg_raw.get("win_length", stft_cfg_raw.get("n_fft", 256))),
+            "hop_length": int(stft_cfg_raw.get("hop_length", 64)),
         }
 
         # adversarial scheduling (step-based)
@@ -489,6 +489,7 @@ def main() -> None:
                 seed=int(seed),
                 ckpt_dir=ckpt_dir,
                 loss_weights=loss_weights,
+                stft_loss_cfg=stft_loss_cfg,
                 disc_start_step=disc_start_step,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
@@ -496,7 +497,6 @@ def main() -> None:
                 resume_from=resume_from,
                 log_every_steps=log_every_steps,
                 codebook_stats_every_steps=codebook_stats_every_steps,
-                codebook_stats_until_step=codebook_stats_until_step,
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
                 freeze_W=freeze_W,

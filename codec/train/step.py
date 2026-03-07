@@ -5,10 +5,13 @@ from functools import partial
 import jax
 import jax.numpy as jnp
 
-from .losses import compute_generator_losses, hinge_d_loss, l1_time_loss
+from .losses import compute_generator_losses, compute_reconstruction_losses, hinge_d_loss
 
 
-@partial(jax.jit, static_argnames=("collect_codebook_stats",))
+@partial(
+    jax.jit,
+    static_argnames=("collect_codebook_stats", "stft_n_fft", "stft_hop_length", "stft_win_length"),
+)
 def compute_grads(
     gen_state,
     disc_state,
@@ -16,6 +19,10 @@ def compute_grads(
     rng,
     loss_weights,
     disc_mask: float,
+    *,
+    stft_n_fft: int = 256,
+    stft_hop_length: int = 64,
+    stft_win_length: int = 256,
     collect_codebook_stats: bool = True,
 ):
     disc_mask = jnp.asarray(disc_mask, dtype=jnp.float32)
@@ -50,36 +57,39 @@ def compute_grads(
             feat_w = jnp.asarray(weights.get("feature", 0.0), dtype=jnp.float32)
             weights["gan"] = disc_mask * gan_w
             weights["feature"] = disc_mask * feat_w
-            total_loss, logs = compute_generator_losses(
+            return compute_generator_losses(
                 y=batch,
                 y_hat=wave_hat,
                 fake_map=fake_map,
                 real_feats=real_feats,
                 fake_feats=fake_feats,
                 weights=weights,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
             )
-            loss_dtype = batch.dtype
-            total_loss = jnp.asarray(total_loss, dtype=loss_dtype)
-            logs = {k: jnp.asarray(v, dtype=loss_dtype) for k, v in logs.items()}
-            return total_loss, logs
 
         def _gen_loss_without_disc(_):
-            l_time = l1_time_loss(batch, wave_hat)
-            dtype = l_time.dtype
-            w_recon = jnp.asarray(loss_weights.get("time_l1", 1.0), dtype=dtype)
-            zero = jnp.asarray(0.0, dtype=dtype)
-            recon_term = w_recon * l_time
-            total = recon_term
-            logs = {
-                "total_loss": total,
-                "reconstruct_loss": l_time,
-                "weighted_reconstruct_loss": recon_term,
-                "gan_raw_loss": zero,
-                "weighted_gan_loss": zero,
-                "feature_loss": zero,
-                "weighted_feature_loss": zero,
-            }
-            return total, logs
+            reconstruct, logs = compute_reconstruction_losses(
+                y=batch,
+                y_hat=wave_hat,
+                weights=loss_weights,
+                stft_n_fft=stft_n_fft,
+                stft_hop_length=stft_hop_length,
+                stft_win_length=stft_win_length,
+            )
+            zero = jnp.asarray(0.0, dtype=reconstruct.dtype)
+            logs = dict(logs)
+            logs.update(
+                {
+                    "total_loss": reconstruct,
+                    "gan_loss_raw": zero,
+                    "gan_loss": zero,
+                    "feature_loss_raw": zero,
+                    "feature_loss": zero,
+                }
+            )
+            return reconstruct, logs
 
         total_loss, logs = jax.lax.cond(
             disc_mask > 0.0,
@@ -96,10 +106,13 @@ def compute_grads(
             usage_ratio = outs["enc"].get("usage_ratio")
             if usage_ratio is not None:
                 logs["code_usage"] = usage_ratio
+        loss_dtype = batch.dtype
+        total_loss = jnp.asarray(total_loss, dtype=loss_dtype)
+        logs = {k: jnp.asarray(v, dtype=loss_dtype) for k, v in logs.items()}
         aux = {"logs": logs, "wave_hat": wave_hat, "vq_vars": vq_vars}
         return total_loss, aux
 
-    (g_loss, aux), g_grads = jax.value_and_grad(gen_loss_fn, has_aux=True)(gen_state.params)
+    (_g_loss, aux), g_grads = jax.value_and_grad(gen_loss_fn, has_aux=True)(gen_state.params)
 
     def disc_loss_fn(disc_params):
         def _disc_loss_with_disc(_):

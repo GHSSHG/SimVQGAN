@@ -83,7 +83,7 @@ class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
     channel_schedule: Sequence[int] = (128, 64, 64, 32, 32)
     num_res_blocks: int = 2
-    up_strides: Sequence[int] = (1, 5, 4, 2)
+    up_strides: Sequence[int] = (1, 2, 2, 2)
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -124,13 +124,13 @@ class SimVQDecoder1D(nn.Module):
                 )
             )
         self.stages = tuple(stages)
-        self.norm_out = GroupNorm1D(self.channel_schedule[-1], dtype=self.dtype, param_dtype=self.param_dtype)
+        self.norm_out = GroupNorm1D(self.channel_schedule[-1], dtype=jnp.float32, param_dtype=self.param_dtype)
         self.conv_out = Conv1d(
             self.out_channels,
             kernel=3,
             padding="SAME",
             use_bias=True,
-            dtype=self.dtype,
+            dtype=jnp.float32,
             param_dtype=self.param_dtype,
             name="to_signal",
         )
@@ -141,6 +141,7 @@ class SimVQDecoder1D(nn.Module):
             h = block(h, train=train)
         for stage in self.stages:
             h = stage(h, train=train)
+        h = h.astype(jnp.float32)
         h = self.norm_out(h)
         h = _swish(h)
         wave = self.conv_out(h)
