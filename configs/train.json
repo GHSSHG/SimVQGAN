@@ -1,30 +1,30 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 3,
-    "batch_size": 2048,
+    "epochs": 2,
+    "batch_size": 512,
     "reference_device_count": 8,
-    "per_device_batch_size": 256,
+    "per_device_batch_size": 64,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 1e-4,
+    "learning_rate": 2e-5,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
     "device_prefetch_per_device": 2,
     "grad_clip": 1.0,
     "disc_start_step": 10000,
-    "disc_warmup_steps": 20000,
-    "log_every_steps": 250,
-    "codebook_stats_every_steps": 1000,
+    "disc_warmup_steps": 10000,
+    "log_every_steps": 500,
+    "codebook_stats_every_steps": 2000,
     "scan_steps": 16,
     "loss_weights": {
       "time_l1": 1.0,
-      "diff1_l1": 0.1,
-      "diff2_l1": 0.05,
-      "stft_logmag_l1": 0.05,
-      "gan": 0.03,
-      "feature": 0.1
+      "diff1_l1": 0.5,
+      "diff2_l1": 0.2,
+      "stft_logmag_l1": 0.1,
+      "gan": 0.05,
+      "feature": 0.03
     },
     "stft_loss": {
       "n_fft": 64,
@@ -103,9 +103,9 @@
       "post_quant_conv": 1.0,
       "pre_quant_tf": 0.8,
       "post_quant_tf": 1.0,
-      "quantizer_W": 0.4,
-      "quantizer_proj_bias": 0.4,
-      "discriminator": 0.15
+      "quantizer_W": 0.7,
+      "quantizer_proj_bias": 0.7,
+      "discriminator": 1.0
     }
   }
 }
