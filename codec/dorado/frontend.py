@@ -241,9 +241,9 @@ def _normalize_feature_map(x: jnp.ndarray, *, eps: float = 1e-5) -> jnp.ndarray:
     x = jnp.asarray(x, dtype=jnp.float32)
     mean = jnp.mean(x, axis=1, keepdims=True)
     centered = x - mean
-    std = jnp.std(centered, axis=1, keepdims=True)
-    safe_std = jnp.where(std >= eps, std, jnp.ones_like(std))
-    return centered / safe_std
+    var = jnp.mean(jnp.square(centered), axis=1, keepdims=True)
+    inv_scale = jax.lax.rsqrt(var + jnp.asarray(eps * eps, dtype=x.dtype))
+    return centered * inv_scale
 
 
 def dorado_loss_scale(step: jnp.ndarray, state: DoradoPerceptualState) -> jnp.ndarray:

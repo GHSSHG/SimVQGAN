@@ -1,7 +1,7 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 3,
+    "epochs": 2,
     "batch_size": 2048,
     "reference_device_count": 4,
     "per_device_batch_size": 512,
@@ -13,9 +13,8 @@
     "device_prefetch_size": 16,
     "device_prefetch_per_device": 2,
     "grad_clip": 1.0,
-    "log_every_steps": 500,
-    "codebook_stats_every_steps": 2000,
-    "scan_steps": 16,
+    "log_every_steps": 100,
+    "codebook_stats_every_steps": 1000,
     "eval": {
       "enabled": true,
       "every_steps": 10000,
@@ -129,14 +128,14 @@
   },
   "optim": {
     "lr_multipliers": {
-      "encoder": 0.8,
+      "encoder": 1.0,
       "decoder": 1.0,
-      "quant_conv": 0.8,
+      "quant_conv": 1.0,
       "post_quant_conv": 1.0,
-      "pre_quant_tf": 0.8,
+      "pre_quant_tf": 1.0,
       "post_quant_tf": 1.0,
-      "quantizer_W": 0.7,
-      "quantizer_proj_bias": 0.7
+      "quantizer_W": 1.0,
+      "quantizer_proj_bias": 1.0
     }
   }
 }

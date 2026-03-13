@@ -206,7 +206,6 @@ def _clone_dataset_with_metadata(ds: NanoporeSignalDataset) -> NanoporeSignalDat
         loader_prefetch_chunks=ds.loader_prefetch_chunks,
     )
 
-
 def _dummy_batch_from_template(batch: Any, *leading_dims: int) -> Any:
     def _make_leaf(x):
         arr = np.asarray(x)
@@ -281,7 +280,6 @@ def train_model_from_pod5(
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
     codebook_stats_every_steps: int | None = None,
-    scan_steps: int = 1,
     config_path: str | None = None,
     eval_cfg: dict[str, Any] | None = None,
 ):
@@ -492,7 +490,6 @@ def train_model_from_pod5(
     _, L = init_signal_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
     ndev = max(1, int(jax.local_device_count()))
-    scan_steps_int = max(1, int(scan_steps))
     data_parallel = (ndev > 1) if use_data_parallel is None else (bool(use_data_parallel) and ndev > 1)
     if bool(use_data_parallel) and ndev <= 1:
         _log("[warn] data_parallel requested, but only one local device is visible; falling back to single-device.")
@@ -505,8 +502,6 @@ def train_model_from_pod5(
         _log(
             f"[setup] Data parallel enabled on {ndev} devices (global_batch={B}, per_device_batch={per_device_batch})."
         )
-    if scan_steps_int > 1:
-        _log(f"[setup] scan_steps={scan_steps_int} (N-step fused training enabled).")
 
     host_prefetch_size = max(1, int(host_prefetch_size))
     device_prefetch_size = max(1, int(device_prefetch_size))
@@ -879,59 +874,11 @@ def train_model_from_pod5(
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, reduced_logs
 
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
-        def _p_train_step_scan(gen_state, batches, apply_rngs):
-            def _scan_body(carry, xs):
-                gen_state_i = carry
-                batch_i, rng_i = xs
-                g_grads, logs, _ = compute_grads(
-                    gen_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    stft_loss_scales=stft_loss_scales,
-                    dorado_perceptual_state=dorado_state,
-                    collect_codebook_stats=False,
-                )
-                g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-                reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return gen_state_i, reduced_logs
-
-            gen_state, logs_seq = jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
-            return gen_state, logs_seq
-
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
-        def _p_train_step_scan_with_stats(gen_state, batches, apply_rngs):
-            def _scan_body(carry, xs):
-                gen_state_i = carry
-                batch_i, rng_i = xs
-                g_grads, logs, _ = compute_grads(
-                    gen_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    stft_loss_scales=stft_loss_scales,
-                    dorado_perceptual_state=dorado_state,
-                    collect_codebook_stats=True,
-                )
-                g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-                reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return gen_state_i, reduced_logs
-
-            gen_state, logs_seq = jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
-            return gen_state, logs_seq
-
         _jit_train_step = None
         _jit_train_step_with_stats = None
-        _jit_train_step_scan = None
-        _jit_train_step_scan_with_stats = None
     else:
         _p_train_step = None
         _p_train_step_with_stats = None
-        _p_train_step_scan = None
-        _p_train_step_scan_with_stats = None
 
         @jax.jit
         def _jit_train_step(gen_state, batch, apply_rng):
@@ -963,46 +910,6 @@ def train_model_from_pod5(
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, logs
 
-        @jax.jit
-        def _jit_train_step_scan(gen_state, batches, apply_rngs):
-            def _scan_body(carry, xs):
-                gen_state_i = carry
-                batch_i, rng_i = xs
-                g_grads, logs, new_vq = compute_grads(
-                    gen_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    stft_loss_scales=stft_loss_scales,
-                    dorado_perceptual_state=dorado_state,
-                    collect_codebook_stats=False,
-                )
-                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return gen_state_i, logs
-
-            return jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
-
-        @jax.jit
-        def _jit_train_step_scan_with_stats(gen_state, batches, apply_rngs):
-            def _scan_body(carry, xs):
-                gen_state_i = carry
-                batch_i, rng_i = xs
-                g_grads, logs, new_vq = compute_grads(
-                    gen_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    stft_loss_scales=stft_loss_scales,
-                    dorado_perceptual_state=dorado_state,
-                    collect_codebook_stats=True,
-                )
-                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return gen_state_i, logs
-
-            return jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
-
     if resume_from is not None and os.path.exists(resume_from):
         try:
             ckpt = flax_ckpt.restore_checkpoint(ckpt_dir=resume_from, target=None)
@@ -1025,31 +932,12 @@ def train_model_from_pod5(
             _p_train_step(gen_state, dummy_batch, warm_rngs)
             if warmup_compile_stats:
                 _p_train_step_with_stats(gen_state, dummy_batch, warm_rngs)
-            if scan_steps_int > 1:
-                warm_scan_rng = jax.random.split(warm_rng, ndev * scan_steps_int).reshape(ndev, scan_steps_int, 2)
-                warm_scan_batch = _dummy_batch_from_template(
-                    compile_batch_template,
-                    ndev,
-                    scan_steps_int,
-                    per_device_batch,
-                )
-                _p_train_step_scan(gen_state, warm_scan_batch, warm_scan_rng)
-                if warmup_compile_stats:
-                    _p_train_step_scan_with_stats(gen_state, warm_scan_batch, warm_scan_rng)
-                del warm_scan_batch, warm_scan_rng
             del warm_rngs
         else:
             dummy_batch = _dummy_batch_from_template(compile_batch_template, B)
             _jit_train_step(gen_state, dummy_batch, warm_rng)
             if warmup_compile_stats:
                 _jit_train_step_with_stats(gen_state, dummy_batch, warm_rng)
-            if scan_steps_int > 1:
-                warm_scan_rng = jax.random.split(warm_rng, scan_steps_int)
-                warm_scan_batch = _dummy_batch_from_template(compile_batch_template, scan_steps_int, B)
-                _jit_train_step_scan(gen_state, warm_scan_batch, warm_scan_rng)
-                if warmup_compile_stats:
-                    _jit_train_step_scan_with_stats(gen_state, warm_scan_batch, warm_scan_rng)
-                del warm_scan_batch, warm_scan_rng
         del dummy_batch
         gc.collect()
         _log("[warmup] Compile finished; starting real data iterator.")
@@ -1070,20 +958,6 @@ def train_model_from_pod5(
         if "code_usage" in logs:
             logs.pop("code_usage", None)
         return logs
-
-    def _split_logs_sequence(logs_seq: Dict[str, Any], num_steps: int) -> list[Dict[str, Any]]:
-        per_step_logs = [dict() for _ in range(num_steps)]
-        for key, value in logs_seq.items():
-            arr = np.asarray(jax.device_get(value))
-            if arr.ndim == 0:
-                for i in range(num_steps):
-                    per_step_logs[i][key] = arr
-                continue
-            if arr.shape[0] != num_steps:
-                continue
-            for i in range(num_steps):
-                per_step_logs[i][key] = arr[i]
-        return per_step_logs
 
     def _consume_single_batch(
         batch,
@@ -1109,41 +983,6 @@ def train_model_from_pod5(
             logs = _strip_codebook_metrics(logs)
         return logs, host_sync_ms
 
-    def _consume_scan_batches(
-        batches: list[Any],
-        *,
-        collect_codebook_stats_flags: list[bool],
-    ) -> tuple[list[Dict[str, Any]], float]:
-        nonlocal step_rng, gen_state
-        num_steps = len(batches)
-        if num_steps <= 0:
-            return [], 0.0
-        if num_steps != scan_steps_int:
-            raise ValueError(f"scan chunk expects {scan_steps_int} steps but got {num_steps}.")
-        step_rng, apply_rng = jax.random.split(step_rng)
-        collect_any_stats = any(collect_codebook_stats_flags)
-        if data_parallel:
-            stacked_batches = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=1), *batches)
-            apply_rngs = jax.random.split(apply_rng, ndev * num_steps).reshape(ndev, num_steps, 2)
-            train_step_fn = _p_train_step_scan_with_stats if collect_any_stats else _p_train_step_scan
-            gen_state, logs_seq = train_step_fn(gen_state, stacked_batches, apply_rngs)
-            sync_start = time.perf_counter()
-            logs_seq = jax.tree_util.tree_map(lambda x: x[0], logs_seq)
-            logs_seq = dict(logs_seq)
-        else:
-            stacked_batches = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batches)
-            apply_rngs = jax.random.split(apply_rng, num_steps)
-            train_step_fn = _jit_train_step_scan_with_stats if collect_any_stats else _jit_train_step_scan
-            gen_state, logs_seq = train_step_fn(gen_state, stacked_batches, apply_rngs)
-            sync_start = time.perf_counter()
-            logs_seq = dict(logs_seq)
-        host_sync_ms = (time.perf_counter() - sync_start) * 1000.0
-        logs_list = _split_logs_sequence(logs_seq, num_steps=num_steps)
-        for idx, collect_stats in enumerate(collect_codebook_stats_flags):
-            if not collect_stats:
-                logs_list[idx] = _strip_codebook_metrics(logs_list[idx])
-        return logs_list, host_sync_ms
-
     stop_training = False
     try:
         for epoch_idx in range(1, epochs_limit + 1):
@@ -1158,163 +997,130 @@ def train_model_from_pod5(
                     if total_step_cap and global_step >= total_step_cap:
                         stop_training = True
                         break
-                    chunk_target = scan_steps_int
-                    if epoch_step_cap:
-                        chunk_target = min(chunk_target, epoch_step_cap - steps_this_epoch)
-                    if total_step_cap:
-                        chunk_target = min(chunk_target, total_step_cap - global_step)
-                    chunk_target = max(1, int(chunk_target))
 
-                    batches: list[Any] = []
-                    wait_ms_seq: list[float] = []
-                    for _ in range(chunk_target):
-                        wait_start = time.perf_counter()
-                        try:
-                            batch = next(data_iter)
-                        except StopIteration:
-                            break
-                        wait_ms_seq.append((time.perf_counter() - wait_start) * 1000.0)
-                        batches.append(batch)
-                    if not batches:
+                    wait_start = time.perf_counter()
+                    try:
+                        batch = next(data_iter)
+                    except StopIteration:
                         break
+                    data_wait_ms = (time.perf_counter() - wait_start) * 1000.0
 
-                    step_indices = [global_step + i for i in range(len(batches))]
-                    collect_flags = [_should_collect_codebook_stats(step_idx) for step_idx in step_indices]
+                    collect_codebook_stats = _should_collect_codebook_stats(global_step)
+                    step_start = time.perf_counter()
+                    logs, host_sync_ms = _consume_single_batch(
+                        batch,
+                        collect_codebook_stats=collect_codebook_stats,
+                    )
+                    step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
+                    train_step_ms = max(0.0, step_elapsed_ms - host_sync_ms)
+                    _add_perf_sample(
+                        data_wait_ms=data_wait_ms,
+                        train_step_ms=train_step_ms,
+                        host_sync_ms=host_sync_ms,
+                    )
 
-                    if scan_steps_int > 1 and len(batches) == scan_steps_int:
-                        step_start = time.perf_counter()
-                        logs_seq, host_sync_ms_total = _consume_scan_batches(
-                            batches,
-                            collect_codebook_stats_flags=collect_flags,
+                    steps_this_epoch += 1
+                    global_step += 1
+                    _add_log_window_sample(logs)
+
+                    if global_step in mem_probe_steps and global_step not in mem_probe_done:
+                        _maybe_log_gpu_memory(_log, f"step{global_step}")
+                        mem_probe_done.add(global_step)
+
+                    if log_every_steps_int > 0 and global_step % log_every_steps_int == 0:
+                        perf = _drain_perf_window()
+                        averaged_logs = _drain_log_window(logs)
+                        _log_step(global_step, averaged_logs, perf=perf)
+
+                    should_run_eval = (
+                        eval_enabled
+                        and eval_every_steps is not None
+                        and global_step % eval_every_steps == 0
+                    )
+                    should_save_periodic = (
+                        periodic_ckpt_dir is not None
+                        and checkpoint_every_steps_int > 0
+                        and global_step % checkpoint_every_steps_int == 0
+                    )
+                    periodic_ckpt_path: str | None = None
+                    if should_save_periodic:
+                        periodic_ckpt_path = _save_checkpoint_to_dir(
+                            periodic_ckpt_dir,
+                            global_step,
+                            keep=1_000_000,
                         )
-                        step_elapsed_ms_total = (time.perf_counter() - step_start) * 1000.0
-                        train_step_ms_total = max(0.0, step_elapsed_ms_total - host_sync_ms_total)
-                        _add_perf_sample(
-                            data_wait_ms=sum(wait_ms_seq) / len(wait_ms_seq),
-                            train_step_ms=train_step_ms_total / len(batches),
-                            host_sync_ms=host_sync_ms_total / len(batches),
-                            weight=float(len(batches)),
-                        )
-                    else:
-                        logs_seq = []
-                        for local_idx, batch in enumerate(batches):
-                            step_start = time.perf_counter()
-                            logs_i, host_sync_ms = _consume_single_batch(
-                                batch,
-                                collect_codebook_stats=collect_flags[local_idx],
-                            )
-                            step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
-                            train_step_ms = max(0.0, step_elapsed_ms - host_sync_ms)
-                            _add_perf_sample(
-                                data_wait_ms=wait_ms_seq[local_idx],
-                                train_step_ms=train_step_ms,
-                                host_sync_ms=host_sync_ms,
-                            )
-                            logs_seq.append(logs_i)
+                        _log(f"[ckpt] step={global_step} written to {periodic_ckpt_path}")
 
-                    for logs in logs_seq:
-                        steps_this_epoch += 1
-                        global_step += 1
-                        _add_log_window_sample(logs)
-
-                        if global_step in mem_probe_steps and global_step not in mem_probe_done:
-                            _maybe_log_gpu_memory(_log, f"step{global_step}")
-                            mem_probe_done.add(global_step)
-
-                        if log_every_steps_int > 0 and global_step % log_every_steps_int == 0:
-                            perf = _drain_perf_window()
-                            averaged_logs = _drain_log_window(logs)
-                            _log_step(global_step, averaged_logs, perf=perf)
-
-                        should_run_eval = (
-                            eval_enabled
-                            and eval_every_steps is not None
-                            and global_step % eval_every_steps == 0
-                        )
-                        should_save_periodic = (
-                            periodic_ckpt_dir is not None
-                            and checkpoint_every_steps_int > 0
-                            and global_step % checkpoint_every_steps_int == 0
-                        )
-                        periodic_ckpt_path: str | None = None
-                        if should_save_periodic:
+                    if should_run_eval:
+                        if periodic_ckpt_path is None and periodic_ckpt_dir is not None:
                             periodic_ckpt_path = _save_checkpoint_to_dir(
                                 periodic_ckpt_dir,
                                 global_step,
                                 keep=1_000_000,
                             )
                             _log(f"[ckpt] step={global_step} written to {periodic_ckpt_path}")
-
-                        if should_run_eval:
-                            if periodic_ckpt_path is None and periodic_ckpt_dir is not None:
-                                periodic_ckpt_path = _save_checkpoint_to_dir(
-                                    periodic_ckpt_dir,
-                                    global_step,
-                                    keep=1_000_000,
-                                )
-                                _log(f"[ckpt] step={global_step} written to {periodic_ckpt_path}")
-                            eval_summary = (
-                                _run_validation(periodic_ckpt_path, global_step)
-                                if periodic_ckpt_path is not None
-                                else None
+                        eval_summary = (
+                            _run_validation(periodic_ckpt_path, global_step)
+                            if periodic_ckpt_path is not None
+                            else None
+                        )
+                        if eval_summary is None:
+                            _append_eval_history(
+                                {
+                                    "step": global_step,
+                                    "status": "failed",
+                                    "checkpoint_path": periodic_ckpt_path,
+                                }
                             )
-                            if eval_summary is None:
-                                _append_eval_history(
-                                    {
-                                        "step": global_step,
-                                        "status": "failed",
-                                        "checkpoint_path": periodic_ckpt_path,
-                                    }
-                                )
-                            else:
-                                eval_metric = _eval_metric_from_summary(eval_summary)
-                                eval_metrics = _flatten_eval_metrics(eval_summary)
-                                if eval_metric is not None:
-                                    eval_metrics["valid/avg_qscore_diff"] = eval_metric
-                                if eval_metric is not None and (
-                                    best_eval_metric is None or eval_metric > best_eval_metric
-                                ):
-                                    best_eval_metric = eval_metric
-                                    best_eval_step = global_step
-                                    if best_ckpt_dir is not None:
-                                        best_ckpt_path = _save_checkpoint_to_dir(
-                                            best_ckpt_dir,
-                                            global_step,
-                                            keep=1,
-                                            clear_existing=True,
-                                        )
-                                        _log(
-                                            f"[best_ckpt] updated at step={global_step} "
-                                            f"avg_qscore_diff={eval_metric:.6f} path={best_ckpt_path}"
-                                        )
-                                        if best_metric_path is not None:
-                                            with best_metric_path.open("w", encoding="utf-8") as handle:
-                                                json.dump(
-                                                    {
-                                                        "best_step": global_step,
-                                                        "best_avg_qscore_diff": eval_metric,
-                                                        "best_checkpoint_path": best_ckpt_path,
-                                                    },
-                                                    handle,
-                                                    indent=2,
-                                                    ensure_ascii=False,
-                                                )
-                                        eval_summary["best_checkpoint_path"] = best_ckpt_path
-                                if eval_metric is not None:
-                                    eval_summary["avg_qscore_diff"] = eval_metric
-                                eval_summary["best_step"] = best_eval_step
-                                eval_summary["best_avg_qscore_diff"] = best_eval_metric
-                                _append_eval_history(eval_summary)
-                                shared_reads = eval_summary.get("shared_read_count")
-                                identity = eval_summary.get("length_weighted_identity")
-                                mean_q_delta = eval_summary.get("mean_qscore_delta")
-                                _log(
-                                    f"[eval] step={global_step}, shared_reads={shared_reads}, "
-                                    f"length_weighted_identity={identity}, mean_qscore_delta={mean_q_delta}, "
-                                    f"avg_qscore_diff={eval_metric}"
-                                )
-                                if eval_metrics:
-                                    _log_wandb(eval_metrics, global_step)
+                        else:
+                            eval_metric = _eval_metric_from_summary(eval_summary)
+                            eval_metrics = _flatten_eval_metrics(eval_summary)
+                            if eval_metric is not None:
+                                eval_metrics["valid/avg_qscore_diff"] = eval_metric
+                            if eval_metric is not None and (
+                                best_eval_metric is None or eval_metric > best_eval_metric
+                            ):
+                                best_eval_metric = eval_metric
+                                best_eval_step = global_step
+                                if best_ckpt_dir is not None:
+                                    best_ckpt_path = _save_checkpoint_to_dir(
+                                        best_ckpt_dir,
+                                        global_step,
+                                        keep=1,
+                                        clear_existing=True,
+                                    )
+                                    _log(
+                                        f"[best_ckpt] updated at step={global_step} "
+                                        f"avg_qscore_diff={eval_metric:.6f} path={best_ckpt_path}"
+                                    )
+                                    if best_metric_path is not None:
+                                        with best_metric_path.open("w", encoding="utf-8") as handle:
+                                            json.dump(
+                                                {
+                                                    "best_step": global_step,
+                                                    "best_avg_qscore_diff": eval_metric,
+                                                    "best_checkpoint_path": best_ckpt_path,
+                                                },
+                                                handle,
+                                                indent=2,
+                                                ensure_ascii=False,
+                                            )
+                                    eval_summary["best_checkpoint_path"] = best_ckpt_path
+                            if eval_metric is not None:
+                                eval_summary["avg_qscore_diff"] = eval_metric
+                            eval_summary["best_step"] = best_eval_step
+                            eval_summary["best_avg_qscore_diff"] = best_eval_metric
+                            _append_eval_history(eval_summary)
+                            shared_reads = eval_summary.get("shared_read_count")
+                            identity = eval_summary.get("length_weighted_identity")
+                            mean_q_delta = eval_summary.get("mean_qscore_delta")
+                            _log(
+                                f"[eval] step={global_step}, shared_reads={shared_reads}, "
+                                f"length_weighted_identity={identity}, mean_qscore_delta={mean_q_delta}, "
+                                f"avg_qscore_diff={eval_metric}"
+                            )
+                            if eval_metrics:
+                                _log_wandb(eval_metrics, global_step)
             finally:
                 host_iter.close()
             if steps_this_epoch == 0:
