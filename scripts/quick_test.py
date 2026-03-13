@@ -90,7 +90,8 @@ def _patch_config(
     base_data["root"] = str(pod5_file.resolve().parent)
     cfg["data"] = base_data
     ckpt = dict(cfg.get("checkpoint") or {})
-    ckpt["dir"] = str(ckpt_dir.resolve())
+    ckpt["root_dir"] = str(ckpt_dir.resolve())
+    ckpt.pop("dir", None)
     ckpt["resume_from"] = None
     ckpt["every_steps"] = 0
     cfg["checkpoint"] = ckpt

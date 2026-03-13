@@ -5,6 +5,9 @@ from typing import Dict, Sequence
 import jax
 import jax.numpy as jnp
 
+from ..dorado import DoradoPerceptualState
+from ..dorado.frontend import compute_dorado_perceptual_loss
+
 
 def _as_float_signal(x: jnp.ndarray) -> jnp.ndarray:
     return jnp.asarray(x, dtype=jnp.float32)
@@ -93,32 +96,33 @@ def stft_logmag_l1_loss(
     return jnp.mean(jnp.abs(y_logmag - y_hat_logmag))
 
 
-def map_mean(x: jnp.ndarray) -> jnp.ndarray:
-    x = _as_float_signal(x)
-    return jnp.mean(x, axis=tuple(range(1, x.ndim)))
-
-
-def hinge_g_loss(fake_map: jnp.ndarray) -> jnp.ndarray:
-    fake_map = _as_float_signal(fake_map)
-    return -map_mean(fake_map).mean()
-
-
-def hinge_d_loss(real_map: jnp.ndarray, fake_map: jnp.ndarray) -> jnp.ndarray:
-    real_map = _as_float_signal(real_map)
-    fake_map = _as_float_signal(fake_map)
-    real_term = jnp.mean(jnp.maximum(0.0, 1.0 - real_map))
-    fake_term = jnp.mean(jnp.maximum(0.0, 1.0 + fake_map))
-    return real_term + fake_term
-
-
-def feature_matching_loss(real_feats: Sequence[jnp.ndarray], fake_feats: Sequence[jnp.ndarray]) -> jnp.ndarray:
+def ms_stft_logmag_l1_loss(
+    y: jnp.ndarray,
+    y_hat: jnp.ndarray,
+    *,
+    scales: Sequence[tuple[int, int, int]],
+) -> jnp.ndarray:
     losses = [
-        jnp.mean(jnp.abs(_as_float_signal(r) - _as_float_signal(f)))
-        for r, f in zip(real_feats, fake_feats)
+        stft_logmag_l1_loss(
+            y,
+            y_hat,
+            n_fft=int(n_fft),
+            win_length=int(win_length),
+            hop_length=int(hop_length),
+        )
+        for n_fft, win_length, hop_length in scales
     ]
     if not losses:
-        return jnp.array(0.0, dtype=jnp.float32)
+        return jnp.asarray(0.0, dtype=jnp.float32)
     return jnp.mean(jnp.stack(losses))
+
+
+def _stft_scale_labels(num_scales: int) -> tuple[str, ...]:
+    if num_scales == 3:
+        return ("small", "medium", "large")
+    if num_scales == 1:
+        return ("stft",)
+    return tuple(f"scale_{idx}" for idx in range(num_scales))
 
 
 def compute_reconstruction_losses(
@@ -126,20 +130,15 @@ def compute_reconstruction_losses(
     y: jnp.ndarray,
     y_hat: jnp.ndarray,
     weights: Dict[str, float],
-    stft_n_fft: int = 256,
-    stft_hop_length: int = 64,
-    stft_win_length: int = 256,
+    stft_loss_scales: Sequence[tuple[int, int, int]] = ((256, 256, 64),),
+    pa_mean: jnp.ndarray | None = None,
+    pa_std: jnp.ndarray | None = None,
+    step: jnp.ndarray | None = None,
+    dorado_perceptual_state: DoradoPerceptualState | None = None,
 ) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     l_time = l1_time_loss(y, y_hat)
     l_diff1 = l1_diff_loss(y, y_hat, order=1)
     l_diff2 = l1_diff_loss(y, y_hat, order=2)
-    l_stft = stft_logmag_l1_loss(
-        y,
-        y_hat,
-        n_fft=stft_n_fft,
-        hop_length=stft_hop_length,
-        win_length=stft_win_length,
-    )
     dtype = l_time.dtype
 
     def _weight(name: str, default: float) -> jnp.ndarray:
@@ -148,16 +147,13 @@ def compute_reconstruction_losses(
     w_time = _weight("time_l1", 1.0)
     w_diff1 = _weight("diff1_l1", 0.0)
     w_diff2 = _weight("diff2_l1", 0.0)
-    w_stft = _weight("stft_logmag_l1", 0.0)
+    legacy_stft_weight = float(weights.get("stft_logmag_l1", 0.0))
 
-    reconstruct_raw = l_time + l_diff1 + l_diff2 + l_stft
     time_term = w_time * l_time
     diff1_term = w_diff1 * l_diff1
     diff2_term = w_diff2 * l_diff2
-    stft_term = w_stft * l_stft
-    reconstruct = time_term + diff1_term + diff2_term + stft_term
+    reconstruct = time_term + diff1_term + diff2_term
     logs = {
-        "reconstruct_loss_raw": reconstruct_raw,
         "reconstruct_loss": reconstruct,
         "time_l1_loss_raw": l_time,
         "time_l1_loss": time_term,
@@ -165,52 +161,36 @@ def compute_reconstruction_losses(
         "diff1_loss": diff1_term,
         "diff2_loss_raw": l_diff2,
         "diff2_loss": diff2_term,
-        "stft_logmag_loss_raw": l_stft,
-        "stft_logmag_loss": stft_term,
     }
+
+    scale_labels = _stft_scale_labels(len(stft_loss_scales))
+    if len(scale_labels) != len(stft_loss_scales):
+        raise ValueError("STFT scale labels must match the number of STFT scales.")
+    for label, (n_fft, win_length, hop_length) in zip(scale_labels, stft_loss_scales):
+        raw_loss = stft_logmag_l1_loss(
+            y,
+            y_hat,
+            n_fft=int(n_fft),
+            hop_length=int(hop_length),
+            win_length=int(win_length),
+        )
+        weight = _weight(f"{label}_stft_logmag_l1", legacy_stft_weight)
+        weighted_loss = weight * raw_loss
+        reconstruct = reconstruct + weighted_loss
+        logs[f"{label}_stft_logmag_loss_raw"] = raw_loss
+        logs[f"{label}_stft_logmag_loss"] = weighted_loss
+
+    if dorado_perceptual_state is not None and pa_mean is not None and pa_std is not None and step is not None:
+        dorado_loss, dorado_logs = compute_dorado_perceptual_loss(
+            y=y,
+            y_hat=y_hat,
+            pa_mean=pa_mean,
+            pa_std=pa_std,
+            state=dorado_perceptual_state,
+            step=step,
+        )
+        reconstruct = reconstruct + dorado_loss
+        logs.update(dorado_logs)
+
+    logs["reconstruct_loss"] = reconstruct
     return reconstruct, logs
-
-
-def compute_generator_losses(
-    *,
-    y: jnp.ndarray,
-    y_hat: jnp.ndarray,
-    fake_map: jnp.ndarray,
-    real_feats: Sequence[jnp.ndarray],
-    fake_feats: Sequence[jnp.ndarray],
-    weights: Dict[str, float],
-    stft_n_fft: int = 256,
-    stft_hop_length: int = 64,
-    stft_win_length: int = 256,
-) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
-    reconstruct, logs = compute_reconstruction_losses(
-        y=y,
-        y_hat=y_hat,
-        weights=weights,
-        stft_n_fft=stft_n_fft,
-        stft_hop_length=stft_hop_length,
-        stft_win_length=stft_win_length,
-    )
-    l_g = hinge_g_loss(fake_map)
-    l_fm = feature_matching_loss(real_feats, fake_feats)
-    dtype = reconstruct.dtype
-
-    def _weight(name: str, default: float) -> jnp.ndarray:
-        return jnp.asarray(weights.get(name, default), dtype=dtype)
-
-    w_gan = _weight("gan", 0.1)
-    w_feature = _weight("feature", 0.0)
-    gan_term = w_gan * l_g
-    feature_term = w_feature * l_fm
-    total = reconstruct + gan_term + feature_term
-    logs = dict(logs)
-    logs.update(
-        {
-            "total_loss": total,
-            "gan_loss_raw": l_g,
-            "gan_loss": gan_term,
-            "feature_loss_raw": l_fm,
-            "feature_loss": feature_term,
-        }
-    )
-    return total, logs

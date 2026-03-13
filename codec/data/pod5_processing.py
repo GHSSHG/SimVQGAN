@@ -5,7 +5,7 @@ from typing import Any, Iterable, Tuple
 
 import numpy as np
 
-from .normalization import minmax_scale_with_stats
+from .normalization import standardize_with_stats
 
 
 class CalibrationError(RuntimeError):
@@ -37,14 +37,17 @@ class CalibrationParams:
 
 @dataclass(frozen=True)
 class NormalizationStats:
-    """Per-read min/max statistics for reversible min-max scaling."""
+    """Per-signal mean/std statistics for reversible standardization."""
 
-    data_min: float = 0.0
-    data_max: float = 0.0
+    mean: float = 0.0
+    std: float = 0.0
 
     @property
-    def data_range(self) -> float:
-        return float(self.data_max) - float(self.data_min)
+    def safe_std(self) -> float:
+        std = float(self.std)
+        if not np.isfinite(std) or np.isclose(std, 0.0):
+            return 1.0
+        return std
 
 
 def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
@@ -85,11 +88,11 @@ def normalize_adc_signal(
     *,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, NormalizationStats, CalibrationParams]:
-    """Convert ADC signal to normalized values with reversible metadata."""
+    """Convert ADC signal to standardized values with reversible metadata."""
     cal = parse_calibration(calibration)
     pa = cal.to_picoamps(signal)
-    norm, data_min, data_max = minmax_scale_with_stats(pa, eps=eps)
-    stats = NormalizationStats(data_min=data_min, data_max=data_max)
+    norm, mean, std = standardize_with_stats(pa, eps=eps)
+    stats = NormalizationStats(mean=mean, std=std)
     return norm, stats, cal
 
 
@@ -100,15 +103,16 @@ def denormalize_to_adc(
     *,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Invert min-max normalization to obtain (pA, ADC) arrays."""
+    """Invert standardization to obtain (pA, ADC) arrays."""
     norm = np.asarray(normalized, dtype=np.float32)
-    data_min = float(stats.data_min)
-    data_max = float(stats.data_max)
-    data_range = data_max - data_min
-    if data_range < eps:
-        pa = np.full_like(norm, data_min, dtype=np.float32)
+    mean = float(stats.mean)
+    if not np.isfinite(mean):
+        mean = 0.0
+    std = float(stats.std)
+    if not np.isfinite(std) or std < eps:
+        pa = np.full_like(norm, mean, dtype=np.float32)
     else:
-        pa = ((norm + 1.0) * 0.5) * data_range + data_min
+        pa = norm * std + mean
     adc = calibration.to_adc(pa)
     return pa, adc
 

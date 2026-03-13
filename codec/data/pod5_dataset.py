@@ -10,8 +10,9 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Unio
 import numpy as np
 import pod5 as p5
 
+from .normalization import standardize_with_stats
 from .pod5_processing import (
-    normalize_adc_signal,
+    parse_calibration,
     resolve_sample_rate,
     NormalizationStats,
     CalibrationParams,
@@ -19,10 +20,16 @@ from .pod5_processing import (
 )
 
 
-def _normalize_read_signal(signal: np.ndarray, calibration: Any) -> tuple[np.ndarray, NormalizationStats, CalibrationParams]:
-    """Convert int16 ADC to normalized float32 using POD5 calibration."""
-    normalized, stats, cal = normalize_adc_signal(signal, calibration)
-    return normalized, stats, cal
+def _calibrate_read_signal(signal: np.ndarray, calibration: Any) -> tuple[np.ndarray, CalibrationParams]:
+    """Convert int16 ADC to picoamps once per read using POD5 calibration."""
+    cal = parse_calibration(calibration)
+    return cal.to_picoamps(signal), cal
+
+
+def _standardize_chunk_signal(chunk: np.ndarray) -> tuple[np.ndarray, NormalizationStats]:
+    """Standardize a single chunk independently and keep reversible stats."""
+    normalized, mean, std = standardize_with_stats(chunk)
+    return normalized, NormalizationStats(mean=mean, std=std)
 
 
 def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarray]:
@@ -52,9 +59,9 @@ def _should_skip_pod5(exc: Exception) -> bool:
 
 """POD5 dataset utilities.
 
-Each read is streamed from POD5, converted to picoamps via calibration, scaled
-once to [-1, 1] using its own min/max, and then chunked so every window shares
-the same per-read statistics. Sample-rate hints stored in POD5 are preferred,
+Each read is streamed from POD5, converted to picoamps via calibration, sliced
+into fixed windows, and then each chunk is standardized independently using its
+own mean/std statistics. Sample-rate hints stored in POD5 are preferred,
 falling back to configured defaults only when metadata is absent.
 """
 
@@ -171,8 +178,7 @@ class NanoporeSignalDataset:
                         if raw_signal.shape[0] < chunk_size:
                             continue
                         try:
-                            # Normalize the full read prior to slicing windows to keep stats consistent across chunks.
-                            norm_signal, stats, cal = _normalize_read_signal(
+                            pa_signal, cal = _calibrate_read_signal(
                                 raw_signal, getattr(read, "calibration", None)
                             )
                         except CalibrationError as cal_exc:
@@ -184,8 +190,9 @@ class NanoporeSignalDataset:
                                 )
                                 self._calibration_warned_files.add(file_path)
                             continue
-                        for chunk in _iter_full_chunks(norm_signal, chunk_size=chunk_size):
-                            arr = np.asarray(chunk, dtype=np.float32)
+                        for chunk in _iter_full_chunks(pa_signal, chunk_size=chunk_size):
+                            arr, stats = _standardize_chunk_signal(chunk)
+                            arr = np.asarray(arr, dtype=np.float32)
                             if not self.return_metadata:
                                 yield arr
                             else:
@@ -203,9 +210,26 @@ class NanoporeSignalDataset:
             raise RuntimeError(f"打开 POD5 {file_path} 失败: {open_exc}") from open_exc
 
     @staticmethod
-    def _flush_batch(buf: List[np.ndarray]) -> np.ndarray:
+    def _flush_batch(buf: List[Any]) -> Any:
         if buf and isinstance(buf[0], tuple):
-            raise ValueError("return_metadata=True 数据集不支持批量堆叠；请迭代 chunk 自行处理元数据")
+            signals = []
+            pa_means = []
+            pa_stds = []
+            cal_offsets = []
+            cal_scales = []
+            for chunk, stats, cal in buf:
+                signals.append(np.asarray(chunk, dtype=np.float32))
+                pa_means.append(float(stats.mean))
+                pa_stds.append(float(stats.std))
+                cal_offsets.append(float(cal.offset))
+                cal_scales.append(float(cal.scale))
+            return {
+                "signal": np.asarray(np.stack(signals, axis=0), dtype=np.float32),
+                "pa_mean": np.asarray(pa_means, dtype=np.float32),
+                "pa_std": np.asarray(pa_stds, dtype=np.float32),
+                "calibration_offset": np.asarray(cal_offsets, dtype=np.float32),
+                "calibration_scale": np.asarray(cal_scales, dtype=np.float32),
+            }
         batch = np.asarray(np.stack(buf, axis=0), dtype=np.float32)
         return batch[:, np.newaxis, :]
 
@@ -225,17 +249,15 @@ class NanoporeSignalDataset:
         files_cycle: bool = False,
         num_workers: Optional[int] = None,
         max_chunk_queue: Optional[int] = None,
-    ) -> Iterator[np.ndarray]:
+    ) -> Iterator[Any]:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
-        if self.return_metadata:
-            raise ValueError("return_metadata=True 时请使用 iter_chunks 手动消费数据")
         worker_count = int(num_workers if num_workers is not None else self.loader_workers)
         queue_cap = int(max_chunk_queue if max_chunk_queue is not None else self.loader_prefetch_chunks)
         # Threaded path engages whenever >1 worker is requested; finite epochs still benefit
         if worker_count <= 1:
             while True:
-                buf: List[np.ndarray] = []
+                buf: List[Any] = []
                 for fp in self.pod5_files:
                     if fp in self._invalid_files:
                         continue
@@ -285,7 +307,7 @@ class NanoporeSignalDataset:
         files_cycle: bool,
         worker_count: int,
         max_chunk_queue: int,
-    ) -> Iterator[np.ndarray]:
+    ) -> Iterator[Any]:
         valid_files = [fp for fp in self.pod5_files if fp not in self._invalid_files]
         if not valid_files:
             raise FileNotFoundError("No valid POD5 files to stream from.")
@@ -315,9 +337,9 @@ class NanoporeSignalDataset:
             t.start()
             workers.append(t)
 
-        def generator() -> Iterator[np.ndarray]:
+        def generator() -> Iterator[Any]:
             active = worker_count
-            buf: List[np.ndarray] = []
+            buf: List[Any] = []
             try:
                 while True:
                     try:

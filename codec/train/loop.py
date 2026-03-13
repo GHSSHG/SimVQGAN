@@ -3,26 +3,25 @@ from __future__ import annotations
 from typing import Any, Dict, Iterator
 
 import gc
+import json
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
 from functools import partial
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.core import FrozenDict, freeze
-from flax import linen as nn
 from flax import jax_utils as flax_jax_utils
 from flax.training import checkpoints as flax_ckpt
 
-from .states import (
-    GeneratorTrainState,
-    create_generator_state,
-    create_discriminator_state,
-)
+from ..dorado import DoradoPerceptualState, load_dorado_perceptual_state
+from .states import GeneratorTrainState, create_generator_state
 from .step import compute_grads
 from ..data.prefetch import Prefetcher, make_device_prefetcher
 from ..data.pod5_dataset import NanoporeSignalDataset
@@ -30,7 +29,6 @@ from ..data.pod5_dataset import NanoporeSignalDataset
 
 _SIMVQ_KEY_MAPPING = {
     "total_loss": "total_loss",
-    "reconstruct_loss_raw": "reconstruct_loss_raw",
     "reconstruct_loss": "reconstruct_loss",
     "time_l1_loss_raw": "time_l1_loss_raw",
     "time_l1_loss": "time_l1_loss",
@@ -38,22 +36,23 @@ _SIMVQ_KEY_MAPPING = {
     "diff1_loss": "diff1_loss",
     "diff2_loss_raw": "diff2_loss_raw",
     "diff2_loss": "diff2_loss",
-    "stft_logmag_loss_raw": "stft_logmag_loss_raw",
-    "stft_logmag_loss": "stft_logmag_loss",
-    "gan_loss_raw": "gan_loss_raw",
-    "gan_loss": "gan_loss",
-    "feature_loss_raw": "feature_loss_raw",
-    "feature_loss": "feature_loss",
+    "small_stft_logmag_loss_raw": "small_stft_logmag_loss_raw",
+    "small_stft_logmag_loss": "small_stft_logmag_loss",
+    "medium_stft_logmag_loss_raw": "medium_stft_logmag_loss_raw",
+    "medium_stft_logmag_loss": "medium_stft_logmag_loss",
+    "large_stft_logmag_loss_raw": "large_stft_logmag_loss_raw",
+    "large_stft_logmag_loss": "large_stft_logmag_loss",
+    "dorado_perceptual_scale": "dorado_perceptual_scale",
+    "dorado_perceptual_loss_raw": "dorado_perceptual_loss_raw",
+    "dorado_perceptual_loss": "dorado_perceptual_loss",
     "q_z_dist": "q_z_dist",
     "log_q_z_dist": "log_q_z_dist",
     "perplexity": "codebook_perplexity",
     "code_usage": "codebook_util",
-    "disc_loss": "disc_loss",
-    "disc_loss_raw": "disc_loss_raw",
-    "disc_mask": "disc_mask",
 }
 
 _SPARSE_STEP_LOG_KEYS = frozenset({"perplexity", "code_usage"})
+
 
 def _value_to_float(val):
     if val is None:
@@ -72,6 +71,9 @@ def _simvq_style_logs(raw_logs: Dict[str, Any], split: str) -> Dict[str, Any]:
     for src, dst in _SIMVQ_KEY_MAPPING.items():
         if src in raw_logs:
             out[f"{pref}{dst}"] = raw_logs[src]
+    for key, value in raw_logs.items():
+        if key.startswith("dorado_") and f"{pref}{key}" not in out:
+            out[f"{pref}{key}"] = value
     return out
 
 
@@ -147,6 +149,113 @@ def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
     return dtype_value
 
 
+def _normalize_stft_loss_scales(stft_loss_cfg: dict[str, Any] | None) -> tuple[tuple[int, int, int], ...]:
+    cfg = dict(stft_loss_cfg or {})
+    scales_raw = cfg.get("scales")
+    if scales_raw is None:
+        n_fft = max(1, int(cfg.get("n_fft", 256)))
+        win_length = max(1, int(cfg.get("win_length", n_fft)))
+        win_length = min(win_length, n_fft)
+        hop_length = max(1, int(cfg.get("hop_length", max(1, win_length // 4))))
+        return ((n_fft, win_length, hop_length),)
+
+    if not isinstance(scales_raw, (list, tuple)) or len(scales_raw) == 0:
+        raise ValueError("train.stft_loss.scales must be a non-empty list.")
+
+    scales: list[tuple[int, int, int]] = []
+    for idx, scale in enumerate(scales_raw):
+        if isinstance(scale, dict):
+            n_fft = max(1, int(scale.get("n_fft", 256)))
+            win_length = max(1, int(scale.get("win_length", n_fft)))
+            hop_length = max(1, int(scale.get("hop_length", max(1, win_length // 4))))
+        elif isinstance(scale, (list, tuple)) and len(scale) == 3:
+            n_fft = max(1, int(scale[0]))
+            win_length = max(1, int(scale[1]))
+            hop_length = max(1, int(scale[2]))
+        else:
+            raise ValueError(
+                "Each train.stft_loss.scales item must be either a dict with n_fft/win_length/hop_length "
+                f"or a 3-tuple, got item {idx}: {scale!r}"
+            )
+        win_length = min(win_length, n_fft)
+        scales.append((n_fft, win_length, hop_length))
+    return tuple(scales)
+
+
+def _extract_signal_batch(batch: Any) -> np.ndarray:
+    signal = batch["signal"] if isinstance(batch, dict) else batch
+    arr = np.asarray(signal)
+    if arr.ndim == 3 and arr.shape[1] == 1:
+        arr = arr[:, 0, :]
+    elif arr.ndim == 3 and arr.shape[-1] == 1:
+        arr = arr[..., 0]
+    if arr.ndim != 2:
+        raise ValueError(f"Expected a signal batch with shape (B,T), got {arr.shape}")
+    return arr
+
+
+def _clone_dataset_with_metadata(ds: NanoporeSignalDataset) -> NanoporeSignalDataset:
+    return NanoporeSignalDataset.from_paths(
+        ds.pod5_files,
+        window_ms=ds.window_ms,
+        window_samples=ds.window_samples,
+        sample_rate_hz_default=ds.sample_rate_hz_default,
+        return_metadata=True,
+        read_ids_per_file=ds.read_ids_per_file,
+        loader_workers=ds.loader_workers,
+        loader_prefetch_chunks=ds.loader_prefetch_chunks,
+    )
+
+
+def _dummy_batch_from_template(batch: Any, *leading_dims: int) -> Any:
+    def _make_leaf(x):
+        arr = np.asarray(x)
+        if arr.ndim == 0:
+            return np.zeros_like(arr)
+        shape = tuple(int(v) for v in leading_dims) + tuple(arr.shape[1:])
+        return np.zeros(shape, dtype=arr.dtype)
+
+    return jax.tree_util.tree_map(_make_leaf, batch)
+
+
+def _flatten_eval_metrics(summary: dict[str, Any]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for key in (
+        "shared_read_count",
+        "original_read_count",
+        "reconstructed_read_count",
+        "original_only_read_count",
+        "reconstructed_only_read_count",
+        "exact_match_rate",
+        "length_weighted_identity",
+        "mean_qscore_delta",
+        "mean_qscore_delta_abs",
+    ):
+        value = summary.get(key)
+        if value is None:
+            continue
+        metrics[f"valid/{key}"] = float(value)
+
+    for prefix in ("identity_summary", "length_delta_summary", "qscore_delta_summary"):
+        payload = summary.get(prefix)
+        if not isinstance(payload, dict):
+            continue
+        for stat_name in ("mean", "median", "min", "max"):
+            value = payload.get(stat_name)
+            if value is None:
+                continue
+            metrics[f"valid/{prefix}.{stat_name}"] = float(value)
+    return metrics
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected JSON object in {path}")
+    return payload
+
+
 def train_model_from_pod5(
     ds: NanoporeSignalDataset,
     *,
@@ -155,8 +264,8 @@ def train_model_from_pod5(
     seed: int = 0,
     ckpt_dir: str | None = None,
     loss_weights: Dict[str, float] | None = None,
-    stft_loss_cfg: Dict[str, int] | None = None,
-    disc_start_step: int = 0,
+    stft_loss_cfg: dict[str, Any] | None = None,
+    dorado_perceptual_cfg: dict[str, Any] | None = None,
     model_cfg: dict | None = None,
     log_file: str | None = None,
     batch_size: int | None = None,
@@ -164,26 +273,22 @@ def train_model_from_pod5(
     log_every_steps: int = 100,
     checkpoint_every_steps: int = 5000,
     wandb_logger: Any | None = None,
-    # Optimization knobs
     generator_lr_multipliers: Dict[str, float] | None = None,
     grad_clip: float = 1.0,
-    disc_warmup_steps: int = 0,
     host_prefetch_size: int = 64,
     device_prefetch_size: int = 16,
-    disc_lr_mult: float = 0.1,
     use_data_parallel: bool | None = None,
     max_steps_total: int | None = None,
     max_steps_per_epoch: int | None = None,
     codebook_stats_every_steps: int | None = None,
     scan_steps: int = 1,
+    config_path: str | None = None,
+    eval_cfg: dict[str, Any] | None = None,
 ):
-    import jax
     from ..models.model import SimVQAudioModel
-    from ..models.patchgan import PatchDiscriminator1D
 
     if ckpt_dir is not None:
         os.makedirs(ckpt_dir, exist_ok=True)
-    # prepare log file
     log_path = log_file or (os.path.join(ckpt_dir, "train.log") if ckpt_dir else None)
     log_fp = None
     if log_path is not None:
@@ -237,39 +342,97 @@ def train_model_from_pod5(
             if wandb_drop_count in (1, 10, 100):
                 _log(f"[warn] wandb queue full, dropping metrics (dropped={wandb_drop_count}).")
 
+    eval_options = dict(eval_cfg or {})
+    eval_enabled = bool(eval_options.get("enabled", False))
+    eval_every_steps = None
+    eval_num_reads = None
+    eval_min_read_length = 12288
+    eval_split = "valid"
+    eval_microbatch = 128
+    validation_script = Path(__file__).resolve().parents[2] / "valid" / "run_validation.sh"
+    eval_root_dir = Path(ckpt_dir).resolve() / "eval" if ckpt_dir is not None else None
+    periodic_ckpt_dir = Path(ckpt_dir).resolve() / "periodic" if ckpt_dir is not None else None
+    best_ckpt_dir = Path(ckpt_dir).resolve() / "best_checkpoint" if ckpt_dir is not None else None
+    eval_history_path = eval_root_dir / "history.jsonl" if eval_root_dir is not None else None
+    if eval_enabled:
+        if config_path is None:
+            raise ValueError("Evaluation requires config_path so validation scripts can reuse the training config.")
+        try:
+            eval_every_steps = int(eval_options.get("every_steps", 0))
+            eval_num_reads = int(eval_options.get("reads", 0))
+            eval_min_read_length = int(eval_options.get("min_read_length", 12288))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("train.eval.every_steps, train.eval.reads, and train.eval.min_read_length must be integers.") from exc
+        if eval_every_steps <= 0 or eval_num_reads <= 0 or eval_min_read_length <= 0:
+            raise ValueError(
+                "train.eval.every_steps, train.eval.reads, and train.eval.min_read_length must be positive when evaluation is enabled."
+            )
+        eval_split = str(eval_options.get("data_split", "valid")).strip().lower() or "valid"
+        eval_microbatch = max(1, int(eval_options.get("microbatch", 128)))
+        if periodic_ckpt_dir is None or best_ckpt_dir is None or eval_root_dir is None or eval_history_path is None:
+            raise ValueError("Evaluation requires ckpt_dir to be configured.")
+        if not validation_script.exists():
+            raise FileNotFoundError(f"Validation script not found: {validation_script}")
+        periodic_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        best_ckpt_dir.mkdir(parents=True, exist_ok=True)
+        eval_root_dir.mkdir(parents=True, exist_ok=True)
+        _log(
+            f"[setup] periodic evaluation enabled (every_steps={eval_every_steps}, "
+            f"reads={eval_num_reads}, min_read_length={eval_min_read_length}, "
+            f"split={eval_split}, microbatch={eval_microbatch})."
+        )
+        _log("[setup] checkpoint retention follows evaluation cadence; periodic checkpoints will all be preserved.")
+    elif periodic_ckpt_dir is not None and ckpt_dir is not None:
+        periodic_ckpt_dir.mkdir(parents=True, exist_ok=True)
+
     rng = jax.random.PRNGKey(seed)
-    rng, gen_init_rng, disc_init_rng, _ = jax.random.split(rng, 4)
+    rng, gen_init_rng, _ = jax.random.split(rng, 3)
     mcfg = dict(model_cfg or {})
+
+    removed_model_keys = [key for key in ("discriminator", "disc_dtype") if key in mcfg]
+    if removed_model_keys:
+        raise ValueError(
+            "GAN/discriminator modules have been removed; remove these config keys: "
+            f"{sorted(removed_model_keys)}"
+        )
 
     def _tuple_cfg(key, default):
         val = mcfg.get(key, default)
         return tuple(int(v) for v in val)
 
     latent_dim = int(mcfg.get("latent_dim", 128))
-    base_channels = int(mcfg.get("base_channels", 32))
-    compute_dtype = _resolve_dtype(mcfg.get("compute_dtype", "bf16"), fallback=jnp.float32)
+    enc_kernel_size = int(mcfg.get("enc_kernel_size", 7))
+    dec_out_kernel_size = int(mcfg.get("dec_out_kernel_size", 7))
+    cnn_compute_dtype = _resolve_dtype(
+        mcfg.get("cnn_compute_dtype", mcfg.get("compute_dtype", "fp32")),
+        fallback=jnp.float32,
+    )
+    transformer_compute_dtype = _resolve_dtype(
+        mcfg.get("transformer_compute_dtype", mcfg.get("compute_dtype", "bf16")),
+        fallback=jnp.float32,
+    )
     param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
-    disc_compute_dtype = _resolve_dtype(mcfg.get("disc_dtype", mcfg.get("compute_dtype", "bf16")), fallback=jnp.float32)
-    enc_channels = _tuple_cfg("enc_channels", (32, 32, 64, 64, 128))
-    enc_mult = tuple(max(1, int(round(ch / base_channels))) for ch in enc_channels)
-    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2, 2, 1))
-    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 2)))
-    dec_channels = _tuple_cfg("dec_channels", (128, 64, 64, 32, 32))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (1, 2, 2, 2))
-    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 2)))
+    enc_channels = _tuple_cfg("enc_channels", (32, 64, 128))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2))
+    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 3)))
+    dec_channels = _tuple_cfg("dec_channels", (128, 64, 32))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (2, 2))
+    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 3)))
     generator = SimVQAudioModel(
         in_channels=1,
-        base_channels=base_channels,
-        enc_channel_multipliers=enc_mult,
+        enc_channels=enc_channels,
         enc_num_res_blocks=enc_num_res_blocks,
         enc_down_strides=enc_down_strides,
         latent_dim=latent_dim,
         codebook_size=int(mcfg.get("codebook_size", 16384)),
-        dec_channel_schedule=dec_channels,
+        dec_channels=dec_channels,
         dec_num_res_blocks=dec_num_res_blocks,
         dec_up_strides=dec_up_strides,
-        enc_dtype=compute_dtype,
-        dec_dtype=compute_dtype,
+        enc_kernel_size=enc_kernel_size,
+        dec_out_kernel_size=dec_out_kernel_size,
+        enc_dtype=cnn_compute_dtype,
+        dec_dtype=cnn_compute_dtype,
+        transformer_dtype=transformer_compute_dtype,
         param_dtype=param_dtype,
         pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
         post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
@@ -283,19 +446,32 @@ def train_model_from_pod5(
         diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
         search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
     )
-    disc_cfg = dict(mcfg.get("discriminator", {}))
-    disc_channels = tuple(int(v) for v in disc_cfg.get("channels", (32, 64, 128, 256)))
-    disc_strides = tuple(int(v) for v in disc_cfg.get("strides", (2, 2, 2, 2)))
-    discriminator = PatchDiscriminator1D(
-        channels=disc_channels,
-        strides=disc_strides,
-        kernel_size=int(disc_cfg.get("kernel_size", 15)),
-        resblock_layers=int(disc_cfg.get("resblock_layers", 2)),
-        dtype=disc_compute_dtype,
-        param_dtype=param_dtype,
-    )
 
-    # Probe shape using a single-worker iterator so we don't leave background threads running.
+    dorado_state: DoradoPerceptualState | None = None
+    dorado_cfg = dict(dorado_perceptual_cfg or {})
+    if bool(dorado_cfg.get("enabled", False)):
+        model_path = dorado_cfg.get("model_path")
+        if not model_path:
+            raise ValueError("train.dorado_perceptual.enabled=true requires train.dorado_perceptual.model_path.")
+        layers = tuple(dorado_cfg.get("layers", ("conv1", "conv2", "conv3")))
+        layer_weights = dorado_cfg.get("layer_weights")
+        dorado_state = load_dorado_perceptual_state(
+            model_path=str(model_path),
+            layers=layers,
+            layer_weights=layer_weights,
+            loss_weight=float(dorado_cfg.get("loss_weight", 0.05)),
+            warmup_start=int(dorado_cfg.get("warmup_start", 0)),
+            warmup_steps=int(dorado_cfg.get("warmup_steps", 0)),
+        )
+        if not getattr(ds, "return_metadata", False):
+            ds = _clone_dataset_with_metadata(ds)
+        _log(
+            "[setup] Dorado perceptual loss enabled: "
+            f"layers={layers}, loss_weight={float(dorado_cfg.get('loss_weight', 0.05)):.4f}, "
+            f"warmup_start={int(dorado_cfg.get('warmup_start', 0))}, "
+            f"warmup_steps={int(dorado_cfg.get('warmup_steps', 0))}"
+        )
+
     probe_iter = ds.batches(
         batch_size=1,
         drop_last=True,
@@ -304,19 +480,16 @@ def train_model_from_pod5(
         max_chunk_queue=1,
     )
     try:
-        init_batch = next(probe_iter)
+        probe_batch = next(probe_iter)
     except StopIteration as exc:
         raise ValueError(
             "Nanopore dataset produced no chunks; check segment length and sample rate."
         ) from exc
     finally:
         del probe_iter
-    init_batch = np.asarray(init_batch)
-    if init_batch.ndim == 3 and init_batch.shape[1] == 1:
-        init_batch = init_batch[:, 0, :]
-    elif init_batch.ndim == 3 and init_batch.shape[-1] == 1:
-        init_batch = init_batch[..., 0]
-    _, L = init_batch.shape
+    init_signal_batch = _extract_signal_batch(probe_batch)
+    compile_batch_template = probe_batch if isinstance(probe_batch, dict) else init_signal_batch
+    _, L = init_signal_batch.shape
     B = int(batch_size) if batch_size and batch_size > 0 else 1
     ndev = max(1, int(jax.local_device_count()))
     scan_steps_int = max(1, int(scan_steps))
@@ -360,13 +533,6 @@ def train_model_from_pod5(
                 grad_clip=grad_clip,
                 group_lrs=generator_lr_multipliers,
             )
-            disc_state, _ = create_discriminator_state(
-                disc_init_rng,
-                discriminator,
-                (per_device_batch, L),
-                learning_rate=lr_value * float(disc_lr_mult),
-                grad_clip=grad_clip,
-            )
     else:
         gen_state, _ = create_generator_state(
             gen_init_rng,
@@ -375,13 +541,6 @@ def train_model_from_pod5(
             lr_value,
             grad_clip=grad_clip,
             group_lrs=generator_lr_multipliers,
-        )
-        disc_state, _ = create_discriminator_state(
-            disc_init_rng,
-            discriminator,
-            (per_device_batch, L),
-            learning_rate=lr_value * float(disc_lr_mult),
-            grad_clip=grad_clip,
         )
 
     base_vq_vars = gen_state.vq_vars
@@ -400,8 +559,6 @@ def train_model_from_pod5(
 
     if not isinstance(gen_state.params, FrozenDict):
         gen_state = gen_state.replace(params=freeze(gen_state.params))
-    if not isinstance(disc_state.params, FrozenDict):
-        disc_state = disc_state.replace(params=freeze(disc_state.params))
 
     def _is_replicated_state(state: Any) -> bool:
         step = getattr(state, "step", None)
@@ -410,14 +567,12 @@ def train_model_from_pod5(
         ndim = getattr(step, "ndim", 0)
         return bool(ndim and int(ndim) > 0)
 
-    def _ensure_replicated_states() -> None:
-        nonlocal gen_state, disc_state
+    def _ensure_replicated_state() -> None:
+        nonlocal gen_state
         if not data_parallel:
             return
         if not _is_replicated_state(gen_state):
             gen_state = flax_jax_utils.replicate(gen_state)
-        if not _is_replicated_state(disc_state):
-            disc_state = flax_jax_utils.replicate(disc_state)
 
     def _state_step_as_int(state: Any) -> int:
         step = getattr(state, "step", 0)
@@ -425,13 +580,36 @@ def train_model_from_pod5(
             step = step[0]
         return int(jax.device_get(step))
 
-    # Avoid leaving a unique full copy of optimizer/model state on GPU0 before replication.
     if data_parallel:
         gen_state = jax.device_get(gen_state)
-        disc_state = jax.device_get(disc_state)
 
-    _ensure_replicated_states()
+    _ensure_replicated_state()
     _maybe_log_gpu_memory(_log, "after_state_init")
+
+    best_eval_metric: float | None = None
+    best_eval_step: int | None = None
+    best_metric_path = best_ckpt_dir / "best_metric.json" if best_ckpt_dir is not None else None
+    if best_metric_path is not None and best_metric_path.exists():
+        try:
+            best_payload = _read_json_file(best_metric_path)
+            metric_value = best_payload.get("best_avg_qscore_diff")
+            legacy_metric_value = best_payload.get("best_avg_qscore_diff_abs")
+            if metric_value is not None:
+                best_eval_metric = float(metric_value)
+            elif legacy_metric_value is not None:
+                _log(
+                    f"[warn] legacy best checkpoint metadata found at {best_metric_path}; "
+                    "ignoring old abs-qscore criterion and recomputing best from future evaluations."
+                )
+            step_value = best_payload.get("best_step")
+            if step_value is not None and metric_value is not None:
+                best_eval_step = int(step_value)
+            _log(
+                f"[resume] loaded best validation metric={best_eval_metric} "
+                f"from step={best_eval_step} ({best_metric_path})"
+            )
+        except Exception as exc:
+            _log(f"[warn] failed to load best checkpoint metadata from {best_metric_path}: {exc}")
 
     def _make_data_iterator() -> tuple[Prefetcher, Iterator[np.ndarray]]:
         host_iter = Prefetcher(
@@ -447,17 +625,24 @@ def train_model_from_pod5(
             )
         )
         return host_iter, data_iter
+
     if loss_weights is None:
         loss_weights = {
             "time_l1": 1.0,
             "diff1_l1": 0.1,
             "diff2_l1": 0.05,
-            "stft_logmag_l1": 0.05,
-            "gan": 0.03,
-            "feature": 0.1,
+            "small_stft_logmag_l1": 0.1,
+            "medium_stft_logmag_l1": 0.1,
+            "large_stft_logmag_l1": 0.1,
         }
     else:
         loss_weights = dict(loss_weights)
+    for removed_loss_key in ("gan", "feature"):
+        if removed_loss_key in loss_weights:
+            raise ValueError(
+                "GAN losses have been removed; remove train.loss_weights."
+                f"{removed_loss_key} from the config."
+            )
     if "commit" in loss_weights:
         raise ValueError(
             "Pure DiVeQ training does not use commit loss; remove train.loss_weights.commit from the config."
@@ -466,11 +651,8 @@ def train_model_from_pod5(
         raise ValueError(
             "Pure DiVeQ training does not use an explicit diveq loss; remove train.loss_weights.diveq from the config."
         )
-    stft_cfg = dict(stft_loss_cfg or {})
-    stft_n_fft = max(1, int(stft_cfg.get("n_fft", 256)))
-    stft_win_length = max(1, int(stft_cfg.get("win_length", stft_n_fft)))
-    stft_win_length = min(stft_win_length, stft_n_fft)
-    stft_hop_length = max(1, int(stft_cfg.get("hop_length", max(1, stft_win_length // 4))))
+
+    stft_loss_scales = _normalize_stft_loss_scales(stft_loss_cfg)
 
     step_rng = jax.random.PRNGKey(seed ^ 0xC0D3C)
 
@@ -490,16 +672,8 @@ def train_model_from_pod5(
     if stats_every_steps_int is None:
         stats_every_steps_int = max(1, log_every_steps_int if log_every_steps_int > 0 else 100)
     checkpoint_every_steps_int = max(0, int(checkpoint_every_steps))
-    disc_start_step_int = max(0, int(disc_start_step))
-    disc_warmup_steps_int = max(0, int(disc_warmup_steps))
-
-    def _disc_mask_for_step(step_idx: int) -> float:
-        if step_idx < disc_start_step_int:
-            return 0.0
-        if disc_warmup_steps_int <= 0:
-            return 1.0
-        ramp = (step_idx - disc_start_step_int) / max(1, disc_warmup_steps_int)
-        return float(np.clip(ramp, 0.0, 1.0))
+    if eval_enabled and eval_every_steps is not None:
+        checkpoint_every_steps_int = eval_every_steps
 
     perf_accum = {
         "count": 0.0,
@@ -598,118 +772,156 @@ def train_model_from_pod5(
         if wandb_metrics:
             _log_wandb(wandb_metrics, step)
 
-    def _maybe_update_disc(state, grads, disc_mask):
-        return jax.lax.cond(
-            disc_mask > 0.0,
-            lambda s: s.apply_gradients(grads=grads),
-            lambda s: s,
-            state,
+    def _save_checkpoint_to_dir(base_dir: Path, step: int, *, keep: int, clear_existing: bool = False) -> str:
+        base_dir = base_dir.resolve()
+        if clear_existing and base_dir.exists():
+            for child in base_dir.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child)
+                else:
+                    child.unlink()
+        base_dir.mkdir(parents=True, exist_ok=True)
+        save_gen = flax_jax_utils.unreplicate(gen_state) if data_parallel else gen_state
+        ckpt_path = flax_ckpt.save_checkpoint(
+            str(base_dir),
+            target={"gen": save_gen},
+            step=step,
+            overwrite=False,
+            keep=keep,
         )
+        return str(ckpt_path)
+
+    def _append_eval_history(payload: dict[str, Any]) -> None:
+        if eval_history_path is None:
+            return
+        eval_history_path.parent.mkdir(parents=True, exist_ok=True)
+        with eval_history_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def _run_validation(checkpoint_path: str, step: int) -> dict[str, Any] | None:
+        if not eval_enabled or eval_root_dir is None or eval_every_steps is None or eval_num_reads is None:
+            return None
+        output_dir = eval_root_dir / f"step_{step}"
+        if output_dir.exists():
+            shutil.rmtree(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        env = os.environ.copy()
+        env["CONFIG_PATH"] = str(Path(config_path).resolve())  # type: ignore[arg-type]
+        env["CHECKPOINT_PATH"] = str(checkpoint_path)
+        env["OUTPUT_DIR"] = str(output_dir)
+        env["NUM_READS"] = str(eval_num_reads)
+        env["MIN_READ_LENGTH"] = str(eval_min_read_length)
+        env["MICROBATCH"] = str(eval_microbatch)
+        env["DATA_SPLIT"] = eval_split
+        proc = subprocess.run(
+            ["bash", str(validation_script)],
+            cwd=str(Path(__file__).resolve().parents[2]),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env=env,
+            check=False,
+        )
+        if proc.stdout:
+            for line in proc.stdout.splitlines():
+                _log(f"[eval step {step}] {line}")
+        if proc.returncode != 0:
+            _log(f"[warn] validation failed at step {step} with exit code {proc.returncode}")
+            return None
+        summary_path = output_dir / "metrics" / "summary.json"
+        if not summary_path.exists():
+            _log(f"[warn] validation summary missing at step {step}: {summary_path}")
+            return None
+        summary = _read_json_file(summary_path)
+        summary["step"] = step
+        summary["checkpoint_path"] = str(checkpoint_path)
+        summary["output_dir"] = str(output_dir)
+        return summary
+
+    def _eval_metric_from_summary(summary: dict[str, Any]) -> float | None:
+        metric = summary.get("mean_qscore_delta")
+        if metric is None:
+            qscore_summary = summary.get("qscore_delta_summary")
+            if isinstance(qscore_summary, dict):
+                metric = qscore_summary.get("mean")
+        return None if metric is None else float(metric)
 
     if data_parallel:
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
-        def _p_train_step(gen_state, disc_state, batch, apply_rngs, disc_mask):
-            g_grads, d_grads, logs, _ = compute_grads(
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
+        def _p_train_step(gen_state, batch, apply_rngs):
+            g_grads, logs, _ = compute_grads(
                 gen_state,
-                disc_state,
                 batch,
                 apply_rngs,
                 loss_weights,
-                disc_mask,
-                stft_n_fft=stft_n_fft,
-                stft_hop_length=stft_hop_length,
-                stft_win_length=stft_win_length,
+                stft_loss_scales=stft_loss_scales,
+                dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=False,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-            d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
             reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            return gen_state, disc_state, reduced_logs
+            return gen_state, reduced_logs
 
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
-        def _p_train_step_with_stats(gen_state, disc_state, batch, apply_rngs, disc_mask):
-            g_grads, d_grads, logs, _ = compute_grads(
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
+        def _p_train_step_with_stats(gen_state, batch, apply_rngs):
+            g_grads, logs, _ = compute_grads(
                 gen_state,
-                disc_state,
                 batch,
                 apply_rngs,
                 loss_weights,
-                disc_mask,
-                stft_n_fft=stft_n_fft,
-                stft_hop_length=stft_hop_length,
-                stft_win_length=stft_win_length,
+                stft_loss_scales=stft_loss_scales,
+                dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=True,
             )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-            d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
             reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            return gen_state, disc_state, reduced_logs
+            return gen_state, reduced_logs
 
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
-        def _p_train_step_scan(gen_state, disc_state, batches, apply_rngs, disc_masks):
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
+        def _p_train_step_scan(gen_state, batches, apply_rngs):
             def _scan_body(carry, xs):
-                gen_state_i, disc_state_i = carry
-                batch_i, rng_i, disc_mask_i = xs
-                g_grads, d_grads, logs, _ = compute_grads(
+                gen_state_i = carry
+                batch_i, rng_i = xs
+                g_grads, logs, _ = compute_grads(
                     gen_state_i,
-                    disc_state_i,
                     batch_i,
                     rng_i,
                     loss_weights,
-                    disc_mask_i,
-                    stft_n_fft=stft_n_fft,
-                    stft_hop_length=stft_hop_length,
-                    stft_win_length=stft_win_length,
+                    stft_loss_scales=stft_loss_scales,
+                    dorado_perceptual_state=dorado_state,
                     collect_codebook_stats=False,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-                d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
                 reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-                disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
                 gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return (gen_state_i, disc_state_i), reduced_logs
+                return gen_state_i, reduced_logs
 
-            (gen_state, disc_state), logs_seq = jax.lax.scan(
-                _scan_body,
-                (gen_state, disc_state),
-                (batches, apply_rngs, disc_masks),
-            )
-            return gen_state, disc_state, logs_seq
+            gen_state, logs_seq = jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
+            return gen_state, logs_seq
 
-        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0, 0, None), out_axes=(0, 0, 0))
-        def _p_train_step_scan_with_stats(gen_state, disc_state, batches, apply_rngs, disc_masks):
+        @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=(0, 0))
+        def _p_train_step_scan_with_stats(gen_state, batches, apply_rngs):
             def _scan_body(carry, xs):
-                gen_state_i, disc_state_i = carry
-                batch_i, rng_i, disc_mask_i = xs
-                g_grads, d_grads, logs, _ = compute_grads(
+                gen_state_i = carry
+                batch_i, rng_i = xs
+                g_grads, logs, _ = compute_grads(
                     gen_state_i,
-                    disc_state_i,
                     batch_i,
                     rng_i,
                     loss_weights,
-                    disc_mask_i,
-                    stft_n_fft=stft_n_fft,
-                    stft_hop_length=stft_hop_length,
-                    stft_win_length=stft_win_length,
+                    stft_loss_scales=stft_loss_scales,
+                    dorado_perceptual_state=dorado_state,
                     collect_codebook_stats=True,
                 )
                 g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
-                d_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), d_grads)
                 reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-                disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
                 gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return (gen_state_i, disc_state_i), reduced_logs
+                return gen_state_i, reduced_logs
 
-            (gen_state, disc_state), logs_seq = jax.lax.scan(
-                _scan_body,
-                (gen_state, disc_state),
-                (batches, apply_rngs, disc_masks),
-            )
-            return gen_state, disc_state, logs_seq
+            gen_state, logs_seq = jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
+            return gen_state, logs_seq
 
         _jit_train_step = None
         _jit_train_step_with_stats = None
@@ -722,190 +934,122 @@ def train_model_from_pod5(
         _p_train_step_scan_with_stats = None
 
         @jax.jit
-        def _jit_train_step(gen_state, disc_state, batch, apply_rng, disc_mask):
-            g_grads, d_grads, logs, new_vq = compute_grads(
+        def _jit_train_step(gen_state, batch, apply_rng):
+            g_grads, logs, new_vq = compute_grads(
                 gen_state,
-                disc_state,
                 batch,
                 apply_rng,
                 loss_weights,
-                disc_mask,
-                stft_n_fft=stft_n_fft,
-                stft_hop_length=stft_hop_length,
-                stft_win_length=stft_win_length,
+                stft_loss_scales=stft_loss_scales,
+                dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=False,
             )
-            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.replace(vq_vars=new_vq)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            return gen_state, disc_state, logs
+            return gen_state, logs
 
         @jax.jit
-        def _jit_train_step_scan(gen_state, disc_state, batches, apply_rngs, disc_masks):
-            def _scan_body(carry, xs):
-                gen_state_i, disc_state_i = carry
-                batch_i, rng_i, disc_mask_i = xs
-                g_grads, d_grads, logs, new_vq = compute_grads(
-                    gen_state_i,
-                    disc_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    disc_mask_i,
-                    stft_n_fft=stft_n_fft,
-                    stft_hop_length=stft_hop_length,
-                    stft_win_length=stft_win_length,
-                    collect_codebook_stats=False,
-                )
-                disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
-                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return (gen_state_i, disc_state_i), logs
-
-            (gen_state, disc_state), logs_seq = jax.lax.scan(
-                _scan_body,
-                (gen_state, disc_state),
-                (batches, apply_rngs, disc_masks),
-            )
-            return gen_state, disc_state, logs_seq
-
-        @jax.jit
-        def _jit_train_step_scan_with_stats(gen_state, disc_state, batches, apply_rngs, disc_masks):
-            def _scan_body(carry, xs):
-                gen_state_i, disc_state_i = carry
-                batch_i, rng_i, disc_mask_i = xs
-                g_grads, d_grads, logs, new_vq = compute_grads(
-                    gen_state_i,
-                    disc_state_i,
-                    batch_i,
-                    rng_i,
-                    loss_weights,
-                    disc_mask_i,
-                    stft_n_fft=stft_n_fft,
-                    stft_hop_length=stft_hop_length,
-                    stft_win_length=stft_win_length,
-                    collect_codebook_stats=True,
-                )
-                disc_state_i = _maybe_update_disc(disc_state_i, d_grads, disc_mask_i)
-                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
-                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
-                return (gen_state_i, disc_state_i), logs
-
-            (gen_state, disc_state), logs_seq = jax.lax.scan(
-                _scan_body,
-                (gen_state, disc_state),
-                (batches, apply_rngs, disc_masks),
-            )
-            return gen_state, disc_state, logs_seq
-
-        @jax.jit
-        def _jit_train_step_with_stats(gen_state, disc_state, batch, apply_rng, disc_mask):
-            g_grads, d_grads, logs, new_vq = compute_grads(
+        def _jit_train_step_with_stats(gen_state, batch, apply_rng):
+            g_grads, logs, new_vq = compute_grads(
                 gen_state,
-                disc_state,
                 batch,
                 apply_rng,
                 loss_weights,
-                disc_mask,
-                stft_n_fft=stft_n_fft,
-                stft_hop_length=stft_hop_length,
-                stft_win_length=stft_win_length,
+                stft_loss_scales=stft_loss_scales,
+                dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=True,
             )
-            disc_state = _maybe_update_disc(disc_state, d_grads, disc_mask)
             gen_state = gen_state.replace(vq_vars=new_vq)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            return gen_state, disc_state, logs
+            return gen_state, logs
 
-    # Optional resume
+        @jax.jit
+        def _jit_train_step_scan(gen_state, batches, apply_rngs):
+            def _scan_body(carry, xs):
+                gen_state_i = carry
+                batch_i, rng_i = xs
+                g_grads, logs, new_vq = compute_grads(
+                    gen_state_i,
+                    batch_i,
+                    rng_i,
+                    loss_weights,
+                    stft_loss_scales=stft_loss_scales,
+                    dorado_perceptual_state=dorado_state,
+                    collect_codebook_stats=False,
+                )
+                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
+                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
+                return gen_state_i, logs
+
+            return jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
+
+        @jax.jit
+        def _jit_train_step_scan_with_stats(gen_state, batches, apply_rngs):
+            def _scan_body(carry, xs):
+                gen_state_i = carry
+                batch_i, rng_i = xs
+                g_grads, logs, new_vq = compute_grads(
+                    gen_state_i,
+                    batch_i,
+                    rng_i,
+                    loss_weights,
+                    stft_loss_scales=stft_loss_scales,
+                    dorado_perceptual_state=dorado_state,
+                    collect_codebook_stats=True,
+                )
+                gen_state_i = gen_state_i.replace(vq_vars=new_vq)
+                gen_state_i = gen_state_i.apply_gradients(grads=g_grads, vq_vars=gen_state_i.vq_vars)
+                return gen_state_i, logs
+
+            return jax.lax.scan(_scan_body, gen_state, (batches, apply_rngs))
+
     if resume_from is not None and os.path.exists(resume_from):
         try:
             ckpt = flax_ckpt.restore_checkpoint(ckpt_dir=resume_from, target=None)
-            if isinstance(ckpt, dict) and "gen" in ckpt and "disc" in ckpt:
-                gen_state = _with_vq_default(ckpt["gen"])
-                disc_state = ckpt["disc"]
-                _ensure_replicated_states()
+            restored_state = ckpt.get("gen") if isinstance(ckpt, dict) and "gen" in ckpt else ckpt
+            if restored_state is not None:
+                gen_state = _with_vq_default(restored_state)
+                _ensure_replicated_state()
                 _log(f"[resume] Restored from {resume_from}")
                 _maybe_log_gpu_memory(_log, "after_resume")
         except Exception:
             pass
 
-    # Optional compile warmup on dummy batch to avoid long stalls on first real step.
     if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
         _log("[warmup] Compiling training step variants on dummy batch; this may take a couple of minutes on first run.")
         warm_rng, step_rng = jax.random.split(step_rng)
-        disc_mask_warm = jnp.asarray(_disc_mask_for_step(0), dtype=jnp.float32)
         warmup_compile_stats = stats_every_steps_int <= 256
         if data_parallel:
             warm_rngs = jax.random.split(warm_rng, ndev)
-            dummy_batch = np.zeros((ndev, per_device_batch, L), dtype=np.float32)
-            _p_train_step(gen_state, disc_state, dummy_batch, warm_rngs, disc_mask_warm)
+            dummy_batch = _dummy_batch_from_template(compile_batch_template, ndev, per_device_batch)
+            _p_train_step(gen_state, dummy_batch, warm_rngs)
             if warmup_compile_stats:
-                _p_train_step_with_stats(gen_state, disc_state, dummy_batch, warm_rngs, disc_mask_warm)
+                _p_train_step_with_stats(gen_state, dummy_batch, warm_rngs)
             if scan_steps_int > 1:
                 warm_scan_rng = jax.random.split(warm_rng, ndev * scan_steps_int).reshape(ndev, scan_steps_int, 2)
-                warm_scan_batch = np.zeros((ndev, scan_steps_int, per_device_batch, L), dtype=np.float32)
-                warm_scan_masks = np.asarray(
-                    [_disc_mask_for_step(i) for i in range(scan_steps_int)],
-                    dtype=np.float32,
+                warm_scan_batch = _dummy_batch_from_template(
+                    compile_batch_template,
+                    ndev,
+                    scan_steps_int,
+                    per_device_batch,
                 )
-                _p_train_step_scan(
-                    gen_state,
-                    disc_state,
-                    warm_scan_batch,
-                    warm_scan_rng,
-                    warm_scan_masks,
-                )
+                _p_train_step_scan(gen_state, warm_scan_batch, warm_scan_rng)
                 if warmup_compile_stats:
-                    _p_train_step_scan_with_stats(
-                        gen_state,
-                        disc_state,
-                        warm_scan_batch,
-                        warm_scan_rng,
-                        warm_scan_masks,
-                    )
-                del warm_scan_batch, warm_scan_rng, warm_scan_masks
+                    _p_train_step_scan_with_stats(gen_state, warm_scan_batch, warm_scan_rng)
+                del warm_scan_batch, warm_scan_rng
             del warm_rngs
         else:
-            dummy_batch = np.zeros((B, L), dtype=np.float32)
-            _jit_train_step(
-                gen_state,
-                disc_state,
-                dummy_batch,
-                warm_rng,
-                disc_mask_warm,
-            )
+            dummy_batch = _dummy_batch_from_template(compile_batch_template, B)
+            _jit_train_step(gen_state, dummy_batch, warm_rng)
             if warmup_compile_stats:
-                _jit_train_step_with_stats(
-                    gen_state,
-                    disc_state,
-                    dummy_batch,
-                    warm_rng,
-                    disc_mask_warm,
-                )
+                _jit_train_step_with_stats(gen_state, dummy_batch, warm_rng)
             if scan_steps_int > 1:
                 warm_scan_rng = jax.random.split(warm_rng, scan_steps_int)
-                warm_scan_batch = np.zeros((scan_steps_int, B, L), dtype=np.float32)
-                warm_scan_masks = np.asarray(
-                    [_disc_mask_for_step(i) for i in range(scan_steps_int)],
-                    dtype=np.float32,
-                )
-                _jit_train_step_scan(
-                    gen_state,
-                    disc_state,
-                    warm_scan_batch,
-                    warm_scan_rng,
-                    warm_scan_masks,
-                )
+                warm_scan_batch = _dummy_batch_from_template(compile_batch_template, scan_steps_int, B)
+                _jit_train_step_scan(gen_state, warm_scan_batch, warm_scan_rng)
                 if warmup_compile_stats:
-                    _jit_train_step_scan_with_stats(
-                        gen_state,
-                        disc_state,
-                        warm_scan_batch,
-                        warm_scan_rng,
-                        warm_scan_masks,
-                    )
-                del warm_scan_batch, warm_scan_rng, warm_scan_masks
+                    _jit_train_step_scan_with_stats(gen_state, warm_scan_batch, warm_scan_rng)
+                del warm_scan_batch, warm_scan_rng
         del dummy_batch
         gc.collect()
         _log("[warmup] Compile finished; starting real data iterator.")
@@ -914,11 +1058,6 @@ def train_model_from_pod5(
         _maybe_log_gpu_memory(_log, "after_warmup_compile")
 
     global_step = _state_step_as_int(gen_state)
-    next_checkpoint_step = (
-        ((global_step // checkpoint_every_steps_int) + 1) * checkpoint_every_steps_int
-        if checkpoint_every_steps_int > 0
-        else None
-    )
     mem_probe_steps = {10, 50, 200}
     mem_probe_done: set[int] = set()
 
@@ -949,34 +1088,20 @@ def train_model_from_pod5(
     def _consume_single_batch(
         batch,
         *,
-        global_step_idx: int,
         collect_codebook_stats: bool,
     ) -> tuple[Dict[str, Any], float]:
-        nonlocal step_rng, gen_state, disc_state
+        nonlocal step_rng, gen_state
         step_rng, apply_rng = jax.random.split(step_rng)
-        disc_mask = _disc_mask_for_step(global_step_idx)
         if data_parallel:
             apply_rngs = jax.random.split(apply_rng, ndev)
             train_step_fn = _p_train_step_with_stats if collect_codebook_stats else _p_train_step
-            gen_state, disc_state, logs = train_step_fn(
-                gen_state,
-                disc_state,
-                batch,
-                apply_rngs,
-                disc_mask,
-            )
+            gen_state, logs = train_step_fn(gen_state, batch, apply_rngs)
             sync_start = time.perf_counter()
             logs = jax.tree_util.tree_map(lambda x: x[0], logs)
             logs = dict(logs)
         else:
             train_step_fn = _jit_train_step_with_stats if collect_codebook_stats else _jit_train_step
-            gen_state, disc_state, logs = train_step_fn(
-                gen_state,
-                disc_state,
-                batch,
-                apply_rng,
-                disc_mask,
-            )
+            gen_state, logs = train_step_fn(gen_state, batch, apply_rng)
             sync_start = time.perf_counter()
             logs = dict(logs)
         host_sync_ms = (time.perf_counter() - sync_start) * 1000.0
@@ -987,10 +1112,9 @@ def train_model_from_pod5(
     def _consume_scan_batches(
         batches: list[Any],
         *,
-        global_step_idx: int,
         collect_codebook_stats_flags: list[bool],
     ) -> tuple[list[Dict[str, Any]], float]:
-        nonlocal step_rng, gen_state, disc_state
+        nonlocal step_rng, gen_state
         num_steps = len(batches)
         if num_steps <= 0:
             return [], 0.0
@@ -998,21 +1122,11 @@ def train_model_from_pod5(
             raise ValueError(f"scan chunk expects {scan_steps_int} steps but got {num_steps}.")
         step_rng, apply_rng = jax.random.split(step_rng)
         collect_any_stats = any(collect_codebook_stats_flags)
-        disc_masks = np.asarray(
-            [_disc_mask_for_step(global_step_idx + i) for i in range(num_steps)],
-            dtype=np.float32,
-        )
         if data_parallel:
             stacked_batches = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=1), *batches)
             apply_rngs = jax.random.split(apply_rng, ndev * num_steps).reshape(ndev, num_steps, 2)
             train_step_fn = _p_train_step_scan_with_stats if collect_any_stats else _p_train_step_scan
-            gen_state, disc_state, logs_seq = train_step_fn(
-                gen_state,
-                disc_state,
-                stacked_batches,
-                apply_rngs,
-                disc_masks,
-            )
+            gen_state, logs_seq = train_step_fn(gen_state, stacked_batches, apply_rngs)
             sync_start = time.perf_counter()
             logs_seq = jax.tree_util.tree_map(lambda x: x[0], logs_seq)
             logs_seq = dict(logs_seq)
@@ -1020,13 +1134,7 @@ def train_model_from_pod5(
             stacked_batches = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *batches)
             apply_rngs = jax.random.split(apply_rng, num_steps)
             train_step_fn = _jit_train_step_scan_with_stats if collect_any_stats else _jit_train_step_scan
-            gen_state, disc_state, logs_seq = train_step_fn(
-                gen_state,
-                disc_state,
-                stacked_batches,
-                apply_rngs,
-                disc_masks,
-            )
+            gen_state, logs_seq = train_step_fn(gen_state, stacked_batches, apply_rngs)
             sync_start = time.perf_counter()
             logs_seq = dict(logs_seq)
         host_sync_ms = (time.perf_counter() - sync_start) * 1000.0
@@ -1077,7 +1185,6 @@ def train_model_from_pod5(
                         step_start = time.perf_counter()
                         logs_seq, host_sync_ms_total = _consume_scan_batches(
                             batches,
-                            global_step_idx=global_step,
                             collect_codebook_stats_flags=collect_flags,
                         )
                         step_elapsed_ms_total = (time.perf_counter() - step_start) * 1000.0
@@ -1094,7 +1201,6 @@ def train_model_from_pod5(
                             step_start = time.perf_counter()
                             logs_i, host_sync_ms = _consume_single_batch(
                                 batch,
-                                global_step_idx=global_step + local_idx,
                                 collect_codebook_stats=collect_flags[local_idx],
                             )
                             step_elapsed_ms = (time.perf_counter() - step_start) * 1000.0
@@ -1120,21 +1226,95 @@ def train_model_from_pod5(
                             averaged_logs = _drain_log_window(logs)
                             _log_step(global_step, averaged_logs, perf=perf)
 
-                        if (
-                            ckpt_dir
-                            and next_checkpoint_step is not None
-                            and global_step >= next_checkpoint_step
-                        ):
-                            save_gen = flax_jax_utils.unreplicate(gen_state) if data_parallel else gen_state
-                            save_disc = flax_jax_utils.unreplicate(disc_state) if data_parallel else disc_state
-                            flax_ckpt.save_checkpoint(
-                                ckpt_dir,
-                                target={"gen": save_gen, "disc": save_disc},
-                                step=global_step,
-                                overwrite=True,
+                        should_run_eval = (
+                            eval_enabled
+                            and eval_every_steps is not None
+                            and global_step % eval_every_steps == 0
+                        )
+                        should_save_periodic = (
+                            periodic_ckpt_dir is not None
+                            and checkpoint_every_steps_int > 0
+                            and global_step % checkpoint_every_steps_int == 0
+                        )
+                        periodic_ckpt_path: str | None = None
+                        if should_save_periodic:
+                            periodic_ckpt_path = _save_checkpoint_to_dir(
+                                periodic_ckpt_dir,
+                                global_step,
+                                keep=1_000_000,
                             )
-                            _log(f"[ckpt] step={global_step} written to {ckpt_dir}")
-                            next_checkpoint_step += checkpoint_every_steps_int
+                            _log(f"[ckpt] step={global_step} written to {periodic_ckpt_path}")
+
+                        if should_run_eval:
+                            if periodic_ckpt_path is None and periodic_ckpt_dir is not None:
+                                periodic_ckpt_path = _save_checkpoint_to_dir(
+                                    periodic_ckpt_dir,
+                                    global_step,
+                                    keep=1_000_000,
+                                )
+                                _log(f"[ckpt] step={global_step} written to {periodic_ckpt_path}")
+                            eval_summary = (
+                                _run_validation(periodic_ckpt_path, global_step)
+                                if periodic_ckpt_path is not None
+                                else None
+                            )
+                            if eval_summary is None:
+                                _append_eval_history(
+                                    {
+                                        "step": global_step,
+                                        "status": "failed",
+                                        "checkpoint_path": periodic_ckpt_path,
+                                    }
+                                )
+                            else:
+                                eval_metric = _eval_metric_from_summary(eval_summary)
+                                eval_metrics = _flatten_eval_metrics(eval_summary)
+                                if eval_metric is not None:
+                                    eval_metrics["valid/avg_qscore_diff"] = eval_metric
+                                if eval_metric is not None and (
+                                    best_eval_metric is None or eval_metric > best_eval_metric
+                                ):
+                                    best_eval_metric = eval_metric
+                                    best_eval_step = global_step
+                                    if best_ckpt_dir is not None:
+                                        best_ckpt_path = _save_checkpoint_to_dir(
+                                            best_ckpt_dir,
+                                            global_step,
+                                            keep=1,
+                                            clear_existing=True,
+                                        )
+                                        _log(
+                                            f"[best_ckpt] updated at step={global_step} "
+                                            f"avg_qscore_diff={eval_metric:.6f} path={best_ckpt_path}"
+                                        )
+                                        if best_metric_path is not None:
+                                            with best_metric_path.open("w", encoding="utf-8") as handle:
+                                                json.dump(
+                                                    {
+                                                        "best_step": global_step,
+                                                        "best_avg_qscore_diff": eval_metric,
+                                                        "best_checkpoint_path": best_ckpt_path,
+                                                    },
+                                                    handle,
+                                                    indent=2,
+                                                    ensure_ascii=False,
+                                                )
+                                        eval_summary["best_checkpoint_path"] = best_ckpt_path
+                                if eval_metric is not None:
+                                    eval_summary["avg_qscore_diff"] = eval_metric
+                                eval_summary["best_step"] = best_eval_step
+                                eval_summary["best_avg_qscore_diff"] = best_eval_metric
+                                _append_eval_history(eval_summary)
+                                shared_reads = eval_summary.get("shared_read_count")
+                                identity = eval_summary.get("length_weighted_identity")
+                                mean_q_delta = eval_summary.get("mean_qscore_delta")
+                                _log(
+                                    f"[eval] step={global_step}, shared_reads={shared_reads}, "
+                                    f"length_weighted_identity={identity}, mean_qscore_delta={mean_q_delta}, "
+                                    f"avg_qscore_diff={eval_metric}"
+                                )
+                                if eval_metrics:
+                                    _log_wandb(eval_metrics, global_step)
             finally:
                 host_iter.close()
             if steps_this_epoch == 0:
@@ -1148,8 +1328,7 @@ def train_model_from_pod5(
             )
         if data_parallel:
             gen_state = flax_jax_utils.unreplicate(gen_state)
-            disc_state = flax_jax_utils.unreplicate(disc_state)
-        return gen_state, disc_state
+        return gen_state
     finally:
         if wandb_queue is not None:
             try:

@@ -1,64 +1,92 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 2,
-    "batch_size": 512,
-    "reference_device_count": 8,
-    "per_device_batch_size": 64,
+    "epochs": 3,
+    "batch_size": 2048,
+    "reference_device_count": 4,
+    "per_device_batch_size": 512,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 2e-5,
+    "learning_rate": 1e-4,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
     "device_prefetch_per_device": 2,
     "grad_clip": 1.0,
-    "disc_start_step": 10000,
-    "disc_warmup_steps": 10000,
     "log_every_steps": 500,
     "codebook_stats_every_steps": 2000,
     "scan_steps": 16,
+    "eval": {
+      "enabled": true,
+      "every_steps": 10000,
+      "reads": 64,
+      "min_read_length": 12288,
+      "data_split": "valid",
+      "microbatch": 128
+    },
     "loss_weights": {
       "time_l1": 1.0,
       "diff1_l1": 0.5,
-      "diff2_l1": 0.2,
-      "stft_logmag_l1": 0.1,
-      "gan": 0.05,
-      "feature": 0.03
+      "diff2_l1": 0.3,
+      "small_stft_logmag_l1": 0.1,
+      "medium_stft_logmag_l1": 0.1,
+      "large_stft_logmag_l1": 0.1
     },
     "stft_loss": {
-      "n_fft": 64,
-      "win_length": 64,
-      "hop_length": 16
+      "scales": [
+        {
+          "n_fft": 32,
+          "win_length": 32,
+          "hop_length": 8
+        },
+        {
+          "n_fft": 64,
+          "win_length": 64,
+          "hop_length": 16
+        },
+        {
+          "n_fft": 128,
+          "win_length": 128,
+          "hop_length": 32
+        }
+      ]
+    },
+    "dorado_perceptual": {
+      "enabled": true,
+      "model_path": "~/Download/dorado/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0",
+      "layers": ["conv1", "conv2", "conv3"],
+      "layer_weights": {
+        "conv1": 0.2,
+        "conv2": 0.3,
+        "conv3": 0.5
+      },
+      "loss_weight": 0.05,
+      "warmup_start": 10000,
+      "warmup_steps": 10000
     }
   },
   "model": {
-    "base_channels": 32,
-    "enc_channels": [64, 64, 128, 128, 256],
-    "enc_down_strides": [2, 2, 2, 1],
-    "enc_num_res_blocks": 2,
-    "latent_dim": 256,
+    "enc_channels": [32, 64, 128],
+    "enc_down_strides": [2, 2],
+    "enc_num_res_blocks": 3,
+    "enc_kernel_size": 7,
+    "latent_dim": 128,
     "codebook_size": 65536,
-    "dec_channels": [256, 128, 128, 64, 64],
-    "dec_up_strides": [1, 2, 2, 2],
-    "dec_num_res_blocks": 2,
-    "discriminator": {
-      "channels": [32, 64, 128, 256],
-      "strides": [2, 2, 2, 2],
-      "kernel_size": 15,
-      "resblock_layers": 2
-    },
+    "dec_channels": [128, 64, 32],
+    "dec_up_strides": [2, 2],
+    "dec_num_res_blocks": 3,
+    "dec_out_kernel_size": 7,
     "pre_quant_transformer_layers": 2,
     "post_quant_transformer_layers": 2,
-    "transformer_heads": 8,
-    "transformer_mlp_ratio": 2.0,
+    "transformer_heads": 4,
+    "transformer_mlp_ratio": 4.0,
     "transformer_dropout": 0.1,
     "transformer_ffn_activation": "swiglu",
     "transformer_attention_backend": "jax_cudnn",
-    "transformer_use_rope": false,
+    "transformer_use_rope": true,
     "transformer_rope_base": 10000.0,
-    "compute_dtype": "bf16",
-    "disc_dtype": "bf16",
+    "cnn_compute_dtype": "fp32",
+    "transformer_compute_dtype": "bf16",
     "param_dtype": "fp32",
     "diveq_sigma2": 0.001,
     "search_chunk_size": 2048
@@ -70,7 +98,7 @@
     "segment_samples": 2048,
     "sample_rate": 5000,
     "reference_device_count": 8,
-    "subdirs": ["FC01/pod5", "FC02/pod5", "FC03/pod5"],
+    "subdirs": ["FC01/pod5"],
     "loader_workers": 32,
     "loader_workers_per_device": 4,
     "loader_prefetch_chunks": 4096,
@@ -78,20 +106,24 @@
     "auto_scale_loader_by_device_count": true,
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-      "subdirs": ["FC01/pod5", "FC02/pod5", "FC03/pod5"],
+      "subdirs": ["FC01/pod5"],
+      "segment_samples": 2048
+    },
+    "valid": {
+      "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
+      "subdirs": ["FC02/pod5"],
       "segment_samples": 2048
     }
   },
   "checkpoint": {
-    "dir": "checkpoints",
-    "resume_from": null,
-    "every_steps": 5000
+    "root_dir": "checkpoints",
+    "resume_from": null
   },
   "logging": {
     "wandb": {
       "enabled": true,
       "project": "simvq-local",
-      "run_name": "v4.0",
+      "run_name": "V4.2",
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },
@@ -104,8 +136,7 @@
       "pre_quant_tf": 0.8,
       "post_quant_tf": 1.0,
       "quantizer_W": 0.7,
-      "quantizer_proj_bias": 0.7,
-      "discriminator": 1.0
+      "quantizer_proj_bias": 0.7
     }
   }
 }

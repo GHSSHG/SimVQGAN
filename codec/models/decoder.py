@@ -5,129 +5,140 @@ from typing import Any, Sequence
 import jax.numpy as jnp
 from flax import linen as nn
 
-from ..jaxlayers import Conv1d
-from .encoder import GroupNorm1D, SimVQResBlock1D, _swish
+from ..jaxlayers import Conv1d, ConvTranspose1d
+from .encoder import GroupNorm1D, SEANetResnetBlock1D, _elu, _resolve_residual_dilations
 
 
-class PixelShuffleUpsample1D(nn.Module):
+class SEANetUpsample1D(nn.Module):
     out_ch: int
     factor: int
+    use_norm: bool = True
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     def setup(self) -> None:
         if self.factor < 1:
             raise ValueError("Upsample factor must be >= 1")
-        self.conv = Conv1d(
-            self.out_ch * self.factor,
-            kernel=3,
-            padding="SAME",
-            use_bias=False,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="conv",
-        )
+        factor = int(self.factor)
+        kernel = 3 if factor == 1 else max(4, factor * 2)
+        if factor == 1:
+            self.proj = Conv1d(
+                self.out_ch,
+                kernel=kernel,
+                padding="SAME",
+                use_bias=False,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                name="proj",
+            )
+        else:
+            self.proj = ConvTranspose1d(
+                self.out_ch,
+                kernel=kernel,
+                stride=factor,
+                padding="SAME",
+                use_bias=False,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                name="proj",
+            )
+        if self.use_norm:
+            self.norm = GroupNorm1D(
+                self.out_ch,
+                max_groups=1,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                name="norm",
+            )
+        else:
+            self.norm = None
 
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        if self.factor == 1:
-            return self.conv(x)
-        h = self.conv(x)
-        B, T, C = h.shape
-        if C % self.factor != 0:
-            raise ValueError(f"Channel dim {C} not divisible by upsample factor {self.factor}")
-        h = h.reshape(B, T, self.factor, self.out_ch)
-        h = h.reshape(B, T * self.factor, self.out_ch)
+        h = self.proj(x)
+        if self.norm is not None:
+            h = self.norm(h)
+        h = _elu(h)
         return h
 
 
 class DecoderStage1D(nn.Module):
     in_ch: int
     out_ch: int
-    n_blocks: int
     up_factor: int
+    num_res_blocks: int = 3
+    compress: int = 2
+    use_block_norm: bool = True
+    use_upsample_norm: bool = True
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     def setup(self) -> None:
-        blocks = []
-        ch = self.in_ch
-        for i in range(self.n_blocks):
-            block = SimVQResBlock1D(
-                in_ch=ch,
-                out_ch=self.in_ch,
-                use_conv_shortcut=(ch != self.in_ch),
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                name=f"block_{i}",
-            )
-            blocks.append(block)
-            ch = self.in_ch
-        self.blocks = tuple(blocks)
-        self.upsample = PixelShuffleUpsample1D(
+        self.upsample = SEANetUpsample1D(
             out_ch=self.out_ch,
             factor=self.up_factor,
+            use_norm=self.use_upsample_norm,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             name="upsample",
         )
+        self.blocks = tuple(
+            SEANetResnetBlock1D(
+                channels=self.out_ch,
+                dilation=dilation,
+                compress=self.compress,
+                use_norm=self.use_block_norm,
+                dtype=self.dtype,
+                param_dtype=self.param_dtype,
+                name=f"block_{i}",
+            )
+            for i, dilation in enumerate(_resolve_residual_dilations(self.num_res_blocks))
+        )
 
     def __call__(self, x: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
-        h = x
+        h = self.upsample(x)
         for block in self.blocks:
             h = block(h, train=train)
-        h = self.upsample(h)
         return h
 
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channel_schedule: Sequence[int] = (128, 64, 64, 32, 32)
-    num_res_blocks: int = 2
-    up_strides: Sequence[int] = (1, 2, 2, 2)
+    channels: Sequence[int] = (128, 64, 32)
+    num_res_blocks: int = 3
+    up_strides: Sequence[int] = (2, 2)
+    output_kernel_size: int = 7
+    block_compress: int = 2
+    use_block_norm: bool = True
+    use_upsample_norm: bool = True
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
     def setup(self) -> None:
-        if len(self.channel_schedule) != len(self.up_strides) + 1:
-            raise ValueError("channel_schedule must be one longer than up_strides")
-        self.conv_in = Conv1d(
-            self.channel_schedule[0],
-            kernel=3,
-            padding="SAME",
-            use_bias=True,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            name="conv_in",
-        )
-        self.mid_blocks = tuple(
-            SimVQResBlock1D(
-                in_ch=self.channel_schedule[0],
-                out_ch=self.channel_schedule[0],
-                use_conv_shortcut=False,
-                dtype=self.dtype,
-                param_dtype=self.param_dtype,
-                name=f"mid_{i}",
-            )
-            for i in range(self.num_res_blocks)
-        )
+        channels = tuple(int(ch) for ch in self.channels)
+        if len(channels) != len(self.up_strides) + 1:
+            raise ValueError("channels must be one longer than up_strides")
+        if int(self.num_res_blocks) <= 0:
+            raise ValueError("num_res_blocks must be positive")
         stages = []
         for idx, factor in enumerate(self.up_strides):
             stages.append(
                 DecoderStage1D(
-                    in_ch=self.channel_schedule[idx],
-                    out_ch=self.channel_schedule[idx + 1],
-                    n_blocks=self.num_res_blocks,
+                    in_ch=channels[idx],
+                    out_ch=channels[idx + 1],
                     up_factor=factor,
+                    num_res_blocks=self.num_res_blocks,
+                    compress=self.block_compress,
+                    use_block_norm=self.use_block_norm,
+                    use_upsample_norm=self.use_upsample_norm,
                     dtype=self.dtype,
                     param_dtype=self.param_dtype,
                     name=f"stage_{idx}",
                 )
             )
         self.stages = tuple(stages)
-        self.norm_out = GroupNorm1D(self.channel_schedule[-1], dtype=jnp.float32, param_dtype=self.param_dtype)
         self.conv_out = Conv1d(
             self.out_channels,
-            kernel=3,
+            kernel=self.output_kernel_size,
             padding="SAME",
             use_bias=True,
             dtype=jnp.float32,
@@ -136,14 +147,9 @@ class SimVQDecoder1D(nn.Module):
         )
 
     def __call__(self, z: jnp.ndarray, *, train: bool = False):
-        h = self.conv_in(z)
-        for block in self.mid_blocks:
-            h = block(h, train=train)
+        h = z
         for stage in self.stages:
             h = stage(h, train=train)
         h = h.astype(jnp.float32)
-        h = self.norm_out(h)
-        h = _swish(h)
         wave = self.conv_out(h)
-        wave = jnp.tanh(wave)
         return wave, {}

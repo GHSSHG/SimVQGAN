@@ -57,15 +57,6 @@ class GeneratorTrainState(train_state.TrainState):
         return new_state
 
 
-@struct.dataclass
-class DiscriminatorTrainState(train_state.TrainState):
-    def apply_gradients(self, *, grads, **kwargs):
-        grads = _force_frozen(grads)
-        new_state = super().apply_gradients(grads=grads, **kwargs)
-        _assert_frozen("DiscriminatorTrainState.apply_gradients", new_state.params)
-        return new_state
-
-
 def _scaled_lr(learning_rate: float | Callable[[int], float], scale: float):
     if callable(learning_rate):
         return lambda step: scale * learning_rate(step)
@@ -151,26 +142,3 @@ def create_generator_state(
         variables["params"] = params
     _assert_frozen("create_generator_state", state.params)
     return state, variables
-
-
-def create_discriminator_state(
-    rng: jax.random.KeyArray,
-    discriminator,
-    batch_shape: Tuple[int, int],
-    learning_rate: float | Callable[[int], float] = 3e-4,
-    grad_clip: float = 1.0,
-) -> Tuple[DiscriminatorTrainState, Dict[str, Any]]:
-    init_x = jnp.zeros((1, int(batch_shape[1])), dtype=jnp.float32)
-    variables = discriminator.init(rng, init_x, train=True)
-    params = _force_frozen(variables["params"])
-    tx = optax.chain(optax.clip_by_global_norm(grad_clip), optax.adamw(learning_rate))
-    state = DiscriminatorTrainState.create(apply_fn=discriminator.apply, params=params, tx=tx)
-    if isinstance(variables, FrozenDict):
-        variables = variables.copy({"params": params})
-    else:
-        variables["params"] = params
-    _assert_frozen("create_discriminator_state", state.params)
-    return state, variables
-
-
-# No codebook EMA in current training path.

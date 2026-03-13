@@ -10,6 +10,7 @@ def Conv1d(
     features: int,
     kernel: int,
     stride: int = 1,
+    dilation: int = 1,
     padding: str = "SAME",
     use_bias: bool = False,
     dtype: Any = jnp.float32,
@@ -17,6 +18,29 @@ def Conv1d(
     name: str | None = None,
 ) -> nn.Conv:
     return nn.Conv(
+        features=features,
+        kernel_size=(kernel,),
+        strides=(stride,),
+        kernel_dilation=(dilation,),
+        padding=padding,
+        use_bias=use_bias,
+        dtype=dtype,
+        param_dtype=param_dtype,
+        name=name,
+    )
+
+
+def ConvTranspose1d(
+    features: int,
+    kernel: int,
+    stride: int = 1,
+    padding: str = "SAME",
+    use_bias: bool = False,
+    dtype: Any = jnp.float32,
+    param_dtype: Any = jnp.float32,
+    name: str | None = None,
+) -> nn.ConvTranspose:
+    return nn.ConvTranspose(
         features=features,
         kernel_size=(kernel,),
         strides=(stride,),

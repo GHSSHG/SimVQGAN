@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import queue
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import numpy as np
 import jax
@@ -20,7 +20,7 @@ class Prefetcher:
 
     def __init__(
         self,
-        source_iter: Iterable[np.ndarray],
+        source_iter: Iterable[Any],
         prefetch_size: int = 8,
         squeeze_channel_dim: bool = True,
         dtype: np.dtype = np.float32,
@@ -34,17 +34,21 @@ class Prefetcher:
         )
         self._t.start()
 
-    def _worker(self, source_iter: Iterable[np.ndarray], squeeze_channel_dim: bool) -> None:
+    def _worker(self, source_iter: Iterable[Any], squeeze_channel_dim: bool) -> None:
         try:
             for batch in source_iter:
                 if self._stop.is_set():
                     break
-                arr = np.asarray(batch)
-                if squeeze_channel_dim and arr.ndim == 3 and arr.shape[1] == 1:
-                    arr = arr.squeeze(1)
-                if arr.dtype != self._dtype:
-                    arr = np.asarray(arr, dtype=self._dtype)
-                self._q.put(arr, block=True)
+                def _prepare_leaf(x):
+                    arr = np.asarray(x)
+                    if squeeze_channel_dim and arr.ndim == 3 and arr.shape[1] == 1:
+                        arr = arr.squeeze(1)
+                    if arr.dtype != self._dtype:
+                        arr = np.asarray(arr, dtype=self._dtype)
+                    return arr
+
+                prepared = jax.tree_util.tree_map(_prepare_leaf, batch)
+                self._q.put(prepared, block=True)
         except Exception as e:
             self._q.put(e)
         finally:

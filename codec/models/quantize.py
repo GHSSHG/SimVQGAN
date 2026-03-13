@@ -26,6 +26,11 @@ def _bincount(data: jnp.ndarray, *, length: int, dtype: Any) -> jnp.ndarray:
     return counts
 
 
+def _safe_l2_norm(x: jnp.ndarray, *, axis: int = -1, keepdims: bool = False, eps: jnp.ndarray) -> jnp.ndarray:
+    sq = jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims)
+    return jnp.sqrt(sq + jnp.square(eps))
+
+
 class SimVQ1D(nn.Module):
     """SimVQ quantizer adapted for 1D latents (B, T, C)."""
 
@@ -146,8 +151,7 @@ class SimVQ1D(nn.Module):
         z_reshaped = z_flat.reshape(B, T, self.code_dim)
         diff = quant - z_reshaped
         eps = jnp.asarray(1e-8, dtype=z_reshaped.dtype)
-        diff_norm = jnp.linalg.norm(diff, axis=-1, keepdims=True)
-        diff_norm_safe = jnp.maximum(diff_norm, eps)
+        diff_norm_safe = _safe_l2_norm(diff, axis=-1, keepdims=True, eps=eps)
         sigma2 = max(0.0, float(self.diveq_sigma2))
 
         if train:
@@ -157,8 +161,7 @@ class SimVQ1D(nn.Module):
                 diff_dir = noise + diff
             else:
                 diff_dir = diff
-            diff_dir_norm = jnp.linalg.norm(diff_dir, axis=-1, keepdims=True)
-            diff_dir_norm = jnp.maximum(diff_dir_norm, eps)
+            diff_dir_norm = _safe_l2_norm(diff_dir, axis=-1, keepdims=True, eps=eps)
             direction = jax.lax.stop_gradient(diff_dir / diff_dir_norm)
             z_q = z_reshaped + diff_norm_safe * direction
         else:

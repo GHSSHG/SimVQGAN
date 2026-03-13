@@ -113,6 +113,33 @@ def _resolve_data_path(path_value: str | os.PathLike[str] | None, cfg_dir: Path)
     return str(candidate)
 
 
+def _sanitize_checkpoint_subdir(name: str | None) -> str | None:
+    if name is None:
+        return None
+    cleaned = str(name).strip()
+    if not cleaned:
+        return None
+    for token in (os.sep, "/", "\\"):
+        cleaned = cleaned.replace(token, "_")
+    return cleaned
+
+
+def _resolve_checkpoint_dir(
+    *,
+    base_dir_value: str | os.PathLike[str] | None,
+    run_name: str | None,
+) -> str:
+    base_dir = Path(base_dir_value or "checkpoints").expanduser()
+    if not base_dir.is_absolute():
+        base_dir = (_ROOT / base_dir).resolve()
+    else:
+        base_dir = base_dir.resolve()
+    subdir = _sanitize_checkpoint_subdir(run_name)
+    if subdir and base_dir.name != subdir:
+        base_dir = base_dir / subdir
+    return str(base_dir)
+
+
 def _merge_split_cfg(base: Dict[str, Any], override: Dict[str, Any] | None) -> Dict[str, Any]:
     merged = dict(base)
     if override:
@@ -156,11 +183,13 @@ def _build_dataset(
     loader_prefetch = int(
         cfg.get("loader_prefetch_chunks", cfg.get("loader_prefetch") or 128)
     )
+    return_metadata = bool(cfg.get("return_metadata", False))
     return NanoporeSignalDataset.from_paths(
         files,
         window_ms=window_ms,
         window_samples=window_samples,
         sample_rate_hz_default=sample_rate,
+        return_metadata=return_metadata,
         loader_workers=loader_workers,
         loader_prefetch_chunks=loader_prefetch,
     )
@@ -318,6 +347,7 @@ def main() -> None:
         scan_steps = int(train_cfg.get("scan_steps", 1))
         if args.scan_steps is not None:
             scan_steps = max(1, int(args.scan_steps))
+        eval_cfg = dict(train_cfg.get("eval") or {})
         grad_clip = float(train_cfg.get("grad_clip", 1.0))
         host_prefetch_size = max(1, int(train_cfg.get("host_prefetch_size", 64)))
         device_prefetch_size = max(1, int(train_cfg.get("device_prefetch_size", 16)))
@@ -353,20 +383,25 @@ def main() -> None:
             "time_l1": float(lw.get("time_l1", lw.get("recon", 1.0))),
             "diff1_l1": float(lw.get("diff1_l1", 0.1)),
             "diff2_l1": float(lw.get("diff2_l1", 0.05)),
-            "stft_logmag_l1": float(lw.get("stft_logmag_l1", 0.05)),
-            "gan": float(lw.get("gan", 0.03)),
-            "feature": float(lw.get("feature", 0.1)),
+            "small_stft_logmag_l1": float(lw.get("small_stft_logmag_l1", lw.get("stft_logmag_l1", 0.1))),
+            "medium_stft_logmag_l1": float(lw.get("medium_stft_logmag_l1", lw.get("stft_logmag_l1", 0.1))),
+            "large_stft_logmag_l1": float(lw.get("large_stft_logmag_l1", lw.get("stft_logmag_l1", 0.1))),
         }
-        stft_cfg_raw = dict(train_cfg.get("stft_loss") or {})
-        stft_loss_cfg = {
-            "n_fft": int(stft_cfg_raw.get("n_fft", 256)),
-            "win_length": int(stft_cfg_raw.get("win_length", stft_cfg_raw.get("n_fft", 256))),
-            "hop_length": int(stft_cfg_raw.get("hop_length", 64)),
-        }
-
-        # adversarial scheduling (step-based)
-        disc_start_step = int(train_cfg.get("disc_start_step", 0))
-        disc_warmup_steps = int(train_cfg.get("disc_warmup_steps", 0))
+        removed_loss_keys = [key for key in ("gan", "feature") if key in lw]
+        if removed_loss_keys:
+            raise ValueError(
+                "GAN losses have been removed; delete these config keys from train.loss_weights: "
+                f"{sorted(removed_loss_keys)}"
+            )
+        stft_loss_cfg = dict(train_cfg.get("stft_loss") or {})
+        dorado_perceptual_cfg = dict(train_cfg.get("dorado_perceptual") or {})
+        if "model_path" in dorado_perceptual_cfg and dorado_perceptual_cfg["model_path"]:
+            dorado_model_path = Path(dorado_perceptual_cfg["model_path"]).expanduser()
+            if not dorado_model_path.is_absolute():
+                dorado_model_path = (cfg_dir / dorado_model_path).resolve()
+            else:
+                dorado_model_path = dorado_model_path.resolve()
+            dorado_perceptual_cfg["model_path"] = str(dorado_model_path)
         # Optimization group overrides (optional)
         optim_cfg = cfg.get("optim", {})
         if "codebook_lr_mult" in optim_cfg:
@@ -388,13 +423,19 @@ def main() -> None:
             raise ValueError(
                 "SimVQ codebook is not optimized via params; remove optim.lr_multipliers.codebook from the config."
             )
-        disc_lr_mult = float(lr_multipliers.get("discriminator", optim_cfg.get("disc_lr_mult", 0.1)))
-        generator_lr_multipliers = {
-            key: value
-            for key, value in lr_multipliers.items()
-            if key != "discriminator"
-        }
+        if "discriminator" in lr_multipliers or "disc_lr_mult" in optim_cfg:
+            raise ValueError(
+                "Discriminator optimizer settings have been removed; delete optim.lr_multipliers.discriminator "
+                "and optim.disc_lr_mult."
+            )
+        generator_lr_multipliers = dict(lr_multipliers)
         model_kwargs = model_cfg
+        removed_model_keys = [key for key in ("discriminator", "disc_dtype") if key in model_kwargs]
+        if removed_model_keys:
+            raise ValueError(
+                "GAN/discriminator modules have been removed; delete these model config keys: "
+                f"{sorted(removed_model_keys)}"
+            )
 
         default_loader_workers = int(data_cfg.get("loader_workers", 8))
         default_loader_prefetch = int(data_cfg.get("loader_prefetch_chunks", data_cfg.get("loader_prefetch") or 512))
@@ -450,6 +491,7 @@ def main() -> None:
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "loader_workers": max(1, default_loader_workers),
             "loader_prefetch_chunks": max(1, default_loader_prefetch),
+            "return_metadata": bool(dorado_perceptual_cfg.get("enabled", False)),
         }
         if args.loader_workers is not None:
             base_data_cfg["loader_workers"] = max(1, int(args.loader_workers))
@@ -469,17 +511,55 @@ def main() -> None:
         train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
-        ckpt_dir_raw = args.ckpt_dir or ckpt_cfg.get("dir") or "checkpoints"
-        ckpt_dir = str(Path(ckpt_dir_raw).expanduser().resolve())
+        eval_enabled = bool(eval_cfg.get("enabled", False))
+        if eval_enabled:
+            eval_split = str(eval_cfg.get("data_split", "valid")).strip().lower() or "valid"
+            if eval_split not in data_cfg:
+                raise ValueError(
+                    f"train.eval.data_split={eval_split!r} not found in config.data; "
+                    "expected a sibling split like data.valid."
+                )
+            eval_spec = _merge_split_cfg(base_data_cfg, data_cfg.get(eval_split))
+            eval_spec["root"] = _resolve_data_path(eval_spec.get("root"), cfg_dir)
+            eval_files = _collect_files_for_spec(split_cfg=eval_spec)
+            eval_every_steps = _positive_int(eval_cfg.get("every_steps"))
+            eval_reads = _positive_int(eval_cfg.get("reads"))
+            eval_min_read_length = _positive_int(eval_cfg.get("min_read_length")) or 12288
+            if eval_every_steps is None or eval_reads is None:
+                raise ValueError("train.eval.enabled=true requires positive train.eval.every_steps and train.eval.reads.")
+            print(
+                "[setup] eval enabled: "
+                f"split={eval_split}, every_steps={eval_every_steps}, reads={eval_reads}, "
+                f"min_read_length={eval_min_read_length}, files={len(eval_files)}"
+            )
+
+        legacy_ckpt_dir = ckpt_cfg.get("dir")
+        ckpt_root_dir = ckpt_cfg.get("root_dir")
+        if ckpt_root_dir is None and legacy_ckpt_dir is not None:
+            print("[setup] checkpoint.dir is deprecated; please rename it to checkpoint.root_dir.")
+        ckpt_dir_raw = args.ckpt_dir or ckpt_root_dir or legacy_ckpt_dir or "checkpoints"
         resume_from_cfg = ckpt_cfg.get("resume_from")
-        checkpoint_every_steps = int(ckpt_cfg.get("every_steps", 5000))
-        if args.checkpoints_per_epoch is not None:
-            checkpoint_every_steps = max(1, int(args.checkpoints_per_epoch))
+        if eval_enabled:
+            checkpoint_every_steps = int(eval_every_steps)
+            if "every_steps" in ckpt_cfg:
+                print(
+                    "[setup] checkpoint.every_steps is ignored because evaluation is enabled; "
+                    "checkpoint cadence follows train.eval.every_steps."
+                )
+            if args.checkpoints_per_epoch is not None:
+                print(
+                    "[setup] --checkpoints-per-epoch is ignored because evaluation is enabled; "
+                    "checkpoint cadence follows train.eval.every_steps."
+                )
+        else:
+            checkpoint_every_steps = int(ckpt_cfg.get("every_steps", 5000))
+            if args.checkpoints_per_epoch is not None:
+                checkpoint_every_steps = max(1, int(args.checkpoints_per_epoch))
         resume_from = None
         if resume_from_cfg:
             resume_path = Path(resume_from_cfg)
             if not resume_path.is_absolute():
-                resume_from = str((cfg_dir / resume_path).resolve())
+                resume_from = str((_ROOT / resume_path).resolve())
             else:
                 resume_from = str(resume_path.resolve())
 
@@ -490,6 +570,10 @@ def main() -> None:
         wandb_run_name = wandb_cfg.get("run_name") or args.wandb_run or f"simvq-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         wandb_entity = wandb_cfg.get("entity")
         wandb_api_key = wandb_cfg.get("api_key")
+        ckpt_dir = _resolve_checkpoint_dir(
+            base_dir_value=ckpt_dir_raw,
+            run_name=wandb_run_name,
+        )
         wandb_logger = None
         if wandb_enabled:
             wandb_logger = init_wandb(
@@ -509,7 +593,7 @@ def main() -> None:
                 ckpt_dir=ckpt_dir,
                 loss_weights=loss_weights,
                 stft_loss_cfg=stft_loss_cfg,
-                disc_start_step=disc_start_step,
+                dorado_perceptual_cfg=dorado_perceptual_cfg,
                 model_cfg=model_kwargs,
                 log_file=str(Path(ckpt_dir) / "train.log"),
                 batch_size=batch_size,
@@ -519,8 +603,6 @@ def main() -> None:
                 checkpoint_every_steps=checkpoint_every_steps,
                 wandb_logger=wandb_logger,
                 generator_lr_multipliers=generator_lr_multipliers,
-                disc_warmup_steps=disc_warmup_steps,
-                disc_lr_mult=disc_lr_mult,
                 host_prefetch_size=host_prefetch_size,
                 device_prefetch_size=device_prefetch_size,
                 grad_clip=grad_clip,
@@ -528,6 +610,8 @@ def main() -> None:
                 max_steps_total=args.max_steps,
                 max_steps_per_epoch=args.max_steps_per_epoch,
                 scan_steps=scan_steps,
+                config_path=str(cfg_path),
+                eval_cfg=eval_cfg,
             )
         finally:
             if wandb_logger is not None:
@@ -598,8 +682,11 @@ def main() -> None:
         wandb_logger = init_wandb(args.wandb_project or "simvq-nanopore", run_name, wandb_payload, api_key=None)
     default_loss_weights = {
         "time_l1": 2.0,
-        "gan": 0.03,
-        "feature": 0.1,
+        "diff1_l1": 0.1,
+        "diff2_l1": 0.05,
+        "small_stft_logmag_l1": 0.1,
+        "medium_stft_logmag_l1": 0.1,
+        "large_stft_logmag_l1": 0.1,
     }
     try:
         train_model_from_pod5(
@@ -609,6 +696,7 @@ def main() -> None:
             seed=int(seed),
             ckpt_dir=ckpt_dir,
             loss_weights=default_loss_weights,
+            dorado_perceptual_cfg=None,
             batch_size=legacy_batch_size,
             wandb_logger=wandb_logger,
             log_every_steps=legacy_log_every_steps,
