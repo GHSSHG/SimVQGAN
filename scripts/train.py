@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict
@@ -132,6 +133,31 @@ def _resolve_checkpoint_dir(
     if subdir and base_dir.name != subdir:
         base_dir = base_dir / subdir
     return str(base_dir)
+
+
+def _reset_checkpoint_dir(ckpt_dir: str | os.PathLike[str] | None) -> None:
+    if ckpt_dir is None:
+        return
+    ckpt_path = Path(ckpt_dir).expanduser()
+    if not ckpt_path.is_absolute():
+        ckpt_path = (_ROOT / ckpt_path).resolve()
+    else:
+        ckpt_path = ckpt_path.resolve()
+    protected_paths = {
+        Path("/"),
+        Path.home().resolve(),
+        _ROOT.resolve(),
+        _ROOT.parent.resolve(),
+    }
+    if ckpt_path in protected_paths:
+        raise ValueError(f"Refusing to delete protected path: {ckpt_path}")
+    if not ckpt_path.exists():
+        return
+    if ckpt_path.is_dir() and not ckpt_path.is_symlink():
+        shutil.rmtree(ckpt_path)
+    else:
+        ckpt_path.unlink()
+    print(f"[setup] removed existing checkpoint directory: {ckpt_path}")
 
 
 def _merge_split_cfg(base: Dict[str, Any], override: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -565,6 +591,7 @@ def main() -> None:
             base_dir_value=ckpt_dir_raw,
             run_name=wandb_run_name,
         )
+        _reset_checkpoint_dir(ckpt_dir)
         wandb_logger = None
         if wandb_enabled:
             wandb_logger = init_wandb(
@@ -656,6 +683,7 @@ def main() -> None:
     ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
     ckpt_dir = str(args.ckpt_dir) if args.ckpt_dir is not None else str(Path("checkpoints").resolve())
+    _reset_checkpoint_dir(ckpt_dir)
     legacy_batch_size = int(args.batch_size) if args.batch_size is not None else 512
     legacy_log_every_steps = int(args.log_every_steps) if args.log_every_steps is not None else 100
     legacy_checkpoint_every_steps = int(args.checkpoints_per_epoch) if args.checkpoints_per_epoch is not None else 5000

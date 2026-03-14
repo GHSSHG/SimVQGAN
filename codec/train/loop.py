@@ -343,6 +343,7 @@ def train_model_from_pod5(
     eval_options = dict(eval_cfg or {})
     eval_enabled = bool(eval_options.get("enabled", False))
     eval_every_steps = None
+    eval_first_step = None
     eval_num_reads = None
     eval_min_read_length = 12288
     eval_split = "valid"
@@ -365,6 +366,8 @@ def train_model_from_pod5(
             raise ValueError(
                 "train.eval.every_steps, train.eval.reads, and train.eval.min_read_length must be positive when evaluation is enabled."
             )
+        if eval_every_steps > 1000:
+            eval_first_step = 1000
         eval_split = str(eval_options.get("data_split", "valid")).strip().lower() or "valid"
         eval_microbatch = max(1, int(eval_options.get("microbatch", 128)))
         if periodic_ckpt_dir is None or best_ckpt_dir is None or eval_root_dir is None or eval_history_path is None:
@@ -379,6 +382,8 @@ def train_model_from_pod5(
             f"reads={eval_num_reads}, min_read_length={eval_min_read_length}, "
             f"split={eval_split}, microbatch={eval_microbatch})."
         )
+        if eval_first_step is not None:
+            _log(f"[setup] early validation probe enabled at step={eval_first_step}.")
         _log("[setup] checkpoint retention follows evaluation cadence; periodic checkpoints will all be preserved.")
     elif periodic_ckpt_dir is not None and ckpt_dir is not None:
         periodic_ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -1035,7 +1040,10 @@ def train_model_from_pod5(
                     should_run_eval = (
                         eval_enabled
                         and eval_every_steps is not None
-                        and global_step % eval_every_steps == 0
+                        and (
+                            (eval_first_step is not None and global_step == eval_first_step)
+                            or global_step % eval_every_steps == 0
+                        )
                     )
                     should_save_periodic = (
                         periodic_ckpt_dir is not None
