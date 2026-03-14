@@ -10,7 +10,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Unio
 import numpy as np
 import pod5 as p5
 
-from .normalization import standardize_with_stats
+from .normalization import normalize_to_pm1_with_stats
 from .pod5_processing import (
     parse_calibration,
     resolve_sample_rate,
@@ -26,10 +26,10 @@ def _calibrate_read_signal(signal: np.ndarray, calibration: Any) -> tuple[np.nda
     return cal.to_picoamps(signal), cal
 
 
-def _standardize_chunk_signal(chunk: np.ndarray) -> tuple[np.ndarray, NormalizationStats]:
-    """Standardize a single chunk independently and keep reversible stats."""
-    normalized, mean, std = standardize_with_stats(chunk)
-    return normalized, NormalizationStats(mean=mean, std=std)
+def _normalize_chunk_signal(chunk: np.ndarray) -> tuple[np.ndarray, NormalizationStats]:
+    """Normalize a single chunk to [-1, 1] and keep reversible stats."""
+    normalized, center, half_range = normalize_to_pm1_with_stats(chunk)
+    return normalized, NormalizationStats(center=center, half_range=half_range)
 
 
 def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarray]:
@@ -60,8 +60,8 @@ def _should_skip_pod5(exc: Exception) -> bool:
 """POD5 dataset utilities.
 
 Each read is streamed from POD5, converted to picoamps via calibration, sliced
-into fixed windows, and then each chunk is standardized independently using its
-own mean/std statistics. Sample-rate hints stored in POD5 are preferred,
+into fixed windows, and then each chunk is normalized independently to [-1, 1]
+using its own center/half-range statistics. Sample-rate hints stored in POD5 are preferred,
 falling back to configured defaults only when metadata is absent.
 """
 
@@ -191,7 +191,7 @@ class NanoporeSignalDataset:
                                 self._calibration_warned_files.add(file_path)
                             continue
                         for chunk in _iter_full_chunks(pa_signal, chunk_size=chunk_size):
-                            arr, stats = _standardize_chunk_signal(chunk)
+                            arr, stats = _normalize_chunk_signal(chunk)
                             arr = np.asarray(arr, dtype=np.float32)
                             if not self.return_metadata:
                                 yield arr
@@ -213,20 +213,20 @@ class NanoporeSignalDataset:
     def _flush_batch(buf: List[Any]) -> Any:
         if buf and isinstance(buf[0], tuple):
             signals = []
-            pa_means = []
-            pa_stds = []
+            pa_centers = []
+            pa_half_ranges = []
             cal_offsets = []
             cal_scales = []
             for chunk, stats, cal in buf:
                 signals.append(np.asarray(chunk, dtype=np.float32))
-                pa_means.append(float(stats.mean))
-                pa_stds.append(float(stats.std))
+                pa_centers.append(float(stats.center))
+                pa_half_ranges.append(float(stats.half_range))
                 cal_offsets.append(float(cal.offset))
                 cal_scales.append(float(cal.scale))
             return {
                 "signal": np.asarray(np.stack(signals, axis=0), dtype=np.float32),
-                "pa_mean": np.asarray(pa_means, dtype=np.float32),
-                "pa_std": np.asarray(pa_stds, dtype=np.float32),
+                "pa_center": np.asarray(pa_centers, dtype=np.float32),
+                "pa_half_range": np.asarray(pa_half_ranges, dtype=np.float32),
                 "calibration_offset": np.asarray(cal_offsets, dtype=np.float32),
                 "calibration_scale": np.asarray(cal_scales, dtype=np.float32),
             }

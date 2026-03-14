@@ -103,7 +103,7 @@ class DecoderStage1D(nn.Module):
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channels: Sequence[int] = (128, 64, 32)
+    channels: Sequence[int] = (256, 128, 64)
     num_res_blocks: int = 3
     up_strides: Sequence[int] = (2, 2)
     output_kernel_size: int = 7
@@ -152,4 +152,5 @@ class SimVQDecoder1D(nn.Module):
             h = stage(h, train=train)
         h = h.astype(jnp.float32)
         wave = self.conv_out(h)
+        wave = jnp.tanh(wave)
         return wave, {}

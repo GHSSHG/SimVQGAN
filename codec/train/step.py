@@ -18,9 +18,9 @@ def _extract_signal(batch):
 def _extract_dorado_metadata(batch):
     if not isinstance(batch, dict):
         return None, None
-    if "pa_mean" not in batch or "pa_std" not in batch:
+    if "pa_center" not in batch or "pa_half_range" not in batch:
         return None, None
-    return batch["pa_mean"], batch["pa_std"]
+    return batch["pa_center"], batch["pa_half_range"]
 
 
 @partial(
@@ -39,7 +39,7 @@ def compute_grads(
 ):
     def gen_loss_fn(params):
         signal = _extract_signal(batch)
-        pa_mean, pa_std = _extract_dorado_metadata(batch)
+        pa_center, pa_half_range = _extract_dorado_metadata(batch)
         vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
         outs = gen_state.apply_fn(
             {"params": params, "vq": vq_in},
@@ -56,8 +56,8 @@ def compute_grads(
             y_hat=wave_hat,
             weights=loss_weights,
             stft_loss_scales=stft_loss_scales,
-            pa_mean=pa_mean,
-            pa_std=pa_std,
+            pa_center=pa_center,
+            pa_half_range=pa_half_range,
             step=gen_state.step,
             dorado_perceptual_state=dorado_perceptual_state,
         )

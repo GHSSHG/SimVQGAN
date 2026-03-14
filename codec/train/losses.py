@@ -131,8 +131,8 @@ def compute_reconstruction_losses(
     y_hat: jnp.ndarray,
     weights: Dict[str, float],
     stft_loss_scales: Sequence[tuple[int, int, int]] = ((256, 256, 64),),
-    pa_mean: jnp.ndarray | None = None,
-    pa_std: jnp.ndarray | None = None,
+    pa_center: jnp.ndarray | None = None,
+    pa_half_range: jnp.ndarray | None = None,
     step: jnp.ndarray | None = None,
     dorado_perceptual_state: DoradoPerceptualState | None = None,
 ) -> tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
@@ -180,12 +180,17 @@ def compute_reconstruction_losses(
         logs[f"{label}_stft_logmag_loss_raw"] = raw_loss
         logs[f"{label}_stft_logmag_loss"] = weighted_loss
 
-    if dorado_perceptual_state is not None and pa_mean is not None and pa_std is not None and step is not None:
+    if (
+        dorado_perceptual_state is not None
+        and pa_center is not None
+        and pa_half_range is not None
+        and step is not None
+    ):
         dorado_loss, dorado_logs = compute_dorado_perceptual_loss(
             y=y,
             y_hat=y_hat,
-            pa_mean=pa_mean,
-            pa_std=pa_std,
+            pa_center=pa_center,
+            pa_half_range=pa_half_range,
             state=dorado_perceptual_state,
             step=step,
         )

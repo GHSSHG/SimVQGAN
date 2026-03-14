@@ -15,12 +15,12 @@ from ..jaxlayers import Conv1d
 
 class SimVQAudioModel(nn.Module):
     in_channels: int = 1
-    enc_channels: Tuple[int, ...] = (32, 64, 128)
+    enc_channels: Tuple[int, ...] = (64, 128, 256)
     enc_num_res_blocks: int = 3
     enc_down_strides: Tuple[int, ...] = (2, 2)
-    latent_dim: int = 128
+    latent_dim: int = 256
     codebook_size: int = 16384
-    dec_channels: Tuple[int, ...] = (128, 64, 32)
+    dec_channels: Tuple[int, ...] = (256, 128, 64)
     dec_num_res_blocks: int = 3
     dec_up_strides: Tuple[int, ...] = (2, 2)
     enc_kernel_size: int = 7

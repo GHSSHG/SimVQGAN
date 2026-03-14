@@ -5,7 +5,7 @@ from typing import Any, Iterable, Tuple
 
 import numpy as np
 
-from .normalization import standardize_with_stats
+from .normalization import normalize_to_pm1_with_stats
 
 
 class CalibrationError(RuntimeError):
@@ -37,17 +37,17 @@ class CalibrationParams:
 
 @dataclass(frozen=True)
 class NormalizationStats:
-    """Per-signal mean/std statistics for reversible standardization."""
+    """Per-signal center/half-range stats for reversible [-1, 1] normalization."""
 
-    mean: float = 0.0
-    std: float = 0.0
+    center: float = 0.0
+    half_range: float = 0.0
 
     @property
-    def safe_std(self) -> float:
-        std = float(self.std)
-        if not np.isfinite(std) or np.isclose(std, 0.0):
+    def safe_half_range(self) -> float:
+        half_range = float(self.half_range)
+        if not np.isfinite(half_range) or np.isclose(half_range, 0.0):
             return 1.0
-        return std
+        return half_range
 
 
 def parse_calibration(calibration_obj: Any | None) -> CalibrationParams:
@@ -88,11 +88,11 @@ def normalize_adc_signal(
     *,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, NormalizationStats, CalibrationParams]:
-    """Convert ADC signal to standardized values with reversible metadata."""
+    """Convert ADC signal to [-1, 1] values with reversible metadata."""
     cal = parse_calibration(calibration)
     pa = cal.to_picoamps(signal)
-    norm, mean, std = standardize_with_stats(pa, eps=eps)
-    stats = NormalizationStats(mean=mean, std=std)
+    norm, center, half_range = normalize_to_pm1_with_stats(pa, eps=eps)
+    stats = NormalizationStats(center=center, half_range=half_range)
     return norm, stats, cal
 
 
@@ -103,16 +103,16 @@ def denormalize_to_adc(
     *,
     eps: float = 1e-6,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Invert standardization to obtain (pA, ADC) arrays."""
+    """Invert [-1, 1] normalization to obtain (pA, ADC) arrays."""
     norm = np.asarray(normalized, dtype=np.float32)
-    mean = float(stats.mean)
-    if not np.isfinite(mean):
-        mean = 0.0
-    std = float(stats.std)
-    if not np.isfinite(std) or std < eps:
-        pa = np.full_like(norm, mean, dtype=np.float32)
+    center = float(stats.center)
+    if not np.isfinite(center):
+        center = 0.0
+    half_range = float(stats.half_range)
+    if not np.isfinite(half_range) or half_range < eps:
+        pa = np.full_like(norm, center, dtype=np.float32)
     else:
-        pa = norm * std + mean
+        pa = norm * half_range + center
     adc = calibration.to_adc(pa)
     return pa, adc
 

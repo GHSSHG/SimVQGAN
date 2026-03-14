@@ -251,7 +251,7 @@ class EncoderStage1D(nn.Module):
 
 class SimVQEncoder1D(nn.Module):
     in_channels: int = 1
-    channels: Sequence[int] = (32, 64, 128)
+    channels: Sequence[int] = (64, 128, 256)
     num_res_blocks: int = 3
     down_strides: Sequence[int] = (2, 2)
     input_kernel_size: int = 7

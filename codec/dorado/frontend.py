@@ -202,22 +202,28 @@ def _conv1d_nwc(
     return _swish(y)
 
 
-def _safe_chunk_to_pa(x: jnp.ndarray, pa_mean: jnp.ndarray, pa_std: jnp.ndarray, *, eps: float) -> jnp.ndarray:
+def _safe_chunk_to_pa(
+    x: jnp.ndarray,
+    pa_center: jnp.ndarray,
+    pa_half_range: jnp.ndarray,
+    *,
+    eps: float,
+) -> jnp.ndarray:
     x = jnp.asarray(x, dtype=jnp.float32)
-    pa_mean = jnp.asarray(pa_mean, dtype=jnp.float32).reshape((-1, 1))
-    pa_std = jnp.asarray(pa_std, dtype=jnp.float32).reshape((-1, 1))
-    valid = pa_std >= eps
-    restored = x * pa_std + pa_mean
-    return jnp.where(valid, restored, jnp.broadcast_to(pa_mean, restored.shape))
+    pa_center = jnp.asarray(pa_center, dtype=jnp.float32).reshape((-1, 1))
+    pa_half_range = jnp.asarray(pa_half_range, dtype=jnp.float32).reshape((-1, 1))
+    valid = pa_half_range >= eps
+    restored = x * pa_half_range + pa_center
+    return jnp.where(valid, restored, jnp.broadcast_to(pa_center, restored.shape))
 
 
 def _prepare_pa_for_dorado(
     x: jnp.ndarray,
-    pa_mean: jnp.ndarray,
-    pa_std: jnp.ndarray,
+    pa_center: jnp.ndarray,
+    pa_half_range: jnp.ndarray,
     state: DoradoPerceptualState,
 ) -> jnp.ndarray:
-    x_pa = _safe_chunk_to_pa(x, pa_mean, pa_std, eps=1e-6)
+    x_pa = _safe_chunk_to_pa(x, pa_center, pa_half_range, eps=1e-6)
     global_mean = jnp.asarray(state.pa_mean, dtype=jnp.float32)
     global_std = jnp.asarray(state.pa_std, dtype=jnp.float32)
     safe_global_std = jnp.where(jnp.isfinite(global_std) & (global_std > 0.0), global_std, 1.0)
@@ -262,13 +268,13 @@ def compute_dorado_perceptual_loss(
     *,
     y: jnp.ndarray,
     y_hat: jnp.ndarray,
-    pa_mean: jnp.ndarray,
-    pa_std: jnp.ndarray,
+    pa_center: jnp.ndarray,
+    pa_half_range: jnp.ndarray,
     state: DoradoPerceptualState,
     step: jnp.ndarray,
 ) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
-    y_dorado = _prepare_pa_for_dorado(y, pa_mean, pa_std, state)
-    y_hat_dorado = _prepare_pa_for_dorado(y_hat, pa_mean, pa_std, state)
+    y_dorado = _prepare_pa_for_dorado(y, pa_center, pa_half_range, state)
+    y_hat_dorado = _prepare_pa_for_dorado(y_hat, pa_center, pa_half_range, state)
     y_feats = extract_dorado_conv_features(y_dorado, state)
     y_hat_feats = extract_dorado_conv_features(y_hat_dorado, state)
 

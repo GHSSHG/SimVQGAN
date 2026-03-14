@@ -398,7 +398,7 @@ def train_model_from_pod5(
         val = mcfg.get(key, default)
         return tuple(int(v) for v in val)
 
-    latent_dim = int(mcfg.get("latent_dim", 128))
+    latent_dim = int(mcfg.get("latent_dim", 256))
     enc_kernel_size = int(mcfg.get("enc_kernel_size", 7))
     dec_out_kernel_size = int(mcfg.get("dec_out_kernel_size", 7))
     cnn_compute_dtype = _resolve_dtype(
@@ -410,10 +410,10 @@ def train_model_from_pod5(
         fallback=jnp.float32,
     )
     param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
-    enc_channels = _tuple_cfg("enc_channels", (32, 64, 128))
+    enc_channels = _tuple_cfg("enc_channels", (64, 128, 256))
     enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2))
     enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 3)))
-    dec_channels = _tuple_cfg("dec_channels", (128, 64, 32))
+    dec_channels = _tuple_cfg("dec_channels", (256, 128, 64))
     dec_up_strides = _tuple_cfg("dec_up_strides", (2, 2))
     dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 3)))
     generator = SimVQAudioModel(
