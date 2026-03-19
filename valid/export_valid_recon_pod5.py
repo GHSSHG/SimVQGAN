@@ -23,7 +23,7 @@ from codec.data.pod5_processing import normalize_adc_signal
 from codec.models.model import SimVQAudioModel
 from codec.utils import discover_pod5_files
 
-CONCAT_CHUNK_HOP = 2048
+CONCAT_CHUNK_HOP = 11688
 
 
 @dataclass(frozen=True)
@@ -83,16 +83,30 @@ def _build_model(model_cfg: dict[str, Any] | None) -> SimVQAudioModel:
             f"{sorted(removed_model_keys)}"
         )
 
+    stage_transformer_window_size = int(mcfg.get("stage_transformer_window_size", mcfg.get("transformer_window_size", 768)))
+    stage_transformer_shift_size = int(
+        mcfg.get("stage_transformer_shift_size", max(0, stage_transformer_window_size // 2))
+    )
+    latent_transformer_window_size = int(
+        mcfg.get("latent_transformer_window_size", mcfg.get("transformer_window_size", 512))
+    )
+    latent_transformer_shift_size = int(
+        mcfg.get(
+            "latent_transformer_shift_size",
+            mcfg.get("transformer_shift_size", max(0, latent_transformer_window_size // 2)),
+        )
+    )
+
     return SimVQAudioModel(
         in_channels=1,
-        enc_channels=_tuple_cfg(mcfg, "enc_channels", (64, 128, 256)),
-        enc_num_res_blocks=int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 3))),
-        enc_down_strides=_tuple_cfg(mcfg, "enc_down_strides", (2, 2)),
+        enc_channels=_tuple_cfg(mcfg, "enc_channels", (64, 256)),
+        enc_num_res_blocks=int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 4))),
+        enc_down_strides=_tuple_cfg(mcfg, "enc_down_strides", (3,)),
         latent_dim=int(mcfg.get("latent_dim", 256)),
         codebook_size=int(mcfg.get("codebook_size", 16384)),
-        dec_channels=_tuple_cfg(mcfg, "dec_channels", (256, 128, 64)),
-        dec_num_res_blocks=int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 3))),
-        dec_up_strides=_tuple_cfg(mcfg, "dec_up_strides", (2, 2)),
+        dec_channels=_tuple_cfg(mcfg, "dec_channels", (256, 64)),
+        dec_num_res_blocks=int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 4))),
+        dec_up_strides=_tuple_cfg(mcfg, "dec_up_strides", (3,)),
         enc_kernel_size=int(mcfg.get("enc_kernel_size", 7)),
         dec_out_kernel_size=int(mcfg.get("dec_out_kernel_size", 7)),
         enc_dtype=_resolve_dtype(mcfg.get("cnn_compute_dtype", mcfg.get("compute_dtype", "fp32"))),
@@ -105,11 +119,15 @@ def _build_model(model_cfg: dict[str, Any] | None) -> SimVQAudioModel:
         pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
         post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
         transformer_heads=int(mcfg.get("transformer_heads", 4)),
-        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 2.0)),
+        stage_transformer_window_size=stage_transformer_window_size,
+        stage_transformer_shift_size=stage_transformer_shift_size,
+        latent_transformer_window_size=latent_transformer_window_size,
+        latent_transformer_shift_size=latent_transformer_shift_size,
+        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
         transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
-        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
+        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "swiglu")),
         transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
-        transformer_use_rope=bool(mcfg.get("transformer_use_rope", False)),
+        transformer_use_rope=bool(mcfg.get("transformer_use_rope", True)),
         transformer_rope_base=float(mcfg.get("transformer_rope_base", 10000.0)),
         diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
         search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
@@ -170,6 +188,7 @@ def _resolve_split_cfg(config: dict[str, Any], split_name: str) -> dict[str, Any
         "subdirs": data_cfg.get("subdirs", ["."]),
         "segment_sec": float(data_cfg.get("segment_sec", 1.0)),
         "segment_samples": data_cfg.get("segment_samples"),
+        "segment_hop_samples": data_cfg.get("segment_hop_samples"),
         "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
     }
     split_cfg = _merge_split_cfg(base_cfg, data_cfg.get(split_name))
@@ -204,6 +223,16 @@ def _resolve_segment_samples(config: dict[str, Any], split_name: str) -> int:
     if value <= 0:
         raise ValueError(f"Invalid segment length for split {split_name!r}")
     return value
+
+
+def _resolve_segment_hop_samples(config: dict[str, Any], split_name: str) -> int:
+    split_cfg = _resolve_split_cfg(config, split_name)
+    raw_value = split_cfg.get("segment_hop_samples")
+    if raw_value not in (None, ""):
+        value = int(raw_value)
+        if value > 0:
+            return value
+    return _resolve_segment_samples(config, split_name)
 
 
 def _iter_source_specs(

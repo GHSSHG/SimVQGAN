@@ -20,10 +20,10 @@ from flax.training import checkpoints as flax_ckpt
 
 from codec.utils import discover_pod5_files
 from valid.export_valid_recon_pod5 import (
-    CONCAT_CHUNK_HOP,
     _build_model,
     _iter_source_specs,
     _load_json,
+    _resolve_segment_hop_samples,
     _to_host_tree,
 )
 
@@ -58,6 +58,12 @@ def _load_batches(
     root = Path(split_cfg.get("root", data_cfg["root"])).resolve()
     subdirs = list(split_cfg.get("subdirs", data_cfg.get("subdirs", ["."])))
     chunk_size = int(split_cfg.get("segment_samples", data_cfg["segment_samples"]))
+    chunk_hop = int(
+        split_cfg.get(
+            "segment_hop_samples",
+            data_cfg.get("segment_hop_samples", _resolve_segment_hop_samples(cfg, "train")),
+        )
+    )
     sample_rate_hz = float(split_cfg.get("sample_rate", data_cfg["sample_rate"]))
     if source_pod5 is not None:
         files = [source_pod5.resolve()]
@@ -70,7 +76,7 @@ def _load_batches(
     specs, chunks, warnings = _iter_source_specs(
         files=files,
         chunk_size=chunk_size,
-        chunk_hop=int(CONCAT_CHUNK_HOP),
+        chunk_hop=chunk_hop,
         sample_rate_hz=sample_rate_hz,
         target_chunks=total_chunks,
         chunks_per_step=int(batch_size),
@@ -81,7 +87,7 @@ def _load_batches(
     used_source_files = sorted({str(Path(spec.source_file)) for spec in specs})
     meta = {
         "chunk_size": chunk_size,
-        "chunk_hop": int(CONCAT_CHUNK_HOP),
+        "chunk_hop": chunk_hop,
         "sample_rate_hz": sample_rate_hz,
         "root": str(root),
         "subdirs": subdirs,

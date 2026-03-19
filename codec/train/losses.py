@@ -153,6 +153,7 @@ def compute_reconstruction_losses(
     diff1_term = w_diff1 * l_diff1
     diff2_term = w_diff2 * l_diff2
     reconstruct = time_term + diff1_term + diff2_term
+    total = reconstruct
     logs = {
         "reconstruct_loss": reconstruct,
         "time_l1_loss_raw": l_time,
@@ -177,8 +178,11 @@ def compute_reconstruction_losses(
         weight = _weight(f"{label}_stft_logmag_l1", legacy_stft_weight)
         weighted_loss = weight * raw_loss
         reconstruct = reconstruct + weighted_loss
+        total = total + weighted_loss
         logs[f"{label}_stft_logmag_loss_raw"] = raw_loss
         logs[f"{label}_stft_logmag_loss"] = weighted_loss
+
+    logs["reconstruct_loss"] = reconstruct
 
     if (
         dorado_perceptual_state is not None
@@ -194,8 +198,7 @@ def compute_reconstruction_losses(
             state=dorado_perceptual_state,
             step=step,
         )
-        reconstruct = reconstruct + dorado_loss
+        total = total + dorado_loss
         logs.update(dorado_logs)
 
-    logs["reconstruct_loss"] = reconstruct
-    return reconstruct, logs
+    return total, logs

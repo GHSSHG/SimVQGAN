@@ -196,6 +196,7 @@ def _build_dataset(
     window_ms: int,
     sample_rate: float,
     window_samples: int | None,
+    window_hop_samples: int | None,
     split_cfg: Dict[str, Any] | None = None,
 ) -> NanoporeSignalDataset:
     cfg = split_cfg or {}
@@ -208,6 +209,7 @@ def _build_dataset(
         files,
         window_ms=window_ms,
         window_samples=window_samples,
+        window_hop_samples=window_hop_samples,
         sample_rate_hz_default=sample_rate,
         return_metadata=return_metadata,
         loader_workers=loader_workers,
@@ -223,14 +225,23 @@ def _prepare_split_dataset(
     sample_rate = float(split_cfg.get("sample_rate", 5000.0))
     window_ms = int(round(segment_sec * 1000))
     segment_samples_raw = split_cfg.get("segment_samples")
+    segment_hop_samples_raw = split_cfg.get("segment_hop_samples")
     window_samples = None
+    window_hop_samples = None
     if segment_samples_raw not in (None, ""):
         try:
             window_samples = int(segment_samples_raw)
         except (TypeError, ValueError):
             window_samples = None
+    if segment_hop_samples_raw not in (None, ""):
+        try:
+            window_hop_samples = int(segment_hop_samples_raw)
+        except (TypeError, ValueError):
+            window_hop_samples = None
     if window_samples is not None and window_samples <= 0:
         window_samples = None
+    if window_hop_samples is not None and window_hop_samples <= 0:
+        window_hop_samples = None
     data_type = split_cfg.get("type", "pod5")
     if data_type != "pod5":
         raise ValueError(f"Unsupported data type {data_type}")
@@ -240,6 +251,7 @@ def _prepare_split_dataset(
         window_ms=window_ms,
         sample_rate=sample_rate,
         window_samples=window_samples,
+        window_hop_samples=window_hop_samples,
         split_cfg=split_cfg,
     )
     return dataset, files
@@ -505,6 +517,7 @@ def main() -> None:
             "subdirs": data_cfg.get("subdirs", ["."]),
             "segment_sec": float(data_cfg.get("segment_sec", 1.0)),
             "segment_samples": data_cfg.get("segment_samples"),
+            "segment_hop_samples": data_cfg.get("segment_hop_samples"),
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "loader_workers": max(1, default_loader_workers),
             "loader_prefetch_chunks": max(1, default_loader_prefetch),

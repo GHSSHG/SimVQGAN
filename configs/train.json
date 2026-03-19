@@ -1,27 +1,27 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 2,
-    "batch_size": 512,
+    "epochs": 1,
+    "batch_size": 64,
     "reference_device_count": 4,
-    "per_device_batch_size": 128,
+    "per_device_batch_size": 16,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 2e-5,
+    "learning_rate": 2e-6,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
     "device_prefetch_per_device": 2,
     "grad_clip": 1.0,
-    "log_every_steps": 500,
-    "codebook_stats_every_steps": 2000,
+    "log_every_steps": 1000,
+    "codebook_stats_every_steps": 2500,
     "eval": {
       "enabled": true,
       "every_steps": 30000,
       "reads": 64,
       "min_read_length": 12288,
       "data_split": "valid",
-      "microbatch": 128
+      "microbatch": 64
     },
     "loss_weights": {
       "time_l1": 1.0,
@@ -34,46 +34,66 @@
     "stft_loss": {
       "scales": [
         {
-          "n_fft": 32,
-          "win_length": 32,
-          "hop_length": 8
+          "n_fft": 192,
+          "win_length": 192,
+          "hop_length": 48
         },
         {
-          "n_fft": 64,
-          "win_length": 64,
-          "hop_length": 16
+          "n_fft": 384,
+          "win_length": 384,
+          "hop_length": 96
         },
         {
-          "n_fft": 128,
-          "win_length": 128,
-          "hop_length": 32
+          "n_fft": 768,
+          "win_length": 768,
+          "hop_length": 192
         }
       ]
     },
     "dorado_perceptual": {
       "enabled": true,
       "model_path": "~/Download/dorado/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0",
-      "layers": ["conv1", "conv2", "conv3"],
+      "layers": [
+        "conv4",
+        "conv5",
+        "tx6",
+        "tx12",
+        "tx18",
+        "upsample"
+      ],
       "layer_weights": {
-        "conv1": 0.2,
-        "conv2": 0.3,
-        "conv3": 0.5
+        "conv4": 0.1,
+        "conv5": 0.1,
+        "tx6": 0.2,
+        "tx12": 0.2,
+        "tx18": 0.2,
+        "upsample": 0.2
       },
-      "loss_weight": 0.2,
+      "loss_weight": 0.15,
       "warmup_start": 0,
-      "warmup_steps": 20000
+      "warmup_steps": 100000
     }
   },
   "model": {
-    "enc_channels": [64, 128, 256],
-    "enc_down_strides": [2, 2],
-    "enc_num_res_blocks": 3,
+    "enc_channels": [
+      64,
+      256
+    ],
+    "enc_down_strides": [
+      3
+    ],
+    "enc_num_res_blocks": 4,
     "enc_kernel_size": 7,
     "latent_dim": 256,
     "codebook_size": 65536,
-    "dec_channels": [256, 128, 64],
-    "dec_up_strides": [2, 2],
-    "dec_num_res_blocks": 3,
+    "dec_channels": [
+      256,
+      64
+    ],
+    "dec_up_strides": [
+      3
+    ],
+    "dec_num_res_blocks": 4,
     "dec_out_kernel_size": 7,
     "pre_quant_transformer_layers": 2,
     "post_quant_transformer_layers": 2,
@@ -88,16 +108,22 @@
     "transformer_compute_dtype": "bf16",
     "param_dtype": "fp32",
     "diveq_sigma2": 0.001,
-    "search_chunk_size": 2048
+    "search_chunk_size": 2048,
+    "stage_transformer_window_size": 768,
+    "stage_transformer_shift_size": 384,
+    "latent_transformer_window_size": 512,
+    "latent_transformer_shift_size": 256
   },
   "data": {
     "type": "pod5",
     "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-    "segment_sec": 0.4096,
-    "segment_samples": 2048,
+    "segment_sec": 2.4576,
+    "segment_samples": 12288,
     "sample_rate": 5000,
     "reference_device_count": 8,
-    "subdirs": ["FC01/pod5"],
+    "subdirs": [
+      "FC01/pod5"
+    ],
     "loader_workers": 32,
     "loader_workers_per_device": 4,
     "loader_prefetch_chunks": 4096,
@@ -105,14 +131,21 @@
     "auto_scale_loader_by_device_count": true,
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-      "subdirs": ["FC01/pod5"],
-      "segment_samples": 2048
+      "subdirs": [
+        "FC01/pod5"
+      ],
+      "segment_samples": 12288,
+      "segment_hop_samples": 11688
     },
     "valid": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
-      "subdirs": ["FC02/pod5"],
-      "segment_samples": 2048
-    }
+      "subdirs": [
+        "FC02/pod5"
+      ],
+      "segment_samples": 12288,
+      "segment_hop_samples": 11688
+    },
+    "segment_hop_samples": 11688
   },
   "checkpoint": {
     "root_dir": "checkpoints",
@@ -122,7 +155,7 @@
     "wandb": {
       "enabled": true,
       "project": "simvq-local",
-      "run_name": "V4.2",
+      "run_name": "V4.5",
       "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
     }
   },

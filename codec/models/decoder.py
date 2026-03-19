@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Sequence
 
+import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
 from ..jaxlayers import Conv1d, ConvTranspose1d
 from .encoder import GroupNorm1D, SEANetResnetBlock1D, _elu, _resolve_residual_dilations
+from .transformer import SwinTransformerBlock1D
 
 
 class SEANetUpsample1D(nn.Module):
@@ -65,10 +67,20 @@ class DecoderStage1D(nn.Module):
     in_ch: int
     out_ch: int
     up_factor: int
-    num_res_blocks: int = 3
+    num_res_blocks: int = 4
     compress: int = 2
     use_block_norm: bool = True
     use_upsample_norm: bool = True
+    transformer_heads: int = 4
+    transformer_window_size: int = 768
+    transformer_shift_size: int = 384
+    transformer_mlp_ratio: float = 4.0
+    transformer_dropout: float = 0.0
+    transformer_ffn_activation: str = "swiglu"
+    transformer_attention_backend: str = "jax_cudnn"
+    transformer_use_rope: bool = True
+    transformer_rope_base: float = 10000.0
+    transformer_dtype: Any = jnp.float32
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -80,6 +92,21 @@ class DecoderStage1D(nn.Module):
             dtype=self.dtype,
             param_dtype=self.param_dtype,
             name="upsample",
+        )
+        self.transformer_block = SwinTransformerBlock1D(
+            dim=self.out_ch,
+            num_heads=self.transformer_heads,
+            window_size=max(1, int(self.transformer_window_size)),
+            shift_size=max(0, int(self.transformer_shift_size)),
+            mlp_ratio=self.transformer_mlp_ratio,
+            dropout=self.transformer_dropout,
+            ffn_activation=self.transformer_ffn_activation,
+            attention_backend=self.transformer_attention_backend,
+            use_rope=self.transformer_use_rope,
+            rope_base=self.transformer_rope_base,
+            dtype=self.transformer_dtype,
+            param_dtype=self.param_dtype,
+            name="transformer_block",
         )
         self.blocks = tuple(
             SEANetResnetBlock1D(
@@ -94,8 +121,10 @@ class DecoderStage1D(nn.Module):
             for i, dilation in enumerate(_resolve_residual_dilations(self.num_res_blocks))
         )
 
-    def __call__(self, x: jnp.ndarray, *, train: bool = False) -> jnp.ndarray:
+    def __call__(self, x: jnp.ndarray, *, train: bool = False, rng: jax.Array | None = None) -> jnp.ndarray:
         h = self.upsample(x)
+        h = self.transformer_block(h, train=train, rng=rng)
+        h = h.astype(self.dtype)
         for block in self.blocks:
             h = block(h, train=train)
         return h
@@ -103,13 +132,23 @@ class DecoderStage1D(nn.Module):
 
 class SimVQDecoder1D(nn.Module):
     out_channels: int = 1
-    channels: Sequence[int] = (256, 128, 64)
-    num_res_blocks: int = 3
-    up_strides: Sequence[int] = (2, 2)
+    channels: Sequence[int] = (256, 64)
+    num_res_blocks: int = 4
+    up_strides: Sequence[int] = (3,)
     output_kernel_size: int = 7
     block_compress: int = 2
     use_block_norm: bool = True
     use_upsample_norm: bool = True
+    transformer_heads: int = 4
+    transformer_window_size: int = 768
+    transformer_shift_size: int = 384
+    transformer_mlp_ratio: float = 4.0
+    transformer_dropout: float = 0.0
+    transformer_ffn_activation: str = "swiglu"
+    transformer_attention_backend: str = "jax_cudnn"
+    transformer_use_rope: bool = True
+    transformer_rope_base: float = 10000.0
+    transformer_dtype: Any = jnp.float32
     dtype: Any = jnp.float32
     param_dtype: Any = jnp.float32
 
@@ -130,6 +169,16 @@ class SimVQDecoder1D(nn.Module):
                     compress=self.block_compress,
                     use_block_norm=self.use_block_norm,
                     use_upsample_norm=self.use_upsample_norm,
+                    transformer_heads=self.transformer_heads,
+                    transformer_window_size=self.transformer_window_size,
+                    transformer_shift_size=self.transformer_shift_size,
+                    transformer_mlp_ratio=self.transformer_mlp_ratio,
+                    transformer_dropout=self.transformer_dropout,
+                    transformer_ffn_activation=self.transformer_ffn_activation,
+                    transformer_attention_backend=self.transformer_attention_backend,
+                    transformer_use_rope=self.transformer_use_rope,
+                    transformer_rope_base=self.transformer_rope_base,
+                    transformer_dtype=self.transformer_dtype,
                     dtype=self.dtype,
                     param_dtype=self.param_dtype,
                     name=f"stage_{idx}",
@@ -146,10 +195,13 @@ class SimVQDecoder1D(nn.Module):
             name="to_signal",
         )
 
-    def __call__(self, z: jnp.ndarray, *, train: bool = False):
+    def __call__(self, z: jnp.ndarray, *, train: bool = False, rng: jax.Array | None = None):
         h = z
-        for stage in self.stages:
-            h = stage(h, train=train)
+        stage_rngs = [None] * len(self.stages)
+        if rng is not None and self.stages:
+            stage_rngs = list(jax.random.split(rng, len(self.stages)))
+        for stage, stage_rng in zip(self.stages, stage_rngs):
+            h = stage(h, train=train, rng=stage_rng)
         h = h.astype(jnp.float32)
         wave = self.conv_out(h)
         wave = jnp.tanh(wave)

@@ -2,7 +2,7 @@ from .encoder import SimVQEncoder1D, SimVQResBlock1D
 from .decoder import SimVQDecoder1D
 from .model import SimVQAudioModel
 from .quantize import SimVQ1D
-from .transformer import TransformerBlock1D
+from .transformer import LocalTransformerBlock1D, SwinTransformerBlock1D, TransformerBlock1D
 
 # Backwards-compatible aliases for downstream scripts
 Encoder = SimVQEncoder1D
@@ -15,5 +15,7 @@ __all__ = [
     "SimVQDecoder1D",
     "SimVQAudioModel",
     "SimVQ1D",
+    "LocalTransformerBlock1D",
+    "SwinTransformerBlock1D",
     "TransformerBlock1D",
 ]

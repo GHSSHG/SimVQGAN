@@ -49,6 +49,7 @@ from valid.export_valid_recon_pod5 import (
     _build_model,
     _load_generator_variables,
     _load_json,
+    _resolve_segment_hop_samples,
     _resolve_segment_samples,
     _resolve_split_files,
 )
@@ -146,7 +147,7 @@ def _parse_args() -> argparse.Namespace:
         type=Path,
         default=(Path(manifest_path_default) if manifest_path_default else None),
     )
-    parser.add_argument("--recon-mode", type=str, default=os.environ.get("RECON_MODE", RECON_MODE_DIRECT))
+    parser.add_argument("--recon-mode", type=str, default=os.environ.get("RECON_MODE", RECON_MODE_OVERLAP))
     parser.add_argument("--hop-samples", type=int, default=_env_int("HOP_SAMPLES"))
     parser.add_argument("--dorado-bin", type=str, default=os.environ.get("DORADO_BIN", "dorado"))
     parser.add_argument("--dorado-model", type=str, default=os.environ.get("DORADO_MODEL"))
@@ -159,7 +160,7 @@ def _parse_args() -> argparse.Namespace:
     if args.microbatch is not None:
         args.chunk_batch_size = args.microbatch
     args.chunk_batch_size = max(1, int(args.chunk_batch_size))
-    args.recon_mode = str(args.recon_mode).strip().lower() or RECON_MODE_DIRECT
+    args.recon_mode = str(args.recon_mode).strip().lower() or RECON_MODE_OVERLAP
     if args.recon_mode not in SUPPORTED_RECON_MODES:
         raise SystemExit(f"Unsupported --recon-mode={args.recon_mode!r}; choose from {sorted(SUPPORTED_RECON_MODES)}")
     args.trim_mode = str(args.trim_mode).strip().lower() or "drop"
@@ -306,11 +307,18 @@ def _sanitize_tag(text: str) -> str:
     return "".join(cleaned).strip("_") or "data"
 
 
-def _resolve_recon_hop(recon_mode: str, chunk_size: int, hop_override: int | None) -> int:
-    if hop_override is None:
-        hop_samples = int(chunk_size) if recon_mode == RECON_MODE_DIRECT else int(DEFAULT_OVERLAP_HOP)
-    else:
+def _resolve_recon_hop(
+    recon_mode: str,
+    chunk_size: int,
+    configured_hop: int | None,
+    hop_override: int | None,
+) -> int:
+    if hop_override is not None:
         hop_samples = int(hop_override)
+    elif configured_hop is not None:
+        hop_samples = int(configured_hop)
+    else:
+        hop_samples = int(chunk_size) if recon_mode == RECON_MODE_DIRECT else int(DEFAULT_OVERLAP_HOP)
     if hop_samples <= 0:
         raise ValueError(f"Validation chunk hop must be positive, got {hop_samples}.")
     if hop_samples > int(chunk_size):
@@ -1000,13 +1008,14 @@ def main() -> None:
     min_read_length = max(1, int(args.min_read_length))
     max_read_length = None if args.max_read_length is None else int(args.max_read_length)
     chunk_batch_size = max(1, int(args.chunk_batch_size))
-    recon_mode = str(args.recon_mode).strip().lower() or RECON_MODE_DIRECT
+    recon_mode = str(args.recon_mode).strip().lower() or RECON_MODE_OVERLAP
     trim_mode = str(args.trim_mode).strip().lower() or "drop"
 
     config = _load_json(config_path)
     config["_config_dir"] = str(config_path.parent.resolve())
     segment_samples = _resolve_segment_samples(config, split)
-    hop_samples = _resolve_recon_hop(recon_mode, segment_samples, args.hop_samples)
+    configured_hop_samples = _resolve_segment_hop_samples(config, split)
+    hop_samples = _resolve_recon_hop(recon_mode, segment_samples, configured_hop_samples, args.hop_samples)
     split_files = _resolve_input_files(config, split, source_pod5)
 
     if manifest_path_arg is not None:

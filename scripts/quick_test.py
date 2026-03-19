@@ -85,6 +85,7 @@ def _patch_config(
     train_split["files"] = [str(pod5_file.resolve())]
     train_split.setdefault("segment_sec", base_data.get("segment_sec", 1.0))
     train_split.setdefault("segment_samples", base_data.get("segment_samples", 5000))
+    train_split.setdefault("segment_hop_samples", base_data.get("segment_hop_samples"))
     train_split.setdefault("sample_rate", base_data.get("sample_rate", 5000.0))
     base_data["train"] = train_split
     base_data["root"] = str(pod5_file.resolve().parent)

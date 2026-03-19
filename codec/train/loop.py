@@ -199,6 +199,7 @@ def _clone_dataset_with_metadata(ds: NanoporeSignalDataset) -> NanoporeSignalDat
         ds.pod5_files,
         window_ms=ds.window_ms,
         window_samples=ds.window_samples,
+        window_hop_samples=ds.window_hop_samples,
         sample_rate_hz_default=ds.sample_rate_hz_default,
         return_metadata=True,
         read_ids_per_file=ds.read_ids_per_file,
@@ -415,12 +416,25 @@ def train_model_from_pod5(
         fallback=jnp.float32,
     )
     param_dtype = _resolve_dtype(mcfg.get("param_dtype", "fp32"), fallback=jnp.float32)
-    enc_channels = _tuple_cfg("enc_channels", (64, 128, 256))
-    enc_down_strides = _tuple_cfg("enc_down_strides", (2, 2))
-    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 3)))
-    dec_channels = _tuple_cfg("dec_channels", (256, 128, 64))
-    dec_up_strides = _tuple_cfg("dec_up_strides", (2, 2))
-    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 3)))
+    stage_transformer_window_size = int(mcfg.get("stage_transformer_window_size", mcfg.get("transformer_window_size", 768)))
+    stage_transformer_shift_size = int(
+        mcfg.get("stage_transformer_shift_size", max(0, stage_transformer_window_size // 2))
+    )
+    latent_transformer_window_size = int(
+        mcfg.get("latent_transformer_window_size", mcfg.get("transformer_window_size", 512))
+    )
+    latent_transformer_shift_size = int(
+        mcfg.get(
+            "latent_transformer_shift_size",
+            mcfg.get("transformer_shift_size", max(0, latent_transformer_window_size // 2)),
+        )
+    )
+    enc_channels = _tuple_cfg("enc_channels", (64, 256))
+    enc_down_strides = _tuple_cfg("enc_down_strides", (3,))
+    enc_num_res_blocks = int(mcfg.get("enc_num_res_blocks", mcfg.get("num_res_blocks", 4)))
+    dec_channels = _tuple_cfg("dec_channels", (256, 64))
+    dec_up_strides = _tuple_cfg("dec_up_strides", (3,))
+    dec_num_res_blocks = int(mcfg.get("dec_num_res_blocks", mcfg.get("num_res_blocks", 4)))
     generator = SimVQAudioModel(
         in_channels=1,
         enc_channels=enc_channels,
@@ -440,11 +454,15 @@ def train_model_from_pod5(
         pre_quant_transformer_layers=int(mcfg.get("pre_quant_transformer_layers", 0)),
         post_quant_transformer_layers=int(mcfg.get("post_quant_transformer_layers", 0)),
         transformer_heads=int(mcfg.get("transformer_heads", 4)),
-        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 2.0)),
+        stage_transformer_window_size=stage_transformer_window_size,
+        stage_transformer_shift_size=stage_transformer_shift_size,
+        latent_transformer_window_size=latent_transformer_window_size,
+        latent_transformer_shift_size=latent_transformer_shift_size,
+        transformer_mlp_ratio=float(mcfg.get("transformer_mlp_ratio", 4.0)),
         transformer_dropout=float(mcfg.get("transformer_dropout", 0.0)),
-        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "gelu")),
+        transformer_ffn_activation=str(mcfg.get("transformer_ffn_activation", "swiglu")),
         transformer_attention_backend=str(mcfg.get("transformer_attention_backend", "jax_cudnn")),
-        transformer_use_rope=bool(mcfg.get("transformer_use_rope", False)),
+        transformer_use_rope=bool(mcfg.get("transformer_use_rope", True)),
         transformer_rope_base=float(mcfg.get("transformer_rope_base", 10000.0)),
         diveq_sigma2=float(mcfg.get("diveq_sigma2", 1e-3)),
         search_chunk_size=int(mcfg.get("search_chunk_size", 2048)),
@@ -456,13 +474,13 @@ def train_model_from_pod5(
         model_path = dorado_cfg.get("model_path")
         if not model_path:
             raise ValueError("train.dorado_perceptual.enabled=true requires train.dorado_perceptual.model_path.")
-        layers = tuple(dorado_cfg.get("layers", ("conv1", "conv2", "conv3")))
+        layers = tuple(dorado_cfg.get("layers", ("conv4", "conv5", "tx6", "tx12", "tx18", "upsample")))
         layer_weights = dorado_cfg.get("layer_weights")
         dorado_state = load_dorado_perceptual_state(
             model_path=str(model_path),
             layers=layers,
             layer_weights=layer_weights,
-            loss_weight=float(dorado_cfg.get("loss_weight", 0.05)),
+            loss_weight=float(dorado_cfg.get("loss_weight", 0.15)),
             warmup_start=int(dorado_cfg.get("warmup_start", 0)),
             warmup_steps=int(dorado_cfg.get("warmup_steps", 0)),
         )
@@ -470,7 +488,7 @@ def train_model_from_pod5(
             ds = _clone_dataset_with_metadata(ds)
         _log(
             "[setup] Dorado perceptual loss enabled: "
-            f"layers={layers}, loss_weight={float(dorado_cfg.get('loss_weight', 0.05)):.4f}, "
+            f"layers={layers}, loss_weight={float(dorado_cfg.get('loss_weight', 0.15)):.4f}, "
             f"warmup_start={int(dorado_cfg.get('warmup_start', 0))}, "
             f"warmup_steps={int(dorado_cfg.get('warmup_steps', 0))}"
         )

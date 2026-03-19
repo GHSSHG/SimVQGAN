@@ -6,23 +6,23 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from .encoder import SimVQEncoder1D
 from .decoder import SimVQDecoder1D
+from .encoder import SimVQEncoder1D
 from .quantize import SimVQ1D
-from .transformer import TransformerBlock1D
+from .transformer import SwinTransformerBlock1D
 from ..jaxlayers import Conv1d
 
 
 class SimVQAudioModel(nn.Module):
     in_channels: int = 1
-    enc_channels: Tuple[int, ...] = (64, 128, 256)
-    enc_num_res_blocks: int = 3
-    enc_down_strides: Tuple[int, ...] = (2, 2)
+    enc_channels: Tuple[int, ...] = (64, 256)
+    enc_num_res_blocks: int = 4
+    enc_down_strides: Tuple[int, ...] = (3,)
     latent_dim: int = 256
     codebook_size: int = 16384
-    dec_channels: Tuple[int, ...] = (256, 128, 64)
-    dec_num_res_blocks: int = 3
-    dec_up_strides: Tuple[int, ...] = (2, 2)
+    dec_channels: Tuple[int, ...] = (256, 64)
+    dec_num_res_blocks: int = 4
+    dec_up_strides: Tuple[int, ...] = (3,)
     enc_kernel_size: int = 7
     dec_out_kernel_size: int = 7
     enc_dtype: Any = jnp.float32
@@ -32,11 +32,15 @@ class SimVQAudioModel(nn.Module):
     pre_quant_transformer_layers: int = 0
     post_quant_transformer_layers: int = 0
     transformer_heads: int = 4
-    transformer_mlp_ratio: float = 2.0
+    stage_transformer_window_size: int = 768
+    stage_transformer_shift_size: int = 384
+    latent_transformer_window_size: int = 512
+    latent_transformer_shift_size: int = 256
+    transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.0
-    transformer_ffn_activation: str = "gelu"
+    transformer_ffn_activation: str = "swiglu"
     transformer_attention_backend: str = "jax_cudnn"
-    transformer_use_rope: bool = False
+    transformer_use_rope: bool = True
     transformer_rope_base: float = 10000.0
     diveq_sigma2: float = 1e-3
     search_chunk_size: int = 2048
@@ -72,6 +76,16 @@ class SimVQAudioModel(nn.Module):
             use_block_norm=self.encoder_use_block_norm,
             use_input_norm=self.encoder_use_input_norm,
             use_transition_norm=self.encoder_use_transition_norm,
+            transformer_heads=self.transformer_heads,
+            transformer_window_size=self.stage_transformer_window_size,
+            transformer_shift_size=self.stage_transformer_shift_size,
+            transformer_mlp_ratio=self.transformer_mlp_ratio,
+            transformer_dropout=self.transformer_dropout,
+            transformer_ffn_activation=self.transformer_ffn_activation,
+            transformer_attention_backend=self.transformer_attention_backend,
+            transformer_use_rope=self.transformer_use_rope,
+            transformer_rope_base=self.transformer_rope_base,
+            transformer_dtype=self.transformer_dtype,
             dtype=self.enc_dtype,
             param_dtype=self.param_dtype,
         )
@@ -83,6 +97,16 @@ class SimVQAudioModel(nn.Module):
             output_kernel_size=self.dec_out_kernel_size,
             use_block_norm=self.decoder_use_block_norm,
             use_upsample_norm=self.decoder_use_upsample_norm,
+            transformer_heads=self.transformer_heads,
+            transformer_window_size=self.stage_transformer_window_size,
+            transformer_shift_size=self.stage_transformer_shift_size,
+            transformer_mlp_ratio=self.transformer_mlp_ratio,
+            transformer_dropout=self.transformer_dropout,
+            transformer_ffn_activation=self.transformer_ffn_activation,
+            transformer_attention_backend=self.transformer_attention_backend,
+            transformer_use_rope=self.transformer_use_rope,
+            transformer_rope_base=self.transformer_rope_base,
+            transformer_dtype=self.transformer_dtype,
             dtype=self.dec_dtype,
             param_dtype=self.param_dtype,
         )
@@ -113,10 +137,13 @@ class SimVQAudioModel(nn.Module):
             dtype=quant_path_dtype,
             param_dtype=quant_path_dtype,
         )
+        latent_shift = max(0, int(self.latent_transformer_shift_size))
         self.pre_quant_blocks = tuple(
-            TransformerBlock1D(
+            SwinTransformerBlock1D(
                 dim=self.latent_dim,
                 num_heads=self.transformer_heads,
+                window_size=max(1, int(self.latent_transformer_window_size)),
+                shift_size=latent_shift,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
                 ffn_activation=self.transformer_ffn_activation,
@@ -130,9 +157,11 @@ class SimVQAudioModel(nn.Module):
             for i in range(max(0, int(self.pre_quant_transformer_layers)))
         )
         self.post_quant_blocks = tuple(
-            TransformerBlock1D(
+            SwinTransformerBlock1D(
                 dim=dec_channels[0],
                 num_heads=self.transformer_heads,
+                window_size=max(1, int(self.latent_transformer_window_size)),
+                shift_size=latent_shift,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
                 ffn_activation=self.transformer_ffn_activation,
@@ -149,7 +178,7 @@ class SimVQAudioModel(nn.Module):
     def _run_transformer_blocks(
         self,
         x: jnp.ndarray,
-        blocks: Tuple[TransformerBlock1D, ...],
+        blocks: Tuple[SwinTransformerBlock1D, ...],
         *,
         train: bool,
         rng: jax.random.KeyArray | None,
@@ -173,17 +202,14 @@ class SimVQAudioModel(nn.Module):
         rng: jax.random.KeyArray,
         collect_codebook_stats: bool = True,
     ) -> Tuple[jnp.ndarray, jnp.ndarray, Dict[str, Any]]:
-        h_e = self.encoder(x, train=train, offset=offset).astype(jnp.float32)
-        if self.pre_quant_blocks:
-            tf_rng, quant_rng = jax.random.split(rng)
-            h_e = self._run_transformer_blocks(
-                h_e,
-                self.pre_quant_blocks,
-                train=train,
-                rng=tf_rng,
-            )
-        else:
-            _, quant_rng = jax.random.split(rng)
+        enc_rng, pre_tf_rng, quant_rng = jax.random.split(rng, 3)
+        h_e = self.encoder(x, train=train, offset=offset, rng=enc_rng).astype(jnp.float32)
+        h_e = self._run_transformer_blocks(
+            h_e,
+            self.pre_quant_blocks,
+            train=train,
+            rng=pre_tf_rng,
+        )
         h_qin = self.quant_conv(h_e.astype(jnp.float32))
         z_q, info = self.quantizer(
             h_qin.astype(jnp.float32),
@@ -194,9 +220,12 @@ class SimVQAudioModel(nn.Module):
         return h_qin, z_q.astype(jnp.float32), info
 
     def decode(self, z_q: jnp.ndarray, *, train: bool = False, rng: jax.random.KeyArray | None = None):
+        post_tf_rng = dec_rng = None
+        if rng is not None:
+            post_tf_rng, dec_rng = jax.random.split(rng)
         z_dec = self.post_quant_conv(z_q.astype(jnp.float32))
-        z_dec = self._run_transformer_blocks(z_dec, self.post_quant_blocks, train=train, rng=rng)
-        wave, aux = self.decoder(z_dec.astype(jnp.float32), train=train)
+        z_dec = self._run_transformer_blocks(z_dec, self.post_quant_blocks, train=train, rng=post_tf_rng)
+        wave, aux = self.decoder(z_dec.astype(jnp.float32), train=train, rng=dec_rng)
         if wave.ndim == 3 and wave.shape[-1] == 1:
             wave = jnp.squeeze(wave, axis=-1)
         return wave.astype(jnp.float32), aux

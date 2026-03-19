@@ -45,6 +45,18 @@ def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarra
         yield row
 
 
+def _iter_sliding_chunks(signal: np.ndarray, chunk_size: int, hop_size: int) -> Iterator[np.ndarray]:
+    n = int(signal.shape[0])
+    if n <= 0 or chunk_size <= 0 or hop_size <= 0:
+        return
+    if n < chunk_size:
+        return
+    last_start = n - chunk_size
+    for start in range(0, last_start + 1, hop_size):
+        stop = start + chunk_size
+        yield signal[start:stop]
+
+
 def _should_skip_pod5(exc: Exception) -> bool:
     msg = str(exc)
     keywords = (
@@ -71,6 +83,7 @@ class NanoporeSignalDataset:
     pod5_files: List[Path]
     window_ms: int = 1000
     window_samples: Optional[int] = None
+    window_hop_samples: Optional[int] = None
     sample_rate_hz_default: Optional[float] = None
     return_metadata: bool = False
     read_ids_per_file: Optional[Dict[Path, Sequence[str]]] = None
@@ -86,6 +99,7 @@ class NanoporeSignalDataset:
         files: Iterable[Union[str, Path]],
         window_ms: int = 1000,
         window_samples: Optional[int] = None,
+        window_hop_samples: Optional[int] = None,
         sample_rate_hz_default: Optional[float] = None,
         return_metadata: bool = False,
         read_ids_per_file: Optional[Dict[Union[str, Path], Sequence[str]]] = None,
@@ -106,10 +120,16 @@ class NanoporeSignalDataset:
             ws = int(window_samples)
             if ws > 0:
                 window_samples_int = ws
+        window_hop_samples_int: Optional[int] = None
+        if window_hop_samples is not None:
+            hs = int(window_hop_samples)
+            if hs > 0:
+                window_hop_samples_int = hs
         return cls(
             pod5_files=paths,
             window_ms=int(window_ms),
             window_samples=window_samples_int,
+            window_hop_samples=window_hop_samples_int,
             sample_rate_hz_default=sample_rate_hz_default,
             return_metadata=bool(return_metadata),
             read_ids_per_file=rid_map,
@@ -174,6 +194,10 @@ class NanoporeSignalDataset:
                             chunk_size = int(round(self.window_ms * float(target_sr) / 1000.0))
                         if chunk_size <= 0:
                             chunk_size = 1
+                        if self.window_hop_samples is not None and self.window_hop_samples > 0:
+                            chunk_hop = int(self.window_hop_samples)
+                        else:
+                            chunk_hop = chunk_size
                         raw_signal = read.signal
                         if raw_signal.shape[0] < chunk_size:
                             continue
@@ -190,7 +214,11 @@ class NanoporeSignalDataset:
                                 )
                                 self._calibration_warned_files.add(file_path)
                             continue
-                        for chunk in _iter_full_chunks(pa_signal, chunk_size=chunk_size):
+                        for chunk in _iter_sliding_chunks(
+                            pa_signal,
+                            chunk_size=chunk_size,
+                            hop_size=chunk_hop,
+                        ):
                             arr, stats = _normalize_chunk_signal(chunk)
                             arr = np.asarray(arr, dtype=np.float32)
                             if not self.return_metadata:
