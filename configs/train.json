@@ -2,12 +2,12 @@
   "seed": 42,
   "train": {
     "epochs": 1,
-    "batch_size": 64,
+    "batch_size": 16,
     "reference_device_count": 4,
-    "per_device_batch_size": 16,
+    "per_device_batch_size": 4,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 2e-6,
+    "learning_rate": 1e-6,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
@@ -17,11 +17,11 @@
     "codebook_stats_every_steps": 2500,
     "eval": {
       "enabled": true,
-      "every_steps": 30000,
+      "every_steps": 20000,
       "reads": 64,
       "min_read_length": 12288,
       "data_split": "valid",
-      "microbatch": 64
+      "microbatch": 8
     },
     "loss_weights": {
       "time_l1": 1.0,
