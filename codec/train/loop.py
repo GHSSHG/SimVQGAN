@@ -8,6 +8,7 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 from functools import partial
@@ -831,6 +832,7 @@ def train_model_from_pod5(
         env["MIN_READ_LENGTH"] = str(eval_min_read_length)
         env["MICROBATCH"] = str(eval_microbatch)
         env["DATA_SPLIT"] = eval_split
+        env["PYTHON_BIN"] = sys.executable
         proc = subprocess.run(
             ["bash", str(validation_script)],
             cwd=str(Path(__file__).resolve().parents[2]),
@@ -933,17 +935,22 @@ def train_model_from_pod5(
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
             return gen_state, logs
 
-    if resume_from is not None and os.path.exists(resume_from):
+    if resume_from is not None:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
         try:
-            ckpt = flax_ckpt.restore_checkpoint(ckpt_dir=resume_from, target=None)
+            restore_state = flax_jax_utils.unreplicate(gen_state) if _is_replicated_state(gen_state) else gen_state
+            restore_target = {"gen": restore_state}
+            ckpt = flax_ckpt.restore_checkpoint(ckpt_dir=resume_from, target=restore_target)
             restored_state = ckpt.get("gen") if isinstance(ckpt, dict) and "gen" in ckpt else ckpt
-            if restored_state is not None:
-                gen_state = _with_vq_default(restored_state)
-                _ensure_replicated_state()
-                _log(f"[resume] Restored from {resume_from}")
-                _maybe_log_gpu_memory(_log, "after_resume")
-        except Exception:
-            pass
+            if restored_state is None:
+                raise RuntimeError(f"Checkpoint {resume_from} did not contain generator state.")
+            gen_state = _with_vq_default(restored_state)
+            _ensure_replicated_state()
+            _log(f"[resume] Restored from {resume_from} (step={_state_step_as_int(gen_state)})")
+            _maybe_log_gpu_memory(_log, "after_resume")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to restore checkpoint from {resume_from}") from exc
 
     if os.environ.get("VQGAN_WARMUP_COMPILE", "1") != "0":
         _log("[warmup] Compiling training step variants on dummy batch; this may take a couple of minutes on first run.")

@@ -4,4 +4,6 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-exec python3 -m valid.run_validation "$@"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+exec "$PYTHON_BIN" -m valid.run_validation "$@"
