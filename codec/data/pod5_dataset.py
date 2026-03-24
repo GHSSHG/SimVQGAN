@@ -45,14 +45,27 @@ def _iter_full_chunks(signal: np.ndarray, chunk_size: int) -> Iterator[np.ndarra
         yield row
 
 
-def _iter_sliding_chunks(signal: np.ndarray, chunk_size: int, hop_size: int) -> Iterator[np.ndarray]:
+def _iter_sliding_chunks(
+    signal: np.ndarray,
+    chunk_size: int,
+    hop_size: int,
+    tail_chunk_mode: str = "shift_last",
+) -> Iterator[np.ndarray]:
+    mode = str(tail_chunk_mode).strip().lower() or "shift_last"
+    if mode not in {"drop", "shift_last"}:
+        raise ValueError(f"Unsupported tail_chunk_mode={tail_chunk_mode!r}; choose from ['drop', 'shift_last']")
     n = int(signal.shape[0])
     if n <= 0 or chunk_size <= 0 or hop_size <= 0:
         return
     if n < chunk_size:
         return
     last_start = n - chunk_size
-    for start in range(0, last_start + 1, hop_size):
+    starts = list(range(0, last_start + 1, hop_size))
+    if not starts:
+        starts = [0]
+    if mode == "shift_last" and starts[-1] != last_start:
+        starts.append(last_start)
+    for start in starts:
         stop = start + chunk_size
         yield signal[start:stop]
 
@@ -84,6 +97,7 @@ class NanoporeSignalDataset:
     window_ms: int = 1000
     window_samples: Optional[int] = None
     window_hop_samples: Optional[int] = None
+    tail_chunk_mode: str = "shift_last"
     sample_rate_hz_default: Optional[float] = None
     return_metadata: bool = False
     read_ids_per_file: Optional[Dict[Path, Sequence[str]]] = None
@@ -100,6 +114,7 @@ class NanoporeSignalDataset:
         window_ms: int = 1000,
         window_samples: Optional[int] = None,
         window_hop_samples: Optional[int] = None,
+        tail_chunk_mode: str = "shift_last",
         sample_rate_hz_default: Optional[float] = None,
         return_metadata: bool = False,
         read_ids_per_file: Optional[Dict[Union[str, Path], Sequence[str]]] = None,
@@ -125,11 +140,17 @@ class NanoporeSignalDataset:
             hs = int(window_hop_samples)
             if hs > 0:
                 window_hop_samples_int = hs
+        tail_chunk_mode_text = str(tail_chunk_mode).strip().lower() or "shift_last"
+        if tail_chunk_mode_text not in {"drop", "shift_last"}:
+            raise ValueError(
+                f"Unsupported tail_chunk_mode={tail_chunk_mode!r}; choose from ['drop', 'shift_last']"
+            )
         return cls(
             pod5_files=paths,
             window_ms=int(window_ms),
             window_samples=window_samples_int,
             window_hop_samples=window_hop_samples_int,
+            tail_chunk_mode=tail_chunk_mode_text,
             sample_rate_hz_default=sample_rate_hz_default,
             return_metadata=bool(return_metadata),
             read_ids_per_file=rid_map,
@@ -218,6 +239,7 @@ class NanoporeSignalDataset:
                             pa_signal,
                             chunk_size=chunk_size,
                             hop_size=chunk_hop,
+                            tail_chunk_mode=self.tail_chunk_mode,
                         ):
                             arr, stats = _normalize_chunk_signal(chunk)
                             arr = np.asarray(arr, dtype=np.float32)

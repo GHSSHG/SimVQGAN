@@ -135,7 +135,8 @@
         "FC01/pod5"
       ],
       "segment_samples": 12288,
-      "segment_hop_samples": 11688
+      "segment_hop_samples": 11688,
+      "tail_chunk_mode": "shift_last"
     },
     "valid": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",

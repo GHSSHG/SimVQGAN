@@ -201,6 +201,7 @@ def _clone_dataset_with_metadata(ds: NanoporeSignalDataset) -> NanoporeSignalDat
         window_ms=ds.window_ms,
         window_samples=ds.window_samples,
         window_hop_samples=ds.window_hop_samples,
+        tail_chunk_mode=ds.tail_chunk_mode,
         sample_rate_hz_default=ds.sample_rate_hz_default,
         return_metadata=True,
         read_ids_per_file=ds.read_ids_per_file,

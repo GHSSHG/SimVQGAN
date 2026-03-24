@@ -205,11 +205,13 @@ def _build_dataset(
         cfg.get("loader_prefetch_chunks", cfg.get("loader_prefetch") or 128)
     )
     return_metadata = bool(cfg.get("return_metadata", False))
+    tail_chunk_mode = str(cfg.get("tail_chunk_mode", "shift_last")).strip().lower() or "shift_last"
     return NanoporeSignalDataset.from_paths(
         files,
         window_ms=window_ms,
         window_samples=window_samples,
         window_hop_samples=window_hop_samples,
+        tail_chunk_mode=tail_chunk_mode,
         sample_rate_hz_default=sample_rate,
         return_metadata=return_metadata,
         loader_workers=loader_workers,
@@ -518,6 +520,7 @@ def main() -> None:
             "segment_sec": float(data_cfg.get("segment_sec", 1.0)),
             "segment_samples": data_cfg.get("segment_samples"),
             "segment_hop_samples": data_cfg.get("segment_hop_samples"),
+            "tail_chunk_mode": str(data_cfg.get("tail_chunk_mode", "shift_last")).strip().lower() or "shift_last",
             "sample_rate": float(data_cfg.get("sample_rate", 5000.0)),
             "loader_workers": max(1, default_loader_workers),
             "loader_prefetch_chunks": max(1, default_loader_prefetch),
@@ -527,18 +530,19 @@ def main() -> None:
             base_data_cfg["loader_workers"] = max(1, int(args.loader_workers))
         if args.loader_prefetch is not None:
             base_data_cfg["loader_prefetch_chunks"] = max(1, int(args.loader_prefetch))
+        train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
+        train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         print(
             "[setup] devices="
             f"{local_devices} (reference={reference_devices}), "
             f"effective_devices={scale_devices}, "
             f"batch_size={batch_size}, "
-            f"loader_workers={base_data_cfg['loader_workers']}, "
-            f"loader_prefetch_chunks={base_data_cfg['loader_prefetch_chunks']}, "
+            f"tail_chunk_mode={str(train_spec.get('tail_chunk_mode', 'shift_last'))}, "
+            f"loader_workers={train_spec['loader_workers']}, "
+            f"loader_prefetch_chunks={train_spec['loader_prefetch_chunks']}, "
             f"host_prefetch_size={host_prefetch_size}, "
             f"device_prefetch_size={device_prefetch_size}"
         )
-        train_spec = _merge_split_cfg(base_data_cfg, data_cfg.get("train"))
-        train_spec["root"] = _resolve_data_path(train_spec.get("root"), cfg_dir)
         ds, _ = _prepare_split_dataset(split_cfg=train_spec)
 
         eval_enabled = bool(eval_cfg.get("enabled", False))
@@ -689,6 +693,7 @@ def main() -> None:
         "root": str(root),
         "subdirs": subdirs or ["."],
         "segment_sec": float(args.segment_sec),
+        "tail_chunk_mode": "shift_last",
         "sample_rate": float(args.sample_rate),
         "loader_workers": legacy_loader_workers,
         "loader_prefetch_chunks": legacy_loader_prefetch,
