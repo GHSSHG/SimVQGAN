@@ -41,6 +41,17 @@ def _semantic_token_cosine_loss(y: jnp.ndarray, y_hat: jnp.ndarray) -> jnp.ndarr
     return jnp.mean(1.0 - cosine)
 
 
+def _probability_kl_loss(y_probs: jnp.ndarray, y_hat_probs: jnp.ndarray, *, eps: float = 1e-6) -> jnp.ndarray:
+    y_probs = jnp.asarray(y_probs, dtype=jnp.float32)
+    y_hat_probs = jnp.asarray(y_hat_probs, dtype=jnp.float32)
+    eps_arr = jnp.asarray(eps, dtype=jnp.float32)
+    y_probs = y_probs / jnp.maximum(jnp.sum(y_probs, axis=-1, keepdims=True), eps_arr)
+    y_hat_probs = y_hat_probs / jnp.maximum(jnp.sum(y_hat_probs, axis=-1, keepdims=True), eps_arr)
+    y_probs_safe = jnp.clip(y_probs, eps_arr, 1.0)
+    y_hat_probs_safe = jnp.clip(y_hat_probs, eps_arr, 1.0)
+    return jnp.mean(jnp.sum(y_probs_safe * (jnp.log(y_probs_safe) - jnp.log(y_hat_probs_safe)), axis=-1))
+
+
 def dorado_loss_scale(step: jnp.ndarray, state: DoradoPerceptualState) -> jnp.ndarray:
     step_f = jnp.asarray(step, dtype=jnp.float32)
     start = jnp.asarray(float(state.warmup_start), dtype=jnp.float32)
@@ -80,6 +91,8 @@ def compute_dorado_perceptual_loss(
     ):
         if layer_name.startswith("conv"):
             raw = jnp.mean(jnp.abs(_normalize_conv_feature_map(feat_y) - _normalize_conv_feature_map(feat_y_hat)))
+        elif layer_name == "crf_probs":
+            raw = _probability_kl_loss(feat_y, feat_y_hat)
         else:
             raw = _semantic_token_cosine_loss(feat_y, feat_y_hat)
         layer_weight_arr = jnp.asarray(float(layer_weight), dtype=jnp.float32)

@@ -1,7 +1,7 @@
 {
   "seed": 42,
   "train": {
-    "epochs": 3,
+    "epochs": 2,
     "batch_size": 16,
     "reference_device_count": 4,
     "per_device_batch_size": 4,
@@ -54,24 +54,22 @@
       "enabled": true,
       "model_path": "~/Download/dorado/models/dna_r10.4.1_e8.2_400bps_sup@v5.2.0",
       "layers": [
-        "conv4",
-        "conv5",
         "tx6",
         "tx12",
         "tx18",
-        "upsample"
+        "upsample",
+        "crf_probs"
       ],
       "layer_weights": {
-        "conv4": 0.1,
-        "conv5": 0.1,
-        "tx6": 0.2,
-        "tx12": 0.2,
+        "tx6": 0.15,
+        "tx12": 0.15,
         "tx18": 0.2,
-        "upsample": 0.2
+        "upsample": 0.2,
+        "crf_probs": 0.3
       },
       "loss_weight": 0.15,
       "warmup_start": 0,
-      "warmup_steps": 100000
+      "warmup_steps": 0
     }
   },
   "model": {
@@ -122,7 +120,7 @@
     "sample_rate": 5000,
     "reference_device_count": 8,
     "subdirs": [
-      "FC01/pod5"
+      "FC03/pod5"
     ],
     "loader_workers": 32,
     "loader_workers_per_device": 4,
@@ -132,7 +130,7 @@
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [
-        "FC01/pod5"
+        "FC03/pod5"
       ],
       "segment_samples": 12288,
       "segment_hop_samples": 11688,
@@ -141,7 +139,7 @@
     "valid": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [
-        "FC02/pod5"
+        "FC01/pod5"
       ],
       "segment_samples": 12288,
       "segment_hop_samples": 11688
@@ -150,14 +148,14 @@
   },
   "checkpoint": {
     "root_dir": "checkpoints",
-    "resume_from": null
+    "resume_from": "checkpoints/V4.5.3/periodic/checkpoint_1220000"
   },
   "logging": {
     "wandb": {
       "enabled": true,
       "project": "simvq-local",
-      "run_name": "V4.5",
-      "api_key": "2cdf3f560280d95e52c84f09e48885bd40afc155"
+      "run_name": "V4.5 High",
+      "api_key": null
     }
   },
   "optim": {

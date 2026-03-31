@@ -53,9 +53,16 @@ class DoradoPerceptualState:
     transformer_deepnorm_beta: float = struct.field(pytree_node=False)
     upsample_scale_factor: int = struct.field(pytree_node=False)
     include_upsample: bool = struct.field(pytree_node=False)
+    include_crf: bool = struct.field(pytree_node=False)
+    crf_n_base: int = struct.field(pytree_node=False)
+    crf_scale: float | None = struct.field(pytree_node=False)
+    crf_blank_score: float | None = struct.field(pytree_node=False)
+    crf_expand_blanks: bool = struct.field(pytree_node=False)
+    crf_permute: tuple[int, ...] | None = struct.field(pytree_node=False)
     transformer_layers: tuple[DoradoTransformerLayerState, ...] = struct.field(default_factory=tuple)
     upsample_kernel: jnp.ndarray | None = None
     upsample_bias: jnp.ndarray | None = None
+    crf_kernel: jnp.ndarray | None = None
 
 
 def _shape_from_tensor_pickle(pickle_bytes: bytes) -> tuple[int, ...]:
@@ -104,7 +111,7 @@ def _load_model_cfg(model_path: Path) -> dict:
 
 def _normalize_layer_name(name: str) -> str:
     raw = str(name).strip().lower()
-    if raw == "upsample":
+    if raw in {"upsample", "crf_probs"}:
         return raw
     if raw.startswith("conv"):
         prefix = "conv"
@@ -203,6 +210,7 @@ def load_dorado_perceptual_state(
     valid_layers = {f"conv{idx + 1}" for idx in range(len(conv_sublayers))}
     valid_layers.update(f"tx{idx + 1}" for idx in range(transformer_depth))
     valid_layers.add("upsample")
+    valid_layers.add("crf_probs")
     unknown_layers = sorted(set(requested_layers) - valid_layers)
     if unknown_layers:
         raise ValueError(f"Unknown Dorado perceptual layers: {unknown_layers}")
@@ -210,7 +218,9 @@ def load_dorado_perceptual_state(
     conv_indices = tuple(int(layer[4:]) - 1 for layer in requested_layers if layer.startswith("conv"))
     transformer_indices = tuple(int(layer[2:]) - 1 for layer in requested_layers if layer.startswith("tx"))
     include_upsample = "upsample" in requested_layers
-    needs_transformer = bool(transformer_indices) or include_upsample
+    include_crf = "crf_probs" in requested_layers
+    needs_upsample = include_upsample or include_crf
+    needs_transformer = bool(transformer_indices) or needs_upsample
 
     max_conv_idx = max(conv_indices, default=-1)
     if needs_transformer:
@@ -244,7 +254,7 @@ def load_dorado_perceptual_state(
     transformer_deepnorm_beta = float(transformer_layer_cfg.get("deepnorm_beta", 0.2886751))
 
     max_transformer_idx = max(transformer_indices, default=-1)
-    if include_upsample:
+    if needs_upsample:
         max_transformer_idx = max(max_transformer_idx, transformer_depth - 1)
 
     transformer_layers: list[DoradoTransformerLayerState] = []
@@ -275,11 +285,27 @@ def load_dorado_perceptual_state(
     upsample_scale_factor = int(upsample_cfg.get("scale_factor", 2))
     upsample_kernel = None
     upsample_bias = None
-    if include_upsample:
+    if needs_upsample:
         upsample_weight = _load_dorado_tensor(model_dir / "upsample.linear.weight.tensor")
         upsample_bias_arr = _load_dorado_tensor(model_dir / "upsample.linear.bias.tensor")
         upsample_kernel = jnp.asarray(np.transpose(upsample_weight, (1, 0)), dtype=jnp.float32)
         upsample_bias = jnp.asarray(upsample_bias_arr, dtype=jnp.float32)
+
+    crf_cfg = dict(encoder_cfg.get("crf") or {})
+    crf_kernel = None
+    crf_n_base = int(crf_cfg.get("n_base", 4))
+    crf_scale_raw = crf_cfg.get("scale")
+    crf_scale = None if crf_scale_raw is None else float(crf_scale_raw)
+    crf_blank_raw = crf_cfg.get("blank_score")
+    crf_blank_score = None if crf_blank_raw is None else float(crf_blank_raw)
+    crf_expand_blanks = bool(crf_cfg.get("expand_blanks", True))
+    crf_permute_raw = crf_cfg.get("permute")
+    crf_permute = None if crf_permute_raw in (None, ()) else tuple(int(v) for v in crf_permute_raw)
+    if include_crf:
+        if not crf_cfg:
+            raise ValueError("Dorado CRF perceptual loss expects encoder.crf config in config.toml.")
+        crf_weight = _load_dorado_tensor(model_dir / "crf.linear.weight.tensor")
+        crf_kernel = jnp.asarray(np.transpose(crf_weight, (1, 0)), dtype=jnp.float32)
 
     return DoradoPerceptualState(
         conv_kernels=tuple(conv_kernels),
@@ -307,7 +333,14 @@ def load_dorado_perceptual_state(
         transformer_use_rope=transformer_use_rope,
         transformer_deepnorm_beta=transformer_deepnorm_beta,
         upsample_scale_factor=max(1, upsample_scale_factor),
-        include_upsample=include_upsample,
+        include_upsample=needs_upsample,
+        include_crf=include_crf,
+        crf_n_base=max(1, crf_n_base),
+        crf_scale=crf_scale,
+        crf_blank_score=crf_blank_score,
+        crf_expand_blanks=crf_expand_blanks,
+        crf_permute=crf_permute,
+        crf_kernel=crf_kernel,
     )
 
 
@@ -376,6 +409,44 @@ def _apply_linear_upsample(x: jnp.ndarray, state: DoradoPerceptualState) -> jnp.
     return y.reshape(batch, seq_len * scale, state.transformer_dim)
 
 
+def _inverse_permutation(axes: tuple[int, ...]) -> tuple[int, ...]:
+    inverse = [0] * len(axes)
+    for idx, axis in enumerate(axes):
+        inverse[int(axis)] = idx
+    return tuple(inverse)
+
+
+def _apply_crf_encoder(x: jnp.ndarray, state: DoradoPerceptualState) -> jnp.ndarray:
+    if state.crf_kernel is None:
+        raise ValueError("Dorado CRF weights are missing from the perceptual state.")
+    scores = x
+    restore_axes = None
+    if state.crf_permute is not None:
+        if len(state.crf_permute) != scores.ndim:
+            raise ValueError(f"Expected CRF permute of length {scores.ndim}, got {state.crf_permute}")
+        scores = jnp.transpose(scores, state.crf_permute)
+        restore_axes = _inverse_permutation(state.crf_permute)
+    scores = jnp.matmul(scores, state.crf_kernel)
+    if state.crf_scale is not None:
+        scores = scores * jnp.asarray(state.crf_scale, dtype=scores.dtype)
+    if state.crf_blank_score is not None and state.crf_expand_blanks:
+        num_classes = int(scores.shape[-1])
+        if num_classes % int(state.crf_n_base) != 0:
+            raise ValueError(
+                f"Dorado CRF logits dim {num_classes} must be divisible by n_base={state.crf_n_base}."
+            )
+        scores = scores.reshape(scores.shape[:-1] + (num_classes // int(state.crf_n_base), int(state.crf_n_base)))
+        blanks = jnp.full(scores.shape[:-1] + (1,), jnp.asarray(state.crf_blank_score, dtype=scores.dtype))
+        scores = jnp.concatenate((blanks, scores), axis=-1).reshape(scores.shape[:-2] + (-1,))
+    if restore_axes is not None:
+        scores = jnp.transpose(scores, restore_axes)
+    return scores
+
+
+def _crf_scores_to_probs(scores: jnp.ndarray) -> jnp.ndarray:
+    return jax.nn.softmax(jnp.asarray(scores, dtype=jnp.float32), axis=-1)
+
+
 def extract_dorado_features(x: jnp.ndarray, state: DoradoPerceptualState) -> tuple[jnp.ndarray, ...]:
     h = _ensure_batch_time_channel(x)
     requested = set(state.layer_names)
@@ -397,8 +468,17 @@ def extract_dorado_features(x: jnp.ndarray, state: DoradoPerceptualState) -> tup
             if layer_name in requested:
                 feature_map[layer_name] = h
 
+    upsample_h = None
     if state.include_upsample:
-        feature_map["upsample"] = _apply_linear_upsample(h, state)
+        upsample_h = _apply_linear_upsample(h, state)
+        if "upsample" in requested:
+            feature_map["upsample"] = upsample_h
+    if state.include_crf:
+        if upsample_h is None:
+            raise ValueError("CRF feature extraction requires Dorado upsample activations.")
+        crf_scores = _apply_crf_encoder(upsample_h, state)
+        if "crf_probs" in requested:
+            feature_map["crf_probs"] = _crf_scores_to_probs(crf_scores)
 
     return tuple(feature_map[layer_name] for layer_name in state.layer_names)
 
