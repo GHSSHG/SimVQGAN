@@ -97,7 +97,7 @@
     "post_quant_transformer_layers": 2,
     "transformer_heads": 4,
     "transformer_mlp_ratio": 4.0,
-    "transformer_dropout": 0.1,
+    "transformer_dropout": 0.0,
     "transformer_ffn_activation": "swiglu",
     "transformer_attention_backend": "jax_cudnn",
     "transformer_use_rope": true,

@@ -229,13 +229,15 @@ class TransformerBlock1D(nn.Module):
             use_rope=bool(self.use_rope),
             rope_base=float(self.rope_base),
         )
-
         self.norm1 = nn.LayerNorm(dtype=self.dtype, param_dtype=self.param_dtype, name="norm1")
         self.attn = nn.SelfAttention(
             num_heads=self.num_heads,
             qkv_features=self.dim,
             out_features=self.dim,
-            dropout_rate=float(self.dropout),
+            # Keep attention-kernel dropout disabled. Swin/local blocks already
+            # use output/residual dropout only, and this avoids instability in
+            # the fused global-attention backward path on multi-GPU runs.
+            dropout_rate=0.0,
             attention_fn=attention_fn,
             dtype=self.dtype,
             param_dtype=self.param_dtype,
@@ -262,7 +264,6 @@ class TransformerBlock1D(nn.Module):
             raise ValueError(f"TransformerBlock1D expects (B,T,C), got {x.shape}")
         if x.shape[-1] != self.dim:
             raise ValueError(f"Input dim {x.shape[-1]} != block dim {self.dim}")
-
         deterministic = (not train) or (self.dropout <= 0.0)
         attn_rng = ffn_rng = resid1_rng = resid2_rng = None
         if train and self.dropout > 0.0:
@@ -442,7 +443,6 @@ class LocalTransformerBlock1D(nn.Module):
             raise ValueError(f"LocalTransformerBlock1D expects (B,T,C), got {x.shape}")
         if x.shape[-1] != self.dim:
             raise ValueError(f"Input dim {x.shape[-1]} != block dim {self.dim}")
-
         ffn_rng = resid1_rng = resid2_rng = None
         if train and self.dropout > 0.0:
             if rng is None:
@@ -646,7 +646,6 @@ class SwinTransformerBlock1D(nn.Module):
             raise ValueError(f"SwinTransformerBlock1D expects (B,T,C), got {x.shape}")
         if x.shape[-1] != self.dim:
             raise ValueError(f"Input dim {x.shape[-1]} != block dim {self.dim}")
-
         attn_rng = ffn_rng = resid1_rng = resid2_rng = None
         if train and self.dropout > 0.0:
             if rng is None:

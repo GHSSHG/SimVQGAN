@@ -50,14 +50,6 @@ _SIMVQ_KEY_MAPPING = {
     "log_q_z_dist": "log_q_z_dist",
     "perplexity": "codebook_perplexity",
     "code_usage": "codebook_util",
-    "grad_absmax": "grad_absmax",
-    "grad_nonfinite_count": "grad_nonfinite_count",
-    "grad_update_skipped": "grad_update_skipped",
-    "params_absmax": "params_absmax",
-    "params_nonfinite_count": "params_nonfinite_count",
-    "params_absmax_spread": "params_absmax_spread",
-    "state_resynced": "state_resynced",
-    "state_resync_source": "state_resync_source",
 }
 
 _SPARSE_STEP_LOG_KEYS = frozenset({"perplexity", "code_usage"})
@@ -95,313 +87,14 @@ def _logs_to_float_dict(logs: Dict[str, Any]) -> Dict[str, float]:
     return floats
 
 
-def _first_nonfinite_log(logs: Dict[str, Any]) -> tuple[str, np.ndarray] | None:
-    for key, value in logs.items():
-        arr = np.asarray(jax.device_get(value))
-        if not np.isfinite(arr).all():
-            return key, arr
-    return None
+def _host_broadcast_tree_for_pmap(tree, replica_count: int):
+    host_tree = jax.device_get(tree)
 
-
-def _summarize_batch_for_error(batch: Any) -> str:
-    parts: list[str] = []
-
-    def _append_summary(name: str, value: Any) -> None:
-        arr = np.asarray(jax.device_get(value))
-        parts.append(f"{name}_shape={arr.shape}")
-        finite_mask = np.isfinite(arr)
-        parts.append(f"{name}_finite={bool(finite_mask.all())}")
-        if finite_mask.any():
-            safe = arr[finite_mask]
-            parts.append(f"{name}_min={float(safe.min()):.6g}")
-            parts.append(f"{name}_max={float(safe.max()):.6g}")
-        if arr.ndim >= 2:
-            leading = int(arr.shape[0])
-            flat = arr.reshape((leading, -1))
-            flat_finite = np.isfinite(flat)
-            if flat_finite.any():
-                per_min = []
-                per_max = []
-                for idx in range(leading):
-                    if flat_finite[idx].any():
-                        safe_row = flat[idx][flat_finite[idx]]
-                        per_min.append(f"{float(safe_row.min()):.6g}")
-                        per_max.append(f"{float(safe_row.max()):.6g}")
-                    else:
-                        per_min.append("nan")
-                        per_max.append("nan")
-                parts.append(f"{name}_leading_min=[{', '.join(per_min)}]")
-                parts.append(f"{name}_leading_max=[{', '.join(per_max)}]")
-
-    if isinstance(batch, dict):
-        for key in ("signal", "pa_center", "pa_half_range"):
-            if key in batch:
-                _append_summary(key, batch[key])
-    else:
-        _append_summary("signal", batch)
-    return ", ".join(parts)
-
-
-def _raise_on_nonfinite_logs(step_idx: int, logs: Dict[str, Any], batch: Any) -> None:
-    bad = _first_nonfinite_log(logs)
-    if bad is None:
-        return
-    key, arr = bad
-    sample = np.asarray(arr).reshape(-1)[:8]
-    batch_summary = _summarize_batch_for_error(batch)
-    raise FloatingPointError(
-        f"Non-finite training log detected at step={step_idx}: key={key}, "
-        f"sample={sample.tolist()}, batch=({batch_summary})"
-    )
-
-
-def _tree_absmax(tree) -> jnp.ndarray:
-    absmax = jnp.asarray(0.0, dtype=jnp.float32)
-    for leaf in jax.tree_util.tree_leaves(tree):
-        arr = jnp.asarray(leaf, dtype=jnp.float32)
-        finite = jnp.isfinite(arr)
-        safe = jnp.where(finite, arr, 0.0)
-        absmax = jnp.maximum(absmax, jnp.max(jnp.abs(safe)))
-    return absmax
-
-
-def _tree_nonfinite_count(tree) -> jnp.ndarray:
-    count = jnp.asarray(0, dtype=jnp.int32)
-    for leaf in jax.tree_util.tree_leaves(tree):
-        arr = jnp.asarray(leaf)
-        count = count + jnp.sum(jnp.logical_not(jnp.isfinite(arr))).astype(jnp.int32)
-    return count
-
-
-def _zero_nonfinite_tree(tree):
-    return jax.tree_util.tree_map(
-        lambda x: jnp.where(jnp.isfinite(x), x, jnp.zeros_like(x)),
-        tree,
-    )
-
-
-def _zero_tree_like(tree):
-    return jax.tree_util.tree_map(jnp.zeros_like, tree)
-
-
-def _broadcast_tree_from_replica(tree, axis_name: str, source_replica: jnp.ndarray):
     def _broadcast_leaf(x):
-        gathered = jax.lax.all_gather(x, axis_name)
-        return jax.lax.dynamic_index_in_dim(gathered, source_replica, axis=0, keepdims=False)
+        arr = np.asarray(x)
+        return np.broadcast_to(arr, (replica_count,) + arr.shape).copy()
 
-    return jax.tree_util.tree_map(_broadcast_leaf, tree)
-
-
-def _resync_generator_state_from_replica(gen_state, *, axis_name: str, source_replica: jnp.ndarray):
-    return gen_state.replace(
-        step=_broadcast_tree_from_replica(gen_state.step, axis_name, source_replica),
-        params=_broadcast_tree_from_replica(gen_state.params, axis_name, source_replica),
-        opt_state=_broadcast_tree_from_replica(gen_state.opt_state, axis_name, source_replica),
-        vq_vars=(
-            None
-            if gen_state.vq_vars is None
-            else _broadcast_tree_from_replica(gen_state.vq_vars, axis_name, source_replica)
-        ),
-    )
-
-
-def _extract_host_params_from_state(state: Any):
-    params = getattr(state, "params", None)
-    if params is None:
-        return None
-    return jax.device_get(params)
-
-
-def _extract_host_param_replicas_from_state(state: Any) -> list[Any]:
-    params = getattr(state, "params", None)
-    if params is None:
-        return []
-    leaves = jax.tree_util.tree_leaves(params)
-    if not leaves:
-        return []
-    first = leaves[0]
-    if getattr(first, "ndim", 0) <= 0:
-        return [jax.device_get(params)]
-    replica_count = int(first.shape[0])
-    host_params = jax.device_get(params)
-    replicas: list[Any] = []
-    for replica_idx in range(replica_count):
-        replicas.append(jax.tree_util.tree_map(lambda x, idx=replica_idx: x[idx], host_params))
-    return replicas
-
-
-def _iter_tree_leaves_with_paths(tree: Any):
-    from collections.abc import Mapping
-    from flax.core import FrozenDict, unfreeze
-    from flax.traverse_util import flatten_dict
-
-    if isinstance(tree, FrozenDict):
-        tree = unfreeze(tree)
-    if isinstance(tree, Mapping):
-        for path, leaf in flatten_dict(tree).items():
-            yield "/".join(str(part) for part in path), np.asarray(leaf)
-        return
-
-    flattened, _ = jax.tree_util.tree_flatten_with_path(tree)
-    for path, leaf in flattened:
-        arr = np.asarray(jax.device_get(leaf))
-        parts: list[str] = []
-        for entry in path:
-            key = getattr(entry, "key", None)
-            idx = getattr(entry, "idx", None)
-            name = getattr(entry, "name", None)
-            if key is not None:
-                parts.append(str(key))
-            elif idx is not None:
-                parts.append(str(idx))
-            elif name is not None:
-                parts.append(str(name))
-            else:
-                parts.append(str(entry))
-        yield "/".join(parts), arr
-
-
-def _first_nonfinite_tree_path(tree: Any) -> tuple[str, np.ndarray] | None:
-    for path, arr in _iter_tree_leaves_with_paths(tree):
-        if np.isfinite(arr).all():
-            continue
-        return path, arr
-    return None
-
-
-def _largest_abs_tree_path(tree: Any) -> tuple[str, float, np.ndarray] | None:
-    best_path: str | None = None
-    best_abs = -1.0
-    best_arr: np.ndarray | None = None
-    for path, arr in _iter_tree_leaves_with_paths(tree):
-        finite = np.isfinite(arr)
-        if finite.any():
-            local_abs = float(np.max(np.abs(arr[finite])))
-        else:
-            local_abs = float("inf")
-        if local_abs > best_abs:
-            best_path = path
-            best_abs = local_abs
-            best_arr = arr
-    if best_path is None or best_arr is None:
-        return None
-    return best_path, best_abs, best_arr
-
-
-def _raise_on_large_params(step_idx: int, state: Any, logs: Dict[str, Any], *, threshold: float = 1e8) -> None:
-    absmax = _value_to_float(logs.get("params_absmax"))
-    if absmax is None or not np.isfinite(absmax) or absmax < float(threshold):
-        return
-    replicas = _extract_host_param_replicas_from_state(state)
-    best_replica_idx = -1
-    best_path = None
-    best_leaf_absmax = -1.0
-    best_arr = None
-    for replica_idx, params in enumerate(replicas):
-        largest = _largest_abs_tree_path(params)
-        if largest is None:
-            continue
-        path, leaf_absmax, arr = largest
-        if leaf_absmax > best_leaf_absmax:
-            best_replica_idx = replica_idx
-            best_path = path
-            best_leaf_absmax = leaf_absmax
-            best_arr = arr
-    if best_path is None or best_arr is None:
-        raise FloatingPointError(
-            f"Parameter blow-up detected at step={step_idx}: params_absmax={absmax:.6g}"
-        )
-    sample = np.asarray(best_arr).reshape(-1)[:8]
-    raise FloatingPointError(
-        f"Parameter blow-up detected at step={step_idx}: params_absmax={absmax:.6g}, "
-        f"replica={best_replica_idx}, path={best_path}, leaf_absmax={best_leaf_absmax:.6g}, "
-        f"sample={sample.tolist()}"
-    )
-
-
-def _raise_on_nonfinite_params(step_idx: int, state: Any, logs: Dict[str, Any]) -> None:
-    count = _value_to_float(logs.get("params_nonfinite_count"))
-    if count is None or count <= 0.0:
-        return
-    replicas = _extract_host_param_replicas_from_state(state)
-    for replica_idx, params in enumerate(replicas):
-        bad = _first_nonfinite_tree_path(params)
-        if bad is not None:
-            path, arr = bad
-            sample = np.asarray(arr).reshape(-1)[:8]
-            raise FloatingPointError(
-                f"Non-finite params detected at step={step_idx}: replica={replica_idx}, "
-                f"path={path}, sample={sample.tolist()}"
-            )
-    if replicas:
-        best_replica_idx = -1
-        best_path = None
-        best_leaf_absmax = -1.0
-        best_arr = None
-        for replica_idx, params in enumerate(replicas):
-            largest = _largest_abs_tree_path(params)
-            if largest is None:
-                continue
-            path, leaf_absmax, arr = largest
-            if leaf_absmax > best_leaf_absmax:
-                best_replica_idx = replica_idx
-                best_path = path
-                best_leaf_absmax = leaf_absmax
-                best_arr = arr
-        if best_path is not None and best_arr is not None:
-            sample = np.asarray(best_arr).reshape(-1)[:8]
-            raise FloatingPointError(
-                f"Non-finite params detected at step={step_idx}, but the offending leaf could not be located. "
-                f"Largest finite leaf: replica={best_replica_idx}, path={best_path}, "
-                f"leaf_absmax={best_leaf_absmax:.6g}, sample={sample.tolist()}"
-            )
-        raise FloatingPointError(
-            f"Non-finite params detected at step={step_idx}, but the offending leaf could not be located."
-        )
-
-
-def _maybe_log_gpu_memory(log_fn, phase: str) -> None:
-    try:
-        proc = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,memory.used,memory.total",
-                "--format=csv,noheader,nounits",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=2.0,
-            check=False,
-        )
-        if proc.returncode != 0:
-            return
-        rows: list[tuple[int, float, float]] = []
-        for line in proc.stdout.splitlines():
-            parts = [p.strip() for p in line.split(",")]
-            if len(parts) != 3:
-                continue
-            try:
-                idx = int(parts[0])
-                used = float(parts[1])
-                total = float(parts[2])
-            except ValueError:
-                continue
-            rows.append((idx, used, total))
-        if not rows:
-            return
-        rows.sort(key=lambda x: x[0])
-        used_vals = [r[1] for r in rows]
-        median_used = float(np.median(np.asarray(used_vals, dtype=np.float64)))
-        gpu0_used = next((used for idx, used, _ in rows if idx == 0), rows[0][1])
-        delta_gpu0 = gpu0_used - median_used
-        summary = ", ".join(f"gpu{idx}:{used:.0f}/{total:.0f}MiB" for idx, used, total in rows)
-        log_fn(
-            f"[gpu_mem {phase}] {summary} | median_used={median_used:.0f}MiB "
-            f"gpu0_minus_median={delta_gpu0:.0f}MiB"
-        )
-    except Exception:
-        return
+    return jax.tree_util.tree_map(_broadcast_leaf, host_tree)
 
 
 def _resolve_dtype(dtype_value: Any, *, fallback: Any = jnp.float32) -> Any:
@@ -790,7 +483,7 @@ def train_model_from_pod5(
         if not data_parallel:
             return
         if not _is_replicated_state(gen_state):
-            gen_state = flax_jax_utils.replicate(gen_state)
+            gen_state = _host_broadcast_tree_for_pmap(gen_state, ndev)
 
     def _state_step_as_int(state: Any) -> int:
         step = getattr(state, "step", 0)
@@ -802,7 +495,6 @@ def train_model_from_pod5(
         gen_state = jax.device_get(gen_state)
 
     _ensure_replicated_state()
-    _maybe_log_gpu_memory(_log, "after_state_init")
 
     best_eval_metric: float | None = None
     best_eval_step: int | None = None
@@ -1077,55 +769,9 @@ def train_model_from_pod5(
                 dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=False,
             )
-            grad_nonfinite_count = _tree_nonfinite_count(g_grads)
-            grad_absmax = _tree_absmax(g_grads)
-            any_nonfinite = jax.lax.pmax((grad_nonfinite_count > 0).astype(jnp.int32), "data")
-            total_nonfinite = jax.lax.psum(grad_nonfinite_count, "data")
-            g_grads = _zero_nonfinite_tree(g_grads)
-            g_grads = jax.tree_util.tree_map(
-                lambda x: jnp.where(any_nonfinite > 0, jnp.zeros_like(x), x),
-                g_grads,
-            )
             g_grads = jax.tree_util.tree_map(lambda x: jax.lax.pmean(x, "data"), g_grads)
             reduced_logs = {k: jax.lax.pmean(v, "data") for k, v in logs.items()}
-            reduced_logs["grad_absmax"] = jax.lax.pmax(grad_absmax, "data")
-            reduced_logs["grad_nonfinite_count"] = total_nonfinite.astype(reduced_logs["total_loss"].dtype)
-            reduced_logs["grad_update_skipped"] = any_nonfinite.astype(reduced_logs["total_loss"].dtype)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            params_nonfinite_count = _tree_nonfinite_count(gen_state.params)
-            params_absmax = _tree_absmax(gen_state.params)
-            params_absmax_max = jax.lax.pmax(params_absmax, "data")
-            params_absmax_min = jax.lax.pmin(params_absmax, "data")
-            params_absmax_spread = params_absmax_max - params_absmax_min
-            any_params_nonfinite = jax.lax.pmax((params_nonfinite_count > 0).astype(jnp.int32), "data")
-            gathered_absmax = jax.lax.all_gather(params_absmax, "data")
-            gathered_nonfinite = jax.lax.all_gather(params_nonfinite_count, "data")
-            finite_mask = gathered_nonfinite == 0
-            inf_absmax = jnp.asarray(jnp.inf, dtype=params_absmax.dtype)
-            sortable_absmax = jnp.where(finite_mask, gathered_absmax, inf_absmax)
-            sorted_absmax = jnp.sort(sortable_absmax, axis=0)
-            finite_count = jnp.sum(finite_mask.astype(jnp.int32), axis=0)
-            target_pos = jnp.maximum(finite_count - 1, 0) // 2
-            target_absmax = jax.lax.dynamic_index_in_dim(sorted_absmax, target_pos, axis=0, keepdims=False)
-            deviation = jnp.where(finite_mask, jnp.abs(gathered_absmax - target_absmax), inf_absmax)
-            source_replica = jnp.argmin(deviation, axis=0).astype(jnp.int32)
-            source_replica = jnp.where(finite_count > 0, source_replica, jnp.asarray(0, dtype=jnp.int32))
-            need_resync = jnp.logical_or(any_params_nonfinite > 0, params_absmax_spread > jnp.asarray(1e-5, dtype=params_absmax.dtype))
-            gen_state = jax.lax.cond(
-                need_resync,
-                lambda state: _resync_generator_state_from_replica(state, axis_name="data", source_replica=source_replica),
-                lambda state: state,
-                gen_state,
-            )
-            params_nonfinite_count = _tree_nonfinite_count(gen_state.params)
-            params_absmax = _tree_absmax(gen_state.params)
-            reduced_logs["params_absmax"] = jax.lax.pmax(params_absmax, "data")
-            reduced_logs["params_nonfinite_count"] = jax.lax.psum(params_nonfinite_count, "data").astype(
-                reduced_logs["total_loss"].dtype
-            )
-            reduced_logs["params_absmax_spread"] = params_absmax_spread.astype(reduced_logs["total_loss"].dtype)
-            reduced_logs["state_resynced"] = need_resync.astype(reduced_logs["total_loss"].dtype)
-            reduced_logs["state_resync_source"] = source_replica.astype(reduced_logs["total_loss"].dtype)
             return gen_state, reduced_logs
 
         @partial(jax.pmap, axis_name="data", in_axes=(0, 0, 0), out_axes=0)
@@ -1155,27 +801,8 @@ def train_model_from_pod5(
                 dorado_perceptual_state=dorado_state,
                 collect_codebook_stats=False,
             )
-            grad_nonfinite_count = _tree_nonfinite_count(g_grads)
-            grad_absmax = _tree_absmax(g_grads)
-            has_nonfinite = grad_nonfinite_count > 0
-            g_grads = _zero_nonfinite_tree(g_grads)
-            g_grads = jax.tree_util.tree_map(
-                lambda x: jnp.where(has_nonfinite, jnp.zeros_like(x), x),
-                g_grads,
-            )
-            logs = dict(logs)
-            logs["grad_absmax"] = jnp.asarray(grad_absmax, dtype=logs["total_loss"].dtype)
-            logs["grad_nonfinite_count"] = jnp.asarray(grad_nonfinite_count, dtype=logs["total_loss"].dtype)
-            logs["grad_update_skipped"] = jnp.asarray(has_nonfinite, dtype=logs["total_loss"].dtype)
             gen_state = gen_state.replace(vq_vars=new_vq)
             gen_state = gen_state.apply_gradients(grads=g_grads, vq_vars=gen_state.vq_vars)
-            params_nonfinite_count = _tree_nonfinite_count(gen_state.params)
-            params_absmax = _tree_absmax(gen_state.params)
-            logs["params_absmax"] = jnp.asarray(params_absmax, dtype=logs["total_loss"].dtype)
-            logs["params_nonfinite_count"] = jnp.asarray(params_nonfinite_count, dtype=logs["total_loss"].dtype)
-            logs["params_absmax_spread"] = jnp.asarray(0.0, dtype=logs["total_loss"].dtype)
-            logs["state_resynced"] = jnp.asarray(0.0, dtype=logs["total_loss"].dtype)
-            logs["state_resync_source"] = jnp.asarray(0.0, dtype=logs["total_loss"].dtype)
             return gen_state, logs
 
         @jax.jit
@@ -1200,7 +827,6 @@ def train_model_from_pod5(
             gen_state = _with_vq_default(restored_state)
             _ensure_replicated_state()
             _log(f"[resume] Restored from {resume_from} (step={_state_step_as_int(gen_state)})")
-            _maybe_log_gpu_memory(_log, "after_resume")
         except Exception as exc:
             raise RuntimeError(f"Failed to restore checkpoint from {resume_from}") from exc
 
@@ -1225,11 +851,8 @@ def train_model_from_pod5(
         _log("[warmup] Compile finished; starting real data iterator.")
         if not warmup_compile_stats:
             _log("[warmup] Deferred compile of codebook-stats path (first stats step may be slower).")
-        _maybe_log_gpu_memory(_log, "after_warmup_compile")
 
     global_step = _state_step_as_int(gen_state)
-    mem_probe_steps = {10, 50, 200}
-    mem_probe_done: set[int] = set()
 
     def _should_collect_codebook_stats(step_idx: int) -> bool:
         return ((step_idx + 1) % stats_every_steps_int == 0)
@@ -1271,9 +894,6 @@ def train_model_from_pod5(
         host_sync_ms = (time.perf_counter() - sync_start) * 1000.0
         if not collect_codebook_stats:
             logs = _strip_codebook_metrics(logs)
-        _raise_on_large_params(_state_step_as_int(gen_state), gen_state, logs)
-        _raise_on_nonfinite_params(_state_step_as_int(gen_state), gen_state, logs)
-        _raise_on_nonfinite_logs(_state_step_as_int(gen_state), logs, batch)
         return logs, host_sync_ms
 
     stop_training = False
@@ -1315,10 +935,6 @@ def train_model_from_pod5(
                     steps_this_epoch += 1
                     global_step += 1
                     _add_log_window_sample(logs)
-
-                    if global_step in mem_probe_steps and global_step not in mem_probe_done:
-                        _maybe_log_gpu_memory(_log, f"step{global_step}")
-                        mem_probe_done.add(global_step)
 
                     if log_every_steps_int > 0 and global_step % log_every_steps_int == 0:
                         perf = _drain_perf_window()
