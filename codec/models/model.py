@@ -9,7 +9,7 @@ from flax import linen as nn
 from .decoder import SimVQDecoder1D
 from .encoder import SimVQEncoder1D
 from .quantize import SimVQ1D
-from .transformer import SwinTransformerBlock1D
+from .transformer import SwinTransformerBlock1D, TransformerBlock1D
 from ..jaxlayers import Conv1d
 
 
@@ -17,11 +17,13 @@ class SimVQAudioModel(nn.Module):
     in_channels: int = 1
     enc_channels: Tuple[int, ...] = (64, 256)
     enc_num_res_blocks: int = 4
+    enc_stage_num_res_blocks: Tuple[int, ...] | None = None
     enc_down_strides: Tuple[int, ...] = (3,)
     latent_dim: int = 256
     codebook_size: int = 16384
     dec_channels: Tuple[int, ...] = (256, 64)
     dec_num_res_blocks: int = 4
+    dec_stage_num_res_blocks: Tuple[int, ...] | None = None
     dec_up_strides: Tuple[int, ...] = (3,)
     enc_kernel_size: int = 7
     dec_out_kernel_size: int = 7
@@ -49,12 +51,25 @@ class SimVQAudioModel(nn.Module):
     encoder_use_block_norm: bool = True
     encoder_use_input_norm: bool = True
     encoder_use_transition_norm: bool = True
+    encoder_stage_use_transformer: bool | Tuple[bool, ...] = True
     decoder_use_block_norm: bool = True
     decoder_use_upsample_norm: bool = True
+    decoder_stage_use_transformer: bool | Tuple[bool, ...] = True
+    latent_transformer_type: str = "swin"
 
     def setup(self):
         enc_channels = tuple(int(ch) for ch in self.enc_channels)
         dec_channels = tuple(int(ch) for ch in self.dec_channels)
+        enc_stage_num_res_blocks = (
+            tuple(int(v) for v in self.enc_stage_num_res_blocks)
+            if self.enc_stage_num_res_blocks is not None
+            else self.enc_num_res_blocks
+        )
+        dec_stage_num_res_blocks = (
+            tuple(int(v) for v in self.dec_stage_num_res_blocks)
+            if self.dec_stage_num_res_blocks is not None
+            else self.dec_num_res_blocks
+        )
         if len(enc_channels) != len(self.enc_down_strides) + 1:
             raise ValueError("enc_channels must be one longer than enc_down_strides")
         if len(dec_channels) != len(self.dec_up_strides) + 1:
@@ -70,12 +85,13 @@ class SimVQAudioModel(nn.Module):
         self.encoder = SimVQEncoder1D(
             in_channels=self.in_channels,
             channels=enc_channels,
-            num_res_blocks=self.enc_num_res_blocks,
+            num_res_blocks=enc_stage_num_res_blocks,
             down_strides=self.enc_down_strides,
             input_kernel_size=self.enc_kernel_size,
             use_block_norm=self.encoder_use_block_norm,
             use_input_norm=self.encoder_use_input_norm,
             use_transition_norm=self.encoder_use_transition_norm,
+            stage_use_transformer=self.encoder_stage_use_transformer,
             transformer_heads=self.transformer_heads,
             transformer_window_size=self.stage_transformer_window_size,
             transformer_shift_size=self.stage_transformer_shift_size,
@@ -92,11 +108,12 @@ class SimVQAudioModel(nn.Module):
         self.decoder = SimVQDecoder1D(
             out_channels=self.in_channels,
             channels=dec_channels,
-            num_res_blocks=self.dec_num_res_blocks,
+            num_res_blocks=dec_stage_num_res_blocks,
             up_strides=self.dec_up_strides,
             output_kernel_size=self.dec_out_kernel_size,
             use_block_norm=self.decoder_use_block_norm,
             use_upsample_norm=self.decoder_use_upsample_norm,
+            stage_use_transformer=self.decoder_stage_use_transformer,
             transformer_heads=self.transformer_heads,
             transformer_window_size=self.stage_transformer_window_size,
             transformer_shift_size=self.stage_transformer_shift_size,
@@ -138,12 +155,33 @@ class SimVQAudioModel(nn.Module):
             param_dtype=quant_path_dtype,
         )
         latent_shift = max(0, int(self.latent_transformer_shift_size))
-        self.pre_quant_blocks = tuple(
-            SwinTransformerBlock1D(
-                dim=self.latent_dim,
+        latent_transformer_type = str(self.latent_transformer_type).strip().lower()
+        if latent_transformer_type not in {"swin", "global", "transformer"}:
+            raise ValueError(
+                f"Unsupported latent_transformer_type={self.latent_transformer_type!r}; "
+                "choose from ['global', 'swin', 'transformer']."
+            )
+
+        def _make_latent_block(*, dim: int, name: str) -> nn.Module:
+            if latent_transformer_type == "swin":
+                return SwinTransformerBlock1D(
+                    dim=dim,
+                    num_heads=self.transformer_heads,
+                    window_size=max(1, int(self.latent_transformer_window_size)),
+                    shift_size=latent_shift,
+                    mlp_ratio=self.transformer_mlp_ratio,
+                    dropout=self.transformer_dropout,
+                    ffn_activation=self.transformer_ffn_activation,
+                    attention_backend=self.transformer_attention_backend,
+                    use_rope=self.transformer_use_rope,
+                    rope_base=self.transformer_rope_base,
+                    dtype=self.transformer_dtype,
+                    param_dtype=self.param_dtype,
+                    name=name,
+                )
+            return TransformerBlock1D(
+                dim=dim,
                 num_heads=self.transformer_heads,
-                window_size=max(1, int(self.latent_transformer_window_size)),
-                shift_size=latent_shift,
                 mlp_ratio=self.transformer_mlp_ratio,
                 dropout=self.transformer_dropout,
                 ffn_activation=self.transformer_ffn_activation,
@@ -152,33 +190,22 @@ class SimVQAudioModel(nn.Module):
                 rope_base=self.transformer_rope_base,
                 dtype=self.transformer_dtype,
                 param_dtype=self.param_dtype,
-                name=f"pre_quant_tf_{i}",
+                name=name,
             )
+
+        self.pre_quant_blocks = tuple(
+            _make_latent_block(dim=self.latent_dim, name=f"pre_quant_tf_{i}")
             for i in range(max(0, int(self.pre_quant_transformer_layers)))
         )
         self.post_quant_blocks = tuple(
-            SwinTransformerBlock1D(
-                dim=dec_channels[0],
-                num_heads=self.transformer_heads,
-                window_size=max(1, int(self.latent_transformer_window_size)),
-                shift_size=latent_shift,
-                mlp_ratio=self.transformer_mlp_ratio,
-                dropout=self.transformer_dropout,
-                ffn_activation=self.transformer_ffn_activation,
-                attention_backend=self.transformer_attention_backend,
-                use_rope=self.transformer_use_rope,
-                rope_base=self.transformer_rope_base,
-                dtype=self.transformer_dtype,
-                param_dtype=self.param_dtype,
-                name=f"post_quant_tf_{i}",
-            )
+            _make_latent_block(dim=dec_channels[0], name=f"post_quant_tf_{i}")
             for i in range(max(0, int(self.post_quant_transformer_layers)))
         )
 
     def _run_transformer_blocks(
         self,
         x: jnp.ndarray,
-        blocks: Tuple[SwinTransformerBlock1D, ...],
+        blocks: Tuple[nn.Module, ...],
         *,
         train: bool,
         rng: jax.random.KeyArray | None,
