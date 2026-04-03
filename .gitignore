@@ -3,8 +3,3 @@ checkpoints
 wandb
 AGENTS.md
 .*
-valid/*
-!valid/__init__.py
-!valid/export_valid_recon_pod5.py
-!valid/run_validation.py
-!valid/run_validation.sh
