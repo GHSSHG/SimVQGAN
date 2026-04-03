@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Sequence as SequenceABC
 from typing import Any, Sequence
 
 import jax
@@ -33,6 +34,42 @@ def _resolve_residual_dilations(num_blocks: int) -> tuple[int, ...]:
     if count <= len(SEANET_RESIDUAL_DILATIONS):
         return SEANET_RESIDUAL_DILATIONS[:count]
     return tuple(2**idx for idx in range(count))
+
+
+def _resolve_stage_ints(
+    value: int | Sequence[int],
+    *,
+    num_stages: int,
+    field_name: str,
+) -> tuple[int, ...]:
+    if num_stages <= 0:
+        return ()
+    if isinstance(value, SequenceABC) and not isinstance(value, (str, bytes)):
+        resolved = tuple(int(v) for v in value)
+    else:
+        resolved = (int(value),) * num_stages
+    if len(resolved) != num_stages:
+        raise ValueError(f"{field_name} must provide exactly {num_stages} values, got {resolved}")
+    if any(v <= 0 for v in resolved):
+        raise ValueError(f"{field_name} must contain positive integers, got {resolved}")
+    return resolved
+
+
+def _resolve_stage_flags(
+    value: bool | Sequence[bool],
+    *,
+    num_stages: int,
+    field_name: str,
+) -> tuple[bool, ...]:
+    if num_stages <= 0:
+        return ()
+    if isinstance(value, SequenceABC) and not isinstance(value, (str, bytes)):
+        resolved = tuple(bool(v) for v in value)
+    else:
+        resolved = (bool(value),) * num_stages
+    if len(resolved) != num_stages:
+        raise ValueError(f"{field_name} must provide exactly {num_stages} values, got {resolved}")
+    return resolved
 
 
 _GROUPNORM_AXIS_ARG: str | None | bool = None
@@ -200,6 +237,7 @@ class EncoderStage1D(nn.Module):
     compress: int = 2
     use_block_norm: bool = True
     use_transition_norm: bool = True
+    use_transformer: bool = True
     transformer_heads: int = 4
     transformer_window_size: int = 768
     transformer_shift_size: int = 384
@@ -227,21 +265,24 @@ class EncoderStage1D(nn.Module):
             )
             for i, dilation in enumerate(dilations)
         )
-        self.transformer_block = SwinTransformerBlock1D(
-            dim=self.in_ch,
-            num_heads=self.transformer_heads,
-            window_size=max(1, int(self.transformer_window_size)),
-            shift_size=max(0, int(self.transformer_shift_size)),
-            mlp_ratio=self.transformer_mlp_ratio,
-            dropout=self.transformer_dropout,
-            ffn_activation=self.transformer_ffn_activation,
-            attention_backend=self.transformer_attention_backend,
-            use_rope=self.transformer_use_rope,
-            rope_base=self.transformer_rope_base,
-            dtype=self.transformer_dtype,
-            param_dtype=self.param_dtype,
-            name="transformer_block",
-        )
+        if self.use_transformer:
+            self.transformer_block = SwinTransformerBlock1D(
+                dim=self.in_ch,
+                num_heads=self.transformer_heads,
+                window_size=max(1, int(self.transformer_window_size)),
+                shift_size=max(0, int(self.transformer_shift_size)),
+                mlp_ratio=self.transformer_mlp_ratio,
+                dropout=self.transformer_dropout,
+                ffn_activation=self.transformer_ffn_activation,
+                attention_backend=self.transformer_attention_backend,
+                use_rope=self.transformer_use_rope,
+                rope_base=self.transformer_rope_base,
+                dtype=self.transformer_dtype,
+                param_dtype=self.param_dtype,
+                name="transformer_block",
+            )
+        else:
+            self.transformer_block = None
         stride = int(self.down_stride)
         transition_kernel = 3 if stride == 1 else max(4, stride * 2)
         self.transition = Conv1d(
@@ -269,7 +310,8 @@ class EncoderStage1D(nn.Module):
         h = x
         for block in self.blocks:
             h = block(h, train=train)
-        h = self.transformer_block(h, train=train, rng=rng)
+        if self.transformer_block is not None:
+            h = self.transformer_block(h, train=train, rng=rng)
         h = h.astype(self.dtype)
         h = self.transition(h)
         if self.transition_norm is not None:
@@ -281,13 +323,14 @@ class EncoderStage1D(nn.Module):
 class SimVQEncoder1D(nn.Module):
     in_channels: int = 1
     channels: Sequence[int] = (64, 256)
-    num_res_blocks: int = 4
+    num_res_blocks: int | Sequence[int] = 4
     down_strides: Sequence[int] = (3,)
     input_kernel_size: int = 7
     block_compress: int = 2
     use_block_norm: bool = True
     use_input_norm: bool = True
     use_transition_norm: bool = True
+    stage_use_transformer: bool | Sequence[bool] = True
     transformer_heads: int = 4
     transformer_window_size: int = 768
     transformer_shift_size: int = 384
@@ -305,8 +348,17 @@ class SimVQEncoder1D(nn.Module):
         channels = tuple(int(ch) for ch in self.channels)
         if len(channels) != len(self.down_strides) + 1:
             raise ValueError("channels must be one longer than down_strides")
-        if int(self.num_res_blocks) <= 0:
-            raise ValueError("num_res_blocks must be positive")
+        stage_count = len(self.down_strides)
+        stage_res_blocks = _resolve_stage_ints(
+            self.num_res_blocks,
+            num_stages=stage_count,
+            field_name="num_res_blocks",
+        )
+        stage_use_transformer = _resolve_stage_flags(
+            self.stage_use_transformer,
+            num_stages=stage_count,
+            field_name="stage_use_transformer",
+        )
         self.conv_in = Conv1d(
             channels[0],
             kernel=self.input_kernel_size,
@@ -327,16 +379,19 @@ class SimVQEncoder1D(nn.Module):
         else:
             self.conv_in_norm = None
         stages = []
-        for idx, stride in enumerate(self.down_strides):
+        for idx, (stride, stage_blocks, stage_has_transformer) in enumerate(
+            zip(self.down_strides, stage_res_blocks, stage_use_transformer)
+        ):
             stages.append(
                 EncoderStage1D(
                     in_ch=channels[idx],
                     out_ch=channels[idx + 1],
-                    num_res_blocks=self.num_res_blocks,
+                    num_res_blocks=stage_blocks,
                     down_stride=stride,
                     compress=self.block_compress,
                     use_block_norm=self.use_block_norm,
                     use_transition_norm=self.use_transition_norm,
+                    use_transformer=stage_has_transformer,
                     transformer_heads=self.transformer_heads,
                     transformer_window_size=self.transformer_window_size,
                     transformer_shift_size=self.transformer_shift_size,

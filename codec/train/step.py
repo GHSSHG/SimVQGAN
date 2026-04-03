@@ -78,3 +78,29 @@ def compute_grads(
 
     (_g_loss, aux), g_grads = jax.value_and_grad(gen_loss_fn, has_aux=True)(gen_state.params)
     return g_grads, aux["logs"], aux["vq_vars"]
+
+
+@partial(jax.jit, static_argnames=("train",))
+def compute_codebook_stats(
+    gen_state,
+    batch,
+    rng,
+    *,
+    train: bool = False,
+):
+    signal = _extract_signal(batch)
+    vq_in = gen_state.vq_vars if gen_state.vq_vars is not None else {}
+    outs = gen_state.apply_fn(
+        {"params": gen_state.params, "vq": vq_in},
+        signal,
+        train=train,
+        offset=0,
+        rng=rng,
+        collect_codebook_stats=True,
+    )
+    enc = outs["enc"]
+    loss_dtype = signal.dtype
+    return {
+        "perplexity": jnp.asarray(enc.get("perplexity", jnp.asarray(0.0, dtype=jnp.float32)), dtype=loss_dtype),
+        "code_usage": jnp.asarray(enc.get("usage_ratio", jnp.asarray(0.0, dtype=jnp.float32)), dtype=loss_dtype),
+    }
