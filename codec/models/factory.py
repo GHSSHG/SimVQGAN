@@ -74,15 +74,22 @@ def _variant_defaults(variant: str) -> dict[str, Any]:
         return {
             "enc_channels": (32, 64, 128, 256),
             "enc_down_strides": (2, 2, 3),
-            "enc_stage_num_res_blocks": (1, 2, 2),
+            "enc_stage_num_res_blocks": (2, 2, 2),
             "dec_channels": (256, 128, 64, 32),
             "dec_up_strides": (3, 2, 2),
-            "dec_stage_num_res_blocks": (2, 2, 1),
-            "encoder_stage_use_transformer": False,
-            "decoder_stage_use_transformer": False,
+            "dec_stage_num_res_blocks": (2, 2, 2),
+            "encoder_stage_use_transformer": True,
+            "encoder_stage_transformer_window_sizes": (384, 256, 128),
+            "encoder_stage_transformer_shift_sizes": (192, 128, 64),
+            "decoder_stage_use_transformer": True,
+            "decoder_stage_transformer_window_sizes": (128, 256, 384),
+            "decoder_stage_transformer_shift_sizes": (64, 128, 192),
             "pre_quant_transformer_layers": 2,
             "post_quant_transformer_layers": 2,
-            "latent_transformer_type": "global",
+            "latent_transformer_type": "swin",
+            "latent_transformer_window_size": 64,
+            "latent_transformer_shift_size": 32,
+            "quantizer_dim": 128,
         }
     raise ValueError(f"Unsupported normalized model variant {variant!r}.")
 
@@ -122,6 +129,9 @@ def build_audio_model(model_cfg: dict[str, Any] | None) -> SimVQAudioModel:
         enc_stage_num_res_blocks=_optional_tuple_cfg(merged_cfg, "enc_stage_num_res_blocks"),
         enc_down_strides=_tuple_cfg(merged_cfg, "enc_down_strides", (3,)),
         latent_dim=int(merged_cfg.get("latent_dim", 256)),
+        quantizer_dim=(
+            None if merged_cfg.get("quantizer_dim") is None else int(merged_cfg.get("quantizer_dim"))
+        ),
         codebook_size=int(merged_cfg.get("codebook_size", 16384)),
         dec_channels=_tuple_cfg(merged_cfg, "dec_channels", (256, 64)),
         dec_num_res_blocks=int(merged_cfg.get("dec_num_res_blocks", merged_cfg.get("num_res_blocks", 4))),
@@ -156,10 +166,26 @@ def build_audio_model(model_cfg: dict[str, Any] | None) -> SimVQAudioModel:
             "encoder_stage_use_transformer",
             True,
         ),
+        encoder_stage_transformer_window_sizes=_optional_tuple_cfg(
+            merged_cfg,
+            "encoder_stage_transformer_window_sizes",
+        ),
+        encoder_stage_transformer_shift_sizes=_optional_tuple_cfg(
+            merged_cfg,
+            "encoder_stage_transformer_shift_sizes",
+        ),
         decoder_stage_use_transformer=_bool_or_tuple_cfg(
             merged_cfg,
             "decoder_stage_use_transformer",
             True,
+        ),
+        decoder_stage_transformer_window_sizes=_optional_tuple_cfg(
+            merged_cfg,
+            "decoder_stage_transformer_window_sizes",
+        ),
+        decoder_stage_transformer_shift_sizes=_optional_tuple_cfg(
+            merged_cfg,
+            "decoder_stage_transformer_shift_sizes",
         ),
         latent_transformer_type=str(merged_cfg.get("latent_transformer_type", "swin")),
     )

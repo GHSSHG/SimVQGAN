@@ -134,11 +134,11 @@ class DecoderStage1D(nn.Module):
 
     def __call__(self, x: jnp.ndarray, *, train: bool = False, rng: jax.Array | None = None) -> jnp.ndarray:
         h = self.upsample(x)
-        if self.transformer_block is not None:
-            h = self.transformer_block(h, train=train, rng=rng)
         h = h.astype(self.dtype)
         for block in self.blocks:
             h = block(h, train=train)
+        if self.transformer_block is not None:
+            h = self.transformer_block(h, train=train, rng=rng)
         return h
 
 
@@ -155,6 +155,8 @@ class SimVQDecoder1D(nn.Module):
     transformer_heads: int = 4
     transformer_window_size: int = 768
     transformer_shift_size: int = 384
+    stage_transformer_window_sizes: Sequence[int] | None = None
+    stage_transformer_shift_sizes: Sequence[int] | None = None
     transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.0
     transformer_ffn_activation: str = "swiglu"
@@ -180,9 +182,31 @@ class SimVQDecoder1D(nn.Module):
             num_stages=stage_count,
             field_name="stage_use_transformer",
         )
+        stage_transformer_window_sizes = _resolve_stage_ints(
+            self.stage_transformer_window_sizes
+            if self.stage_transformer_window_sizes is not None
+            else self.transformer_window_size,
+            num_stages=stage_count,
+            field_name="stage_transformer_window_sizes",
+            minimum=1,
+        )
+        stage_transformer_shift_sizes = _resolve_stage_ints(
+            self.stage_transformer_shift_sizes
+            if self.stage_transformer_shift_sizes is not None
+            else self.transformer_shift_size,
+            num_stages=stage_count,
+            field_name="stage_transformer_shift_sizes",
+            minimum=0,
+        )
         stages = []
-        for idx, (factor, stage_blocks, stage_has_transformer) in enumerate(
-            zip(self.up_strides, stage_res_blocks, stage_use_transformer)
+        for idx, (factor, stage_blocks, stage_has_transformer, stage_window_size, stage_shift_size) in enumerate(
+            zip(
+                self.up_strides,
+                stage_res_blocks,
+                stage_use_transformer,
+                stage_transformer_window_sizes,
+                stage_transformer_shift_sizes,
+            )
         ):
             stages.append(
                 DecoderStage1D(
@@ -195,8 +219,8 @@ class SimVQDecoder1D(nn.Module):
                     use_upsample_norm=self.use_upsample_norm,
                     use_transformer=stage_has_transformer,
                     transformer_heads=self.transformer_heads,
-                    transformer_window_size=self.transformer_window_size,
-                    transformer_shift_size=self.transformer_shift_size,
+                    transformer_window_size=stage_window_size,
+                    transformer_shift_size=stage_shift_size,
                     transformer_mlp_ratio=self.transformer_mlp_ratio,
                     transformer_dropout=self.transformer_dropout,
                     transformer_ffn_activation=self.transformer_ffn_activation,

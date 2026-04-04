@@ -41,6 +41,7 @@ def _resolve_stage_ints(
     *,
     num_stages: int,
     field_name: str,
+    minimum: int = 1,
 ) -> tuple[int, ...]:
     if num_stages <= 0:
         return ()
@@ -50,8 +51,8 @@ def _resolve_stage_ints(
         resolved = (int(value),) * num_stages
     if len(resolved) != num_stages:
         raise ValueError(f"{field_name} must provide exactly {num_stages} values, got {resolved}")
-    if any(v <= 0 for v in resolved):
-        raise ValueError(f"{field_name} must contain positive integers, got {resolved}")
+    if any(v < minimum for v in resolved):
+        raise ValueError(f"{field_name} must contain integers >= {minimum}, got {resolved}")
     return resolved
 
 
@@ -334,6 +335,8 @@ class SimVQEncoder1D(nn.Module):
     transformer_heads: int = 4
     transformer_window_size: int = 768
     transformer_shift_size: int = 384
+    stage_transformer_window_sizes: Sequence[int] | None = None
+    stage_transformer_shift_sizes: Sequence[int] | None = None
     transformer_mlp_ratio: float = 4.0
     transformer_dropout: float = 0.0
     transformer_ffn_activation: str = "swiglu"
@@ -359,6 +362,22 @@ class SimVQEncoder1D(nn.Module):
             num_stages=stage_count,
             field_name="stage_use_transformer",
         )
+        stage_transformer_window_sizes = _resolve_stage_ints(
+            self.stage_transformer_window_sizes
+            if self.stage_transformer_window_sizes is not None
+            else self.transformer_window_size,
+            num_stages=stage_count,
+            field_name="stage_transformer_window_sizes",
+            minimum=1,
+        )
+        stage_transformer_shift_sizes = _resolve_stage_ints(
+            self.stage_transformer_shift_sizes
+            if self.stage_transformer_shift_sizes is not None
+            else self.transformer_shift_size,
+            num_stages=stage_count,
+            field_name="stage_transformer_shift_sizes",
+            minimum=0,
+        )
         self.conv_in = Conv1d(
             channels[0],
             kernel=self.input_kernel_size,
@@ -379,8 +398,14 @@ class SimVQEncoder1D(nn.Module):
         else:
             self.conv_in_norm = None
         stages = []
-        for idx, (stride, stage_blocks, stage_has_transformer) in enumerate(
-            zip(self.down_strides, stage_res_blocks, stage_use_transformer)
+        for idx, (stride, stage_blocks, stage_has_transformer, stage_window_size, stage_shift_size) in enumerate(
+            zip(
+                self.down_strides,
+                stage_res_blocks,
+                stage_use_transformer,
+                stage_transformer_window_sizes,
+                stage_transformer_shift_sizes,
+            )
         ):
             stages.append(
                 EncoderStage1D(
@@ -393,8 +418,8 @@ class SimVQEncoder1D(nn.Module):
                     use_transition_norm=self.use_transition_norm,
                     use_transformer=stage_has_transformer,
                     transformer_heads=self.transformer_heads,
-                    transformer_window_size=self.transformer_window_size,
-                    transformer_shift_size=self.transformer_shift_size,
+                    transformer_window_size=stage_window_size,
+                    transformer_shift_size=stage_shift_size,
                     transformer_mlp_ratio=self.transformer_mlp_ratio,
                     transformer_dropout=self.transformer_dropout,
                     transformer_ffn_activation=self.transformer_ffn_activation,

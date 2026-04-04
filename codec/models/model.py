@@ -20,6 +20,7 @@ class SimVQAudioModel(nn.Module):
     enc_stage_num_res_blocks: Tuple[int, ...] | None = None
     enc_down_strides: Tuple[int, ...] = (3,)
     latent_dim: int = 256
+    quantizer_dim: int | None = None
     codebook_size: int = 16384
     dec_channels: Tuple[int, ...] = (256, 64)
     dec_num_res_blocks: int = 4
@@ -52,9 +53,13 @@ class SimVQAudioModel(nn.Module):
     encoder_use_input_norm: bool = True
     encoder_use_transition_norm: bool = True
     encoder_stage_use_transformer: bool | Tuple[bool, ...] = True
+    encoder_stage_transformer_window_sizes: Tuple[int, ...] | None = None
+    encoder_stage_transformer_shift_sizes: Tuple[int, ...] | None = None
     decoder_use_block_norm: bool = True
     decoder_use_upsample_norm: bool = True
     decoder_stage_use_transformer: bool | Tuple[bool, ...] = True
+    decoder_stage_transformer_window_sizes: Tuple[int, ...] | None = None
+    decoder_stage_transformer_shift_sizes: Tuple[int, ...] | None = None
     latent_transformer_type: str = "swin"
 
     def setup(self):
@@ -82,6 +87,9 @@ class SimVQAudioModel(nn.Module):
             raise ValueError(
                 f"Decoder input channels ({dec_channels[0]}) must match latent_dim ({self.latent_dim})"
             )
+        quantizer_dim = self.latent_dim if self.quantizer_dim is None else int(self.quantizer_dim)
+        if quantizer_dim <= 0:
+            raise ValueError(f"quantizer_dim must be positive, got {quantizer_dim}")
         self.encoder = SimVQEncoder1D(
             in_channels=self.in_channels,
             channels=enc_channels,
@@ -92,6 +100,8 @@ class SimVQAudioModel(nn.Module):
             use_input_norm=self.encoder_use_input_norm,
             use_transition_norm=self.encoder_use_transition_norm,
             stage_use_transformer=self.encoder_stage_use_transformer,
+            stage_transformer_window_sizes=self.encoder_stage_transformer_window_sizes,
+            stage_transformer_shift_sizes=self.encoder_stage_transformer_shift_sizes,
             transformer_heads=self.transformer_heads,
             transformer_window_size=self.stage_transformer_window_size,
             transformer_shift_size=self.stage_transformer_shift_size,
@@ -114,6 +124,8 @@ class SimVQAudioModel(nn.Module):
             use_block_norm=self.decoder_use_block_norm,
             use_upsample_norm=self.decoder_use_upsample_norm,
             stage_use_transformer=self.decoder_stage_use_transformer,
+            stage_transformer_window_sizes=self.decoder_stage_transformer_window_sizes,
+            stage_transformer_shift_sizes=self.decoder_stage_transformer_shift_sizes,
             transformer_heads=self.transformer_heads,
             transformer_window_size=self.stage_transformer_window_size,
             transformer_shift_size=self.stage_transformer_shift_size,
@@ -129,7 +141,7 @@ class SimVQAudioModel(nn.Module):
         )
         quant_path_dtype = jnp.float32
         self.quant_conv = Conv1d(
-            self.latent_dim,
+            quantizer_dim,
             kernel=int(self.quant_conv_kernel_size),
             use_bias=False,
             padding="SAME",
@@ -148,7 +160,7 @@ class SimVQAudioModel(nn.Module):
         )
         self.quantizer = SimVQ1D(
             codebook_size=self.codebook_size,
-            code_dim=self.latent_dim,
+            code_dim=quantizer_dim,
             diveq_sigma2=self.diveq_sigma2,
             search_chunk_size=max(1, int(self.search_chunk_size)),
             dtype=quant_path_dtype,
