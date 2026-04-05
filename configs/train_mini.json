@@ -2,23 +2,23 @@
   "seed": 42,
   "train": {
     "epochs": 2,
-    "batch_size": 32,
+    "batch_size": 16,
     "reference_device_count": 4,
-    "per_device_batch_size": 8,
+    "per_device_batch_size": 4,
     "auto_scale_batch_by_device_count": true,
     "data_parallel": true,
-    "learning_rate": 2e-6,
+    "learning_rate": 1e-6,
     "host_prefetch_size": 64,
     "host_prefetch_per_device": 8,
     "device_prefetch_size": 16,
     "device_prefetch_per_device": 2,
     "grad_clip": 1.0,
-    "log_every_steps": 500,
-    "codebook_stats_every_steps": 2000,
+    "log_every_steps": 1000,
+    "codebook_stats_every_steps": 5000,
     "eval": {
       "enabled": true,
-      "every_steps": 10000,
-      "reads": 64,
+      "every_steps": 20000,
+      "reads": 128,
       "min_read_length": 12288,
       "data_split": "valid",
       "microbatch": 8
@@ -71,66 +71,56 @@
       },
       "loss_weight": 0.2,
       "warmup_start": 0,
-      "warmup_steps": 50000
+      "warmup_steps": 100000
     }
   },
   "model": {
     "variant": "v45_mini",
     "enc_channels": [
-      32,
       64,
       128,
       256
     ],
     "enc_down_strides": [
       2,
-      2,
       3
     ],
     "enc_stage_num_res_blocks": [
-      2,
-      2,
-      2
+      3,
+      3
     ],
     "encoder_stage_use_transformer": true,
     "encoder_stage_transformer_window_sizes": [
       384,
-      256,
-      128
+      256
     ],
     "encoder_stage_transformer_shift_sizes": [
       192,
-      128,
-      64
+      128
     ],
     "enc_kernel_size": 7,
     "latent_dim": 256,
-    "quantizer_dim": 128,
+    "quantizer_dim": 256,
     "codebook_size": 65536,
     "dec_channels": [
       256,
       128,
-      64,
-      32
+      64
     ],
     "dec_up_strides": [
       3,
-      2,
       2
     ],
     "dec_stage_num_res_blocks": [
-      2,
-      2,
-      2
+      3,
+      3
     ],
     "decoder_stage_use_transformer": true,
     "decoder_stage_transformer_window_sizes": [
-      128,
       256,
       384
     ],
     "decoder_stage_transformer_shift_sizes": [
-      64,
       128,
       192
     ],
@@ -150,8 +140,8 @@
     "param_dtype": "fp32",
     "diveq_sigma2": 0.001,
     "search_chunk_size": 2048,
-    "latent_transformer_window_size": 64,
-    "latent_transformer_shift_size": 32
+    "latent_transformer_window_size": 128,
+    "latent_transformer_shift_size": 64
   },
   "data": {
     "type": "pod5",
@@ -172,8 +162,8 @@
     "train": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [
-        "FC01/pod5",
-        "FC02/pod5"
+        "FC02/pod5",
+        "FC03/pod5"
       ],
       "segment_samples": 12288,
       "segment_hop_samples": 11688,
@@ -182,7 +172,7 @@
     "valid": {
       "root": "/data/nanopore/hereditary_cancer_2025.09/raw",
       "subdirs": [
-        "FC03/pod5"
+        "FC01/pod5"
       ],
       "segment_samples": 12288,
       "segment_hop_samples": 11688

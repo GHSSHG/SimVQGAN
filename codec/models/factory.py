@@ -72,24 +72,24 @@ def _variant_defaults(variant: str) -> dict[str, Any]:
         return {}
     if variant == "v45_mini":
         return {
-            "enc_channels": (32, 64, 128, 256),
-            "enc_down_strides": (2, 2, 3),
-            "enc_stage_num_res_blocks": (2, 2, 2),
-            "dec_channels": (256, 128, 64, 32),
-            "dec_up_strides": (3, 2, 2),
-            "dec_stage_num_res_blocks": (2, 2, 2),
+            "enc_channels": (64, 128, 256),
+            "enc_down_strides": (2, 3),
+            "enc_stage_num_res_blocks": (3, 3),
+            "dec_channels": (256, 128, 64),
+            "dec_up_strides": (3, 2),
+            "dec_stage_num_res_blocks": (3, 3),
             "encoder_stage_use_transformer": True,
-            "encoder_stage_transformer_window_sizes": (384, 256, 128),
-            "encoder_stage_transformer_shift_sizes": (192, 128, 64),
+            "encoder_stage_transformer_window_sizes": (384, 256),
+            "encoder_stage_transformer_shift_sizes": (192, 128),
             "decoder_stage_use_transformer": True,
-            "decoder_stage_transformer_window_sizes": (128, 256, 384),
-            "decoder_stage_transformer_shift_sizes": (64, 128, 192),
+            "decoder_stage_transformer_window_sizes": (256, 384),
+            "decoder_stage_transformer_shift_sizes": (128, 192),
             "pre_quant_transformer_layers": 2,
             "post_quant_transformer_layers": 2,
             "latent_transformer_type": "swin",
-            "latent_transformer_window_size": 64,
-            "latent_transformer_shift_size": 32,
-            "quantizer_dim": 128,
+            "latent_transformer_window_size": 128,
+            "latent_transformer_shift_size": 64,
+            "quantizer_dim": 256,
         }
     raise ValueError(f"Unsupported normalized model variant {variant!r}.")
 

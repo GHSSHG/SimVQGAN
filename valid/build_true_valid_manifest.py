@@ -7,8 +7,10 @@ import gzip
 import json
 import math
 import os
+import random
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +36,11 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--fc", type=str, default="FC01")
     parser.add_argument("--barcodes", type=str, default="barcode01,barcode02,barcode03")
+    parser.add_argument("--selection-mode", type=str, default="global_random")
+    parser.add_argument("--quality-filter-mode", type=str, default="len_only")
+    parser.add_argument("--target-total-reads", type=int, default=1000)
     parser.add_argument("--target-per-barcode", type=int, default=200)
+    parser.add_argument("--random-seed", type=int, default=42)
     parser.add_argument("--min-read-length", type=int, default=12288)
     parser.add_argument("--min-acc", type=float, default=99.0)
     parser.add_argument("--min-coverage", type=float, default=98.0)
@@ -42,6 +48,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-qstart", type=int, default=100)
     parser.add_argument("--max-tail", type=int, default=100)
     parser.add_argument("--truth-mode", type=str, default=TRUTH_MODE_ANALYSIS_HAC_PROXY)
+    parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
 
 
@@ -57,12 +64,39 @@ def _int_value(row: dict[str, str], key: str) -> int:
     return int(round(_float_value(row, key)))
 
 
-def _load_filtered_candidates(
+def _candidate_sort_key(item: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        -float(item["analysis_acc"]),
+        -float(item["analysis_coverage"]),
+        -float(item["analysis_mean_quality"]),
+        -int(item["analysis_read_length"]),
+        str(item["read_id"]),
+    )
+
+
+def _stable_sample(
+    *,
+    items: list[dict[str, Any]],
+    sample_size: int,
+    seed: int,
+) -> list[dict[str, Any]]:
+    if sample_size <= 0 or not items:
+        return []
+    ordered = sorted(items, key=lambda item: (str(item["barcode"]), str(item["read_id"])))
+    if sample_size >= len(ordered):
+        return ordered
+    rng = random.Random(int(seed))
+    sampled_indices = sorted(rng.sample(range(len(ordered)), k=int(sample_size)))
+    return [ordered[idx] for idx in sampled_indices]
+
+
+def _load_candidates(
     *,
     readstats_path: Path,
     fc: str,
     barcode: str,
     min_read_length: int,
+    quality_filter_mode: str,
     min_acc: float,
     min_coverage: float,
     min_mean_quality: float,
@@ -82,16 +116,17 @@ def _load_filtered_candidates(
             mean_quality = _float_value(row, "mean_quality")
             if read_length < int(min_read_length):
                 continue
-            if acc < float(min_acc):
-                continue
-            if coverage < float(min_coverage):
-                continue
-            if mean_quality < float(min_mean_quality):
-                continue
-            if qstart > int(max_qstart):
-                continue
-            if tail > int(max_tail):
-                continue
+            if quality_filter_mode == "strict":
+                if acc < float(min_acc):
+                    continue
+                if coverage < float(min_coverage):
+                    continue
+                if mean_quality < float(min_mean_quality):
+                    continue
+                if qstart > int(max_qstart):
+                    continue
+                if tail > int(max_tail):
+                    continue
             candidates.append(
                 {
                     "fc": fc,
@@ -120,15 +155,6 @@ def _load_filtered_candidates(
                     "analysis_sample_name": str(row.get("sample_name") or ""),
                 }
             )
-    candidates.sort(
-        key=lambda item: (
-            -float(item["analysis_acc"]),
-            -float(item["analysis_coverage"]),
-            -float(item["analysis_mean_quality"]),
-            -int(item["analysis_read_length"]),
-            str(item["read_id"]),
-        )
-    )
     return candidates
 
 
@@ -173,7 +199,10 @@ def _extract_truth_from_analysis_bam(
 
     def _record_to_truth_payload(record: Any, bam: Any) -> dict[str, Any] | None:
         sequence = record.get_forward_sequence()
-        qualities = record.get_forward_qualities()
+        try:
+            qualities = record.get_forward_qualities()
+        except TypeError:
+            qualities = None
         if not sequence:
             return None
         quality_string = "".join(chr(int(q) + 33) for q in (qualities or []))
@@ -240,12 +269,24 @@ def main() -> None:
     if truth_mode != TRUTH_MODE_ANALYSIS_HAC_PROXY:
         raise SystemExit(f"Unsupported truth mode {truth_mode!r}; currently only {TRUTH_MODE_ANALYSIS_HAC_PROXY!r} is implemented.")
 
+    selection_mode = str(args.selection_mode).strip().lower()
+    if selection_mode not in {"global_random", "per_barcode_top"}:
+        raise SystemExit("Unsupported --selection-mode; choose from ['global_random', 'per_barcode_top'].")
+
+    quality_filter_mode = str(args.quality_filter_mode).strip().lower()
+    if quality_filter_mode not in {"len_only", "strict"}:
+        raise SystemExit("Unsupported --quality-filter-mode; choose from ['len_only', 'strict'].")
+
+    target_total_reads = max(0, int(args.target_total_reads))
+    target_per_barcode = max(0, int(args.target_per_barcode))
+    random_seed = int(args.random_seed)
+
     fc = str(args.fc).strip().upper()
     barcodes = [item.strip() for item in str(args.barcodes).split(",") if item.strip()]
     if not barcodes:
         raise SystemExit("At least one barcode is required.")
 
-    candidate_rows: list[dict[str, Any]] = []
+    candidate_rows_by_barcode: dict[str, list[dict[str, Any]]] = {}
     candidate_summary: dict[str, Any] = {}
     all_candidate_ids: set[str] = set()
     for barcode in barcodes:
@@ -255,11 +296,12 @@ def main() -> None:
             raise FileNotFoundError(f"Missing readstats: {readstats_path}")
         if not bam_path.exists():
             raise FileNotFoundError(f"Missing haplotagged BAM: {bam_path}")
-        candidates = _load_filtered_candidates(
+        candidates = _load_candidates(
             readstats_path=readstats_path,
             fc=fc,
             barcode=barcode,
             min_read_length=args.min_read_length,
+            quality_filter_mode=quality_filter_mode,
             min_acc=args.min_acc,
             min_coverage=args.min_coverage,
             min_mean_quality=args.min_mean_quality,
@@ -268,10 +310,10 @@ def main() -> None:
         )
         for item in candidates:
             item["analysis_bam"] = str(bam_path.resolve())
-        candidate_rows.extend(candidates)
+        candidate_rows_by_barcode[barcode] = candidates
         all_candidate_ids.update(item["read_id"] for item in candidates)
         candidate_summary[barcode] = {
-            "candidate_read_count": len(candidates),
+            "candidate_read_count": int(len(candidates)),
         }
 
     pod5_map = _map_read_ids_to_pod5(
@@ -282,18 +324,19 @@ def main() -> None:
     truth_map: dict[str, dict[str, Any]] = {}
     for barcode in barcodes:
         bam_path = analysis_root / fc / barcode / f"{barcode}.haplotagged.bam"
-        barcode_candidates = [item for item in candidate_rows if item["barcode"] == barcode]
+        barcode_candidates = list(candidate_rows_by_barcode.get(barcode, []))
         truth_map.update(_extract_truth_from_analysis_bam(bam_path=bam_path, candidates=barcode_candidates))
 
-    selected_reads: list[dict[str, Any]] = []
+    usable_rows_by_barcode: dict[str, list[dict[str, Any]]] = {}
+    usable_rows: list[dict[str, Any]] = []
     truth_fastq_records: list[dict[str, str]] = []
     truth_metadata_rows: list[dict[str, Any]] = []
     group_summary: dict[str, Any] = {}
     warnings: list[str] = []
 
     for barcode in barcodes:
-        barcode_candidates = [item for item in candidate_rows if item["barcode"] == barcode]
-        barcode_selected: list[dict[str, Any]] = []
+        barcode_candidates = list(candidate_rows_by_barcode.get(barcode, []))
+        barcode_usable: list[dict[str, Any]] = []
         for item in barcode_candidates:
             read_id = item["read_id"]
             pod5_entry = pod5_map.get(read_id)
@@ -309,33 +352,60 @@ def main() -> None:
             merged = dict(item)
             merged.update(pod5_entry)
             merged.update(truth_entry)
-            barcode_selected.append(merged)
-            if len(barcode_selected) >= int(args.target_per_barcode):
-                break
+            barcode_usable.append(merged)
 
-        if len(barcode_selected) < int(args.target_per_barcode):
+        if selection_mode == "per_barcode_top":
+            barcode_usable.sort(key=_candidate_sort_key)
+        else:
+            barcode_usable.sort(key=lambda item: (str(item["barcode"]), str(item["read_id"])))
+        usable_rows_by_barcode[barcode] = barcode_usable
+        usable_rows.extend(barcode_usable)
+
+    if selection_mode == "global_random":
+        selected_reads = _stable_sample(
+            items=usable_rows,
+            sample_size=target_total_reads,
+            seed=random_seed,
+        )
+        if len(selected_reads) < target_total_reads:
             warnings.append(
-                f"{barcode}: requested {int(args.target_per_barcode)} reads but only found {len(barcode_selected)} usable reads."
+                f"Requested {target_total_reads} reads in global_random mode but only found {len(selected_reads)} usable reads."
             )
+    else:
+        selected_reads = []
+        for barcode in barcodes:
+            barcode_usable = list(usable_rows_by_barcode.get(barcode, []))
+            barcode_selected = barcode_usable[:target_per_barcode]
+            if len(barcode_selected) < target_per_barcode:
+                warnings.append(
+                    f"{barcode}: requested {target_per_barcode} reads but only found {len(barcode_selected)} usable reads."
+                )
+            selected_reads.extend(barcode_selected)
 
-        selected_reads.extend(barcode_selected)
-        for item in barcode_selected:
-            truth_fastq_records.append(
-                {
-                    "read_id": str(item["read_id"]),
-                    "seq": str(item["truth_seq"]),
-                    "qual": str(item["truth_qual"]),
-                }
-            )
-            truth_metadata_rows.append(
-                {
-                    key: value
-                    for key, value in item.items()
-                    if key not in {"truth_seq", "truth_qual"}
-                }
-            )
+    selected_reads.sort(key=lambda item: (str(item["barcode"]), str(item["read_id"])))
+    selected_count_by_barcode = Counter(str(item["barcode"]) for item in selected_reads)
+
+    for item in selected_reads:
+        truth_fastq_records.append(
+            {
+                "read_id": str(item["read_id"]),
+                "seq": str(item["truth_seq"]),
+                "qual": str(item["truth_qual"]),
+            }
+        )
+        truth_metadata_rows.append(
+            {
+                key: value
+                for key, value in item.items()
+                if key not in {"truth_seq", "truth_qual"}
+            }
+        )
+
+    for barcode in barcodes:
+        barcode_selected = [item for item in selected_reads if str(item["barcode"]) == barcode]
         group_summary[barcode] = {
             "candidate_read_count": int(candidate_summary[barcode]["candidate_read_count"]),
+            "usable_read_count": int(len(usable_rows_by_barcode.get(barcode, []))),
             "selected_read_count": int(len(barcode_selected)),
             "min_raw_length": int(min((item["raw_length"] for item in barcode_selected), default=0)),
             "max_raw_length": int(max((item["raw_length"] for item in barcode_selected), default=0)),
@@ -348,9 +418,6 @@ def main() -> None:
     truth_metadata_path = truth_dir / "truth_metadata.jsonl"
     manifest_path = output_dir / "manifest" / f"true_valid_{fc.lower()}_{len(selected_reads)}reads_manifest.json"
 
-    write_fastq_gz(truth_fastq_path, truth_fastq_records)
-    write_jsonl(truth_metadata_path, truth_metadata_rows)
-
     manifest_payload = {
         "status": "ok",
         "truth_mode": truth_mode,
@@ -359,16 +426,35 @@ def main() -> None:
         "fc": fc,
         "barcodes": barcodes,
         "selection": {
-            "target_per_barcode": int(args.target_per_barcode),
+            "selection_mode": selection_mode,
+            "quality_filter_mode": quality_filter_mode,
+            "random_seed": int(random_seed),
+            "target_total_reads": int(target_total_reads),
+            "target_per_barcode": int(target_per_barcode),
             "min_read_length": int(args.min_read_length),
             "min_acc": float(args.min_acc),
             "min_coverage": float(args.min_coverage),
             "min_mean_quality": float(args.min_mean_quality),
             "max_qstart": int(args.max_qstart),
             "max_tail": int(args.max_tail),
-            "sort_order": ["analysis_acc", "analysis_coverage", "analysis_mean_quality", "analysis_read_length"],
+            "applied_filters": ["min_read_length"] if quality_filter_mode == "len_only" else [
+                "min_read_length",
+                "min_acc",
+                "min_coverage",
+                "min_mean_quality",
+                "max_qstart",
+                "max_tail",
+            ],
+            "sort_order": (
+                ["analysis_acc", "analysis_coverage", "analysis_mean_quality", "analysis_read_length"]
+                if selection_mode == "per_barcode_top"
+                else ["barcode", "read_id"]
+            ),
         },
+        "candidate_read_count": int(sum(len(items) for items in candidate_rows_by_barcode.values())),
+        "usable_read_count": int(len(usable_rows)),
         "selected_read_count": int(len(selected_reads)),
+        "selected_barcode_counts": {barcode: int(selected_count_by_barcode.get(barcode, 0)) for barcode in barcodes},
         "group_summary": group_summary,
         "selected_reads": [
             {key: value for key, value in item.items() if key not in {"truth_seq", "truth_qual"}}
@@ -382,8 +468,29 @@ def main() -> None:
         "started_at_unix": float(started_at),
         "finished_at_unix": float(time.time()),
     }
+    if args.dry_run:
+        dry_run_payload = dict(manifest_payload)
+        dry_run_payload["selected_read_examples"] = dry_run_payload.get("selected_reads", [])[:10]
+        dry_run_payload.pop("selected_reads", None)
+        print(json.dumps(dry_run_payload, indent=2, ensure_ascii=False))
+        return
+
+    write_fastq_gz(truth_fastq_path, truth_fastq_records)
+    write_jsonl(truth_metadata_path, truth_metadata_rows)
     write_json(manifest_path, manifest_payload)
-    print(json.dumps({"manifest_path": str(manifest_path), "selected_read_count": len(selected_reads)}, indent=2, ensure_ascii=False))
+    print(
+        json.dumps(
+            {
+                "manifest_path": str(manifest_path),
+                "candidate_read_count": manifest_payload["candidate_read_count"],
+                "usable_read_count": manifest_payload["usable_read_count"],
+                "selected_read_count": len(selected_reads),
+                "selected_barcode_counts": manifest_payload["selected_barcode_counts"],
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+    )
 
 
 if __name__ == "__main__":

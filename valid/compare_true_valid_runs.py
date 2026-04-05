@@ -34,16 +34,50 @@ def _run_name_from_summary(summary: dict[str, Any]) -> str:
     return f"{parent_name}_{checkpoint_path.name}"
 
 
+def _model_tag_from_summary(summary: dict[str, Any]) -> str:
+    model_path = str(summary.get("dorado_model") or "").strip()
+    if not model_path:
+        return "unknown_model"
+    model_name = Path(model_path).name.strip() or "unknown_model"
+    return (
+        model_name.replace("@", "_at_")
+        .replace(".", "_")
+        .replace("/", "_")
+        .replace(" ", "_")
+    )
+
+
 def main() -> None:
     args = _parse_args()
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    loaded: list[tuple[str, Path, dict[str, Any]]] = []
+    raw_loaded: list[tuple[Path, dict[str, Any]]] = []
     for run_dir_raw in args.run_dir:
         run_dir = Path(run_dir_raw).expanduser().resolve()
         summary = _load_summary(run_dir)
-        loaded.append((_run_name_from_summary(summary), run_dir, summary))
+        raw_loaded.append((run_dir, summary))
+
+    base_name_counts: dict[str, int] = {}
+    for _, summary in raw_loaded:
+        base_name = _run_name_from_summary(summary)
+        base_name_counts[base_name] = base_name_counts.get(base_name, 0) + 1
+
+    loaded: list[tuple[str, Path, dict[str, Any]]] = []
+    used_names: set[str] = set()
+    for run_dir, summary in raw_loaded:
+        base_name = _run_name_from_summary(summary)
+        if base_name_counts.get(base_name, 0) > 1:
+            name = f"{base_name}_{_model_tag_from_summary(summary)}"
+        else:
+            name = base_name
+        suffix = 2
+        unique_name = name
+        while unique_name in used_names:
+            unique_name = f"{name}_{suffix}"
+            suffix += 1
+        used_names.add(unique_name)
+        loaded.append((unique_name, run_dir, summary))
 
     compare_payload: dict[str, Any] = {
         "runs": {},
